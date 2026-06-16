@@ -1,0 +1,33 @@
+[project]
+name = "tiger-tradehub"
+version = "0.1.0"
+description = "Guarded Tiger Brokers trading bridge for ChatGPT, Claude, and Telegram."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.3.0",
+  "python-dotenv>=1.0.1",
+  "tigeropen>=3.3.0",
+  "uvicorn[standard]>=0.30.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2.0"]
+telegram = ["python-telegram-bot>=21.4"]
+dev = ["pytest>=8.2.0", "ruff>=0.5.0"]
+
+[project.scripts]
+tradehub = "tradehub.app:main"
+tradehub-mcp = "tradehub.mcp_server:main"
+tradehub-telegram = "tradehub.telegram_bot:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
