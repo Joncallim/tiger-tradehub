@@ -3,14 +3,17 @@ from __future__ import annotations
 from functools import lru_cache
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 
 from tradehub.audit import AuditStore
 from tradehub.config import Settings, get_settings
 from tradehub.models import (
+    AccountAssetsResponse,
     CancelOrderRequest,
     HealthResponse,
     OrderIntent,
+    OrdersResponse,
+    PositionsResponse,
     PreviewResponse,
     SubmitOrderRequest,
     SubmitOrderResponse,
@@ -164,6 +167,89 @@ def cancel_order(
         "order_id": request.order_id,
         "tiger_response": response,
     }
+
+
+@app.get(
+    "/account/assets",
+    response_model=AccountAssetsResponse,
+    dependencies=[Depends(require_auth)],
+)
+def account_assets(
+    store: AuditStore = Depends(get_store),
+    gateway: TigerGateway = Depends(get_gateway),
+):
+    if not gateway.is_configured():
+        return AccountAssetsResponse(
+            tiger_configured=False,
+            warning="Tiger credentials are not configured",
+        )
+    try:
+        assets = gateway.get_assets()
+    except Exception as exc:
+        store.record_event("read_error", {"resource": "account_assets", "reason": str(exc)})
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    store.record_event("read_account_assets", {})
+    return AccountAssetsResponse(tiger_configured=True, assets=assets)
+
+
+@app.get(
+    "/account/positions",
+    response_model=PositionsResponse,
+    dependencies=[Depends(require_auth)],
+)
+def account_positions(
+    symbol: str | None = Query(default=None, min_length=1, max_length=16),
+    store: AuditStore = Depends(get_store),
+    gateway: TigerGateway = Depends(get_gateway),
+):
+    if not gateway.is_configured():
+        return PositionsResponse(
+            tiger_configured=False,
+            warning="Tiger credentials are not configured",
+        )
+    try:
+        positions = gateway.get_positions(symbol=symbol)
+    except Exception as exc:
+        store.record_event(
+            "read_error",
+            {"resource": "account_positions", "symbol": symbol, "reason": str(exc)},
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    store.record_event("read_account_positions", {"symbol": symbol})
+    return PositionsResponse(tiger_configured=True, positions=positions)
+
+
+@app.get(
+    "/account/orders",
+    response_model=OrdersResponse,
+    dependencies=[Depends(require_auth)],
+)
+def account_orders(
+    symbol: str | None = Query(default=None, min_length=1, max_length=16),
+    limit: int = Query(default=20, ge=1, le=100),
+    store: AuditStore = Depends(get_store),
+    gateway: TigerGateway = Depends(get_gateway),
+):
+    if not gateway.is_configured():
+        return OrdersResponse(
+            tiger_configured=False,
+            warning="Tiger credentials are not configured",
+        )
+    try:
+        orders = gateway.get_orders(symbol=symbol, limit=limit)
+    except Exception as exc:
+        store.record_event(
+            "read_error",
+            {
+                "resource": "account_orders",
+                "symbol": symbol,
+                "limit": limit,
+                "reason": str(exc),
+            },
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    store.record_event("read_account_orders", {"symbol": symbol, "limit": limit})
+    return OrdersResponse(tiger_configured=True, orders=orders)
 
 
 def main() -> None:
