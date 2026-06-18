@@ -20,6 +20,25 @@ def main() -> None:
         return await client.get("/health")
 
     @mcp.tool()
+    async def account_assets() -> dict[str, Any]:
+        """Read Tiger account assets through TradeHub without placing any orders."""
+        return await client.get("/account/assets")
+
+    @mcp.tool()
+    async def account_positions(symbol: str | None = None) -> dict[str, Any]:
+        """Read Tiger account positions, optionally filtered by symbol."""
+        params = {"symbol": symbol} if symbol else None
+        return await client.get("/account/positions", params=params)
+
+    @mcp.tool()
+    async def account_orders(symbol: str | None = None, limit: int = 20) -> dict[str, Any]:
+        """Read recent Tiger account orders, optionally filtered by symbol."""
+        params: dict[str, Any] = {"limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        return await client.get("/account/orders", params=params)
+
+    @mcp.tool()
     async def preview_order(
         symbol: str,
         side: str,

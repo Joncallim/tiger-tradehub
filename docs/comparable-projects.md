@@ -32,8 +32,8 @@ toolbox:
 - Preview-first order flow with short-lived confirmation tokens.
 - Dry-run mode on by default.
 - Local SQLite audit log.
-- ChatGPT Actions compatibility through FastAPI's OpenAPI schema.
-- Claude compatibility through a thin MCP adapter that calls the same guarded API.
+- Claude-first compatibility through a thin MCP adapter that calls the guarded local API.
+- ChatGPT Actions compatibility through FastAPI's OpenAPI schema for advanced per-user deployments.
 - Telegram commands that use the same preview/confirm path rather than placing orders directly.
 
 ## Follow-Up Ideas
@@ -44,4 +44,3 @@ toolbox:
   order previews.
 - Add portfolio and buying-power endpoints before enabling live trading.
 - Add replay tests inspired by `MockTrader_MCP` for policy regression coverage.
-

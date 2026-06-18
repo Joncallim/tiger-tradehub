@@ -6,3 +6,5 @@ __pycache__/
 data/
 *.pyc
 *.egg-info/
+.codex/
+.claude/settings.local.json

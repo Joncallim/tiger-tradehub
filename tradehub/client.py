@@ -18,9 +18,11 @@ class TradeHubClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_token}"}
 
-    async def get(self, path: str) -> dict[str, Any]:
+    async def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(f"{self.base_url}{path}", headers=self._headers())
+            response = await client.get(
+                f"{self.base_url}{path}", headers=self._headers(), params=params
+            )
             response.raise_for_status()
             return response.json()
 
@@ -31,4 +33,3 @@ class TradeHubClient:
             )
             response.raise_for_status()
             return response.json()
-

@@ -81,3 +81,20 @@ class HealthResponse(BaseModel):
     tiger_configured: bool
     require_approval: bool
 
+
+class AccountAssetsResponse(BaseModel):
+    tiger_configured: bool
+    assets: dict[str, Any] | None = None
+    warning: str | None = None
+
+
+class PositionsResponse(BaseModel):
+    tiger_configured: bool
+    positions: list[dict[str, Any]] = Field(default_factory=list)
+    warning: str | None = None
+
+
+class OrdersResponse(BaseModel):
+    tiger_configured: bool
+    orders: list[dict[str, Any]] = Field(default_factory=list)
+    warning: str | None = None

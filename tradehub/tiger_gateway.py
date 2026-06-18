@@ -32,8 +32,36 @@ class TigerGateway:
     def cancel_order(self, order_id: str) -> dict[str, Any] | None:
         if not self.is_configured():
             raise RuntimeError("Tiger credentials are not configured")
-        response = self.trade_client.cancel_order(order_id)
+        response = self.trade_client.cancel_order(
+            account=self.settings.tiger_account, order_id=order_id
+        )
         return normalize(response)
+
+    def get_assets(self) -> dict[str, Any] | None:
+        if not self.is_configured():
+            raise RuntimeError("Tiger credentials are not configured")
+        response = self.trade_client.get_assets(account=self.settings.tiger_account)
+        return normalize(response)
+
+    def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if not self.is_configured():
+            raise RuntimeError("Tiger credentials are not configured")
+        response = self.trade_client.get_positions(
+            account=self.settings.tiger_account,
+            symbol=symbol.upper() if symbol else None,
+        )
+        return normalize_collection(response)
+
+    def get_orders(self, symbol: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        if not self.is_configured():
+            raise RuntimeError("Tiger credentials are not configured")
+        response = self.trade_client.get_orders(
+            account=self.settings.tiger_account,
+            symbol=symbol.upper() if symbol else None,
+            limit=limit,
+            is_brief=True,
+        )
+        return normalize_collection(response)
 
     @property
     def trade_client(self) -> Any:
@@ -95,3 +123,11 @@ def normalize(value: Any) -> dict[str, Any] | None:
         }
     return {"value": str(value)}
 
+
+def normalize_collection(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, list | tuple):
+        return [item for item in (normalize(entry) for entry in value) if item is not None]
+    item = normalize(value)
+    return [item] if item is not None else []
