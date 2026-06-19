@@ -17,12 +17,14 @@ def validate_order_intent(intent: OrderIntent, settings: Settings) -> list[str]:
 
     if intent.quantity > settings.max_quantity:
         raise PolicyError(
-            f"quantity {intent.quantity:g} exceeds TRADEHUB_MAX_QUANTITY "
-            f"{settings.max_quantity:g}"
+            f"quantity {intent.quantity:g} exceeds TRADEHUB_MAX_QUANTITY {settings.max_quantity:g}"
         )
 
-    if intent.order_type == OrderType.MARKET and not settings.allow_market_orders:
-        raise PolicyError("market orders are disabled by TRADEHUB_ALLOW_MARKET_ORDERS=false")
+    if intent.currency != "USD":
+        raise PolicyError("only USD-denominated orders are supported")
+
+    if intent.order_type == OrderType.MARKET:
+        raise PolicyError("market orders are not supported")
 
     notional = intent.estimated_notional
     if notional is not None and notional > settings.max_notional_usd:
@@ -31,11 +33,7 @@ def validate_order_intent(intent: OrderIntent, settings: Settings) -> list[str]:
             f"{settings.max_notional_usd:.2f}"
         )
 
-    if intent.order_type == OrderType.MARKET:
-        warnings.append("Market orders do not guarantee execution price.")
-
     if settings.dry_run:
         warnings.append("Dry-run mode is active; submit will not place a live Tiger order.")
 
     return warnings
-

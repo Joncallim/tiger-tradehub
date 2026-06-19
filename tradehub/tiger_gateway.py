@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tradehub.config import Settings
+from tradehub.config import Settings, secret_value
 from tradehub.models import OrderIntent, OrderType
 
 
@@ -26,7 +26,7 @@ class TigerGateway:
             raise RuntimeError("Tiger credentials are not configured")
         order = self._build_order(intent)
         response = self.trade_client.place_order(order)
-        order_id = getattr(order, "id", None) or response
+        order_id = extract_order_id(response) or extract_order_id(order)
         return str(order_id) if order_id is not None else None, normalize(response or order)
 
     def cancel_order(self, order_id: str) -> dict[str, Any] | None:
@@ -80,8 +80,9 @@ class TigerGateway:
         config.account = self.settings.tiger_account
         config.language = Language.en_US
 
-        if self.settings.tiger_private_key:
-            config.private_key = self.settings.tiger_private_key.replace("\\n", "\n")
+        private_key = secret_value(self.settings.tiger_private_key)
+        if private_key:
+            config.private_key = private_key.replace("\\n", "\n")
         elif self.settings.tiger_private_key_path:
             config.private_key = read_private_key(str(self.settings.tiger_private_key_path))
 
@@ -122,6 +123,14 @@ def normalize(value: Any) -> dict[str, Any] | None:
             if not key.startswith("_") and isinstance(item, str | int | float | bool | type(None))
         }
     return {"value": str(value)}
+
+
+def extract_order_id(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get("order_id") or value.get("id")
+    return getattr(value, "order_id", None) or getattr(value, "id", None)
 
 
 def normalize_collection(value: Any) -> list[dict[str, Any]]:

@@ -16,18 +16,14 @@ def main() -> None:
     settings = get_settings()
     if not settings.telegram_bot_token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
+    if not settings.telegram_allowed_chat_ids:
+        raise SystemExit("TELEGRAM_ALLOWED_CHAT_IDS must contain at least one chat id")
 
     client = TradeHubClient()
 
     def allowed(update: Update) -> bool:
         chat_id = update.effective_chat.id if update.effective_chat else None
-        return bool(
-            chat_id
-            and (
-                not settings.telegram_allowed_chat_ids
-                or chat_id in settings.telegram_allowed_chat_ids
-            )
-        )
+        return bool(chat_id and chat_id in settings.telegram_allowed_chat_ids)
 
     async def reject_if_needed(update: Update) -> bool:
         if allowed(update):
@@ -92,12 +88,39 @@ def main() -> None:
             return
         await update.message.reply_text(format_response(response), parse_mode="HTML")
 
-    app = Application.builder().token(settings.telegram_bot_token).build()
+    async def assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await reject_if_needed(update):
+            return
+        response = await client.get("/account/assets")
+        await update.message.reply_text(format_response(response), parse_mode="HTML")
+
+    async def positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await reject_if_needed(update):
+            return
+        params = {"symbol": context.args[0]} if context.args else None
+        response = await client.get("/account/positions", params=params)
+        await update.message.reply_text(format_response(response), parse_mode="HTML")
+
+    async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await reject_if_needed(update):
+            return
+        params: dict[str, object] = {}
+        if context.args:
+            params["symbol"] = context.args[0]
+        if len(context.args) > 1:
+            params["limit"] = int(context.args[1])
+        response = await client.get("/account/orders", params=params or None)
+        await update.message.reply_text(format_response(response), parse_mode="HTML")
+
+    app = Application.builder().token(settings.telegram_bot_token.get_secret_value()).build()
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("preview", preview))
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("sell", sell))
     app.add_handler(CommandHandler("confirm", confirm))
+    app.add_handler(CommandHandler("assets", assets))
+    app.add_handler(CommandHandler("positions", positions))
+    app.add_handler(CommandHandler("orders", orders))
     app.run_polling()
 
 

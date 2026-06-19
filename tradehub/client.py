@@ -8,9 +8,9 @@ import httpx
 
 class TradeHubClient:
     def __init__(self, base_url: str | None = None, api_token: str | None = None):
-        self.base_url = (base_url or os.getenv("TRADEHUB_BASE_URL") or "http://127.0.0.1:8787").rstrip(
-            "/"
-        )
+        self.base_url = (
+            base_url or os.getenv("TRADEHUB_BASE_URL") or "http://127.0.0.1:8787"
+        ).rstrip("/")
         self.api_token = api_token or os.getenv("TRADEHUB_API_TOKEN")
         if not self.api_token:
             raise RuntimeError("TRADEHUB_API_TOKEN is required")

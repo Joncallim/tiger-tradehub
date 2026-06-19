@@ -75,6 +75,13 @@ class CancelOrderRequest(BaseModel):
     order_id: str = Field(min_length=1)
 
 
+class CancelOrderResponse(BaseModel):
+    cancelled: bool
+    dry_run: bool
+    order_id: str
+    tiger_response: dict[str, Any] | None = None
+
+
 class HealthResponse(BaseModel):
     ok: bool
     dry_run: bool
