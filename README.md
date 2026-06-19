@@ -48,6 +48,9 @@ Keep `TRADEHUB_DRY_RUN=true` and use a Tiger paper account until you have verifi
 
 This is the recommended path.
 
+For a slower step-by-step walkthrough, including Claude Desktop MCP setup and Tiger paper-account
+testing, see [docs/claude-mcp-paper-account-setup.md](docs/claude-mcp-paper-account-setup.md).
+
 ```bash
 cd tiger-tradehub
 python3 -m venv .venv
