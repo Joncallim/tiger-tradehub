@@ -146,7 +146,20 @@ def preview_order(
             detail=str(exc),
         ) from exc
 
-    tiger_preview = gateway.preview_order(intent)
+    try:
+        tiger_preview = gateway.preview_order(intent)
+    except Exception as exc:
+        detail = upstream_error_detail()
+        record_upstream_error(
+            store,
+            settings,
+            "preview_error",
+            {"intent": intent.model_dump()},
+            exc,
+            detail,
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+
     token, expires_at = store.create_confirmation(
         intent, tiger_preview, settings.confirmation_ttl_seconds
     )

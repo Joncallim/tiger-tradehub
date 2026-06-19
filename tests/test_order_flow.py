@@ -13,11 +13,14 @@ class FakeGateway:
     def __init__(self):
         self.placed = False
         self.fail_place = False
+        self.fail_preview = False
 
     def is_configured(self):
         return True
 
     def preview_order(self, intent):
+        if self.fail_preview:
+            raise RuntimeError("preview failed for sensitive-account")
         return {"preview_symbol": intent.symbol}
 
     def place_order(self, intent):
@@ -118,6 +121,31 @@ def test_live_place_failure_releases_confirmation_for_retry(tmp_path):
     assert retried.status_code == 200
     assert retried.json()["submitted"] is True
     assert event_types(db_path) == ["preview_created", "submit_error", "live_submit"]
+
+
+def test_preview_failure_is_sanitized_and_does_not_create_token(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DATABASE_PATH=db_path,
+        TIGEROPEN_ACCOUNT="sensitive-account",
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    gateway.fail_preview = True
+    install(settings, store, gateway)
+
+    try:
+        response = TestClient(app).post(
+            "/orders/preview", json=preview_payload(), headers=headers()
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["message"] == "upstream broker request failed"
+    assert "sensitive-account" not in response.text
+    assert event_types(db_path) == ["preview_error"]
 
 
 def test_submit_policy_revalidation_blocks_and_records_event(tmp_path):

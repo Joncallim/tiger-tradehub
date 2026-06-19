@@ -11,6 +11,8 @@ from typing import Any
 
 from tradehub.models import OrderIntent
 
+STALE_CLAIM_SECONDS = 120
+
 
 class AuditStore:
     def __init__(self, path: Path):
@@ -106,7 +108,8 @@ class AuditStore:
         return self.claim_confirmation(token)
 
     def claim_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None]:
-        now = utc_now().isoformat()
+        now = utc_now()
+        stale_before = now - timedelta(seconds=STALE_CLAIM_SECONDS)
         with self.connect() as db:
             cursor = db.execute(
                 """
@@ -114,10 +117,10 @@ class AuditStore:
                 SET claimed_at = ?
                 WHERE token = ?
                   AND submitted_at IS NULL
-                  AND claimed_at IS NULL
+                  AND (claimed_at IS NULL OR claimed_at < ?)
                   AND expires_at >= ?
                 """,
-                (now, token, now),
+                (now.isoformat(), token, stale_before.isoformat(), now.isoformat()),
             )
             row = db.execute(
                 "SELECT * FROM confirmations WHERE token = ?",
@@ -134,7 +137,7 @@ class AuditStore:
                 raise ValueError("confirmation token has already been submitted")
             if row["claimed_at"]:
                 raise ValueError("confirmation token is already being submitted")
-            if datetime.fromisoformat(row["expires_at"]) < utc_now():
+            if datetime.fromisoformat(row["expires_at"]) < now:
                 raise ValueError("confirmation token has expired")
             raise ValueError("confirmation token could not be claimed")
 

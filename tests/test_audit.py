@@ -1,9 +1,10 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import pytest
 
-from tradehub.audit import AuditStore
+from tradehub.audit import STALE_CLAIM_SECONDS, AuditStore, utc_now
 from tradehub.models import OrderIntent
 
 
@@ -59,6 +60,23 @@ def test_concurrent_claim_allows_only_one_submitter(tmp_path):
 
     assert results.count("ok") == 1
     assert any("already being submitted" in result for result in results)
+
+
+def test_stale_claim_can_be_reclaimed(tmp_path):
+    store = AuditStore(tmp_path / "tradehub.db")
+    token, _ = store.create_confirmation(intent(), None, ttl_seconds=300)
+    store.claim_confirmation(token)
+    stale_claimed_at = utc_now() - timedelta(seconds=STALE_CLAIM_SECONDS + 1)
+
+    with sqlite3.connect(tmp_path / "tradehub.db") as db:
+        db.execute(
+            "UPDATE confirmations SET claimed_at = ? WHERE token = ?",
+            (stale_claimed_at.isoformat(), token),
+        )
+
+    reclaimed_intent, _ = store.claim_confirmation(token)
+
+    assert reclaimed_intent.symbol == "AAPL"
 
 
 def test_claim_rejects_unknown_and_expired_tokens(tmp_path):

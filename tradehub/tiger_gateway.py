@@ -128,6 +128,8 @@ def normalize(value: Any) -> dict[str, Any] | None:
 def extract_order_id(value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(value, str | int):
+        return value
     if isinstance(value, dict):
         return value.get("order_id") or value.get("id")
     return getattr(value, "order_id", None) or getattr(value, "id", None)

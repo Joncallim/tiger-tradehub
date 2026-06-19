@@ -8,13 +8,14 @@ STRONG_TOKEN = "test-token-with-enough-length"
 class FakeTradeClient:
     def __init__(self):
         self.cancel_kwargs = None
+        self.place_response = {"order_id": "broker-order-123"}
 
     def cancel_order(self, **kwargs):
         self.cancel_kwargs = kwargs
         return {"cancelled": True}
 
     def place_order(self, order):
-        return {"order_id": "broker-order-123"}
+        return self.place_response
 
 
 class FakeGateway(TigerGateway):
@@ -52,3 +53,17 @@ def test_place_order_prefers_broker_response_order_id():
 
     assert order_id == "broker-order-123"
     assert response == {"order_id": "broker-order-123"}
+
+
+def test_place_order_accepts_scalar_broker_order_id():
+    gateway = FakeGateway(settings())
+    client = FakeTradeClient()
+    client.place_response = 12345
+    gateway._trade_client = client
+
+    order_id, response = gateway.place_order(
+        OrderIntent(symbol="AAPL", side="BUY", quantity=1, limit_price=150)
+    )
+
+    assert order_id == "12345"
+    assert response == {"value": "12345"}
