@@ -4,9 +4,11 @@ from tradehub.config import Settings
 from tradehub.models import OrderIntent
 from tradehub.policy import PolicyError, validate_order_intent
 
+STRONG_TOKEN = "test-token-with-enough-length"
+
 
 def settings(**overrides):
-    base = {"TRADEHUB_API_TOKEN": "test-token"}
+    base = {"TRADEHUB_API_TOKEN": STRONG_TOKEN}
     base.update(overrides)
     return Settings(**base)
 
@@ -40,3 +42,9 @@ def test_notional_limit_blocks_large_order():
     with pytest.raises(PolicyError):
         validate_order_intent(intent, settings(TRADEHUB_MAX_NOTIONAL_USD=100))
 
+
+def test_non_usd_order_is_rejected():
+    intent = OrderIntent(symbol="AAPL", side="BUY", quantity=1, limit_price=150, currency="HKD")
+
+    with pytest.raises(PolicyError, match="USD"):
+        validate_order_intent(intent, settings())

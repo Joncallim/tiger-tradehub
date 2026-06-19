@@ -4,6 +4,10 @@ Tiger TradeHub is a guarded local bridge from Claude to Tiger Brokers OpenAPI.
 It is designed primarily for a local Claude MCP workflow: you run TradeHub on your own machine,
 Claude gets a small set of trading tools, and Tiger credentials stay in your local environment.
 
+This project is not financial advice. It is local trading infrastructure provided as-is under the
+MIT License. Keep dry-run mode enabled and use a Tiger paper account until you have personally
+verified every preview, confirmation, and submit path.
+
 TradeHub uses Tiger's official Python SDK for account, preview, and order placement, but keeps AI
 clients behind explicit policy checks and a two-step confirmation flow.
 
@@ -15,7 +19,8 @@ public trading endpoint.
 
 - Local `FastAPI` REST service used as the guarded backend.
 - MCP server for Claude Desktop or Claude Code.
-- Optional Telegram bot for `/buy`, `/sell`, `/preview`, `/confirm`, and `/health`.
+- Optional Telegram bot for `/buy`, `/sell`, `/preview`, `/confirm`, `/assets`, `/positions`,
+  `/orders`, and `/health`.
 - SQLite audit trail for previews, confirmations, submissions, and blocked requests.
 - Dry-run mode enabled by default.
 - OpenAPI schema for advanced direct HTTP or ChatGPT Actions deployments.
@@ -33,6 +38,9 @@ The service is deliberately not a raw trading proxy.
 3. TradeHub returns a confirmation token and, when configured, Tiger's own order preview.
 4. The client must call `/orders/submit` with that token before it expires.
 5. If `TRADEHUB_DRY_RUN=true`, no live Tiger order is placed.
+
+Release 1 intentionally supports USD-denominated limit orders only. Market orders and non-USD
+orders are rejected until a stronger exposure model and FX conversion are added.
 
 Keep `TRADEHUB_DRY_RUN=true` and use a Tiger paper account until you have verified the full flow.
 
@@ -60,6 +68,8 @@ Generate a token with:
 ```bash
 python -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
+
+Startup rejects empty, placeholder, and short API tokens.
 
 Dry-run mode does not place live Tiger orders. Keep it enabled until the full Claude preview and
 confirmation flow is verified.
@@ -117,7 +127,7 @@ Use the absolute path to `tradehub-mcp` from this checkout. For example, if the 
 ```
 
 Restart Claude after editing the config. Claude should then have TradeHub tools for health checks,
-order previews, order submission, and cancellation.
+account reads, order previews, order submission, and cancellation.
 
 The MCP tools call TradeHub's guarded REST API; they do not talk to Tiger directly.
 
@@ -183,7 +193,27 @@ Commands:
 - `/buy AAPL 1 150`
 - `/sell AAPL 1 150`
 - `/confirm <token>`
+- `/assets`
+- `/positions [SYMBOL]`
+- `/orders [SYMBOL] [LIMIT]`
 - `/health`
+
+The Telegram bot fails closed: `TELEGRAM_ALLOWED_CHAT_IDS` must contain at least one chat ID when
+`TELEGRAM_BOT_TOKEN` is set.
+
+## Reproducible Installs
+
+`requirements.lock` captures the pinned environment used for local verification. Use it when you
+want a reproducible app environment:
+
+```bash
+pip install -r requirements.lock
+pip install -e ".[mcp]"
+```
+
+## License
+
+Tiger TradeHub is released under the MIT License. See [LICENSE](LICENSE).
 
 ## Sources
 

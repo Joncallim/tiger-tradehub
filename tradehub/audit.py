@@ -20,8 +20,10 @@ class AuditStore:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA journal_mode=WAL")
         try:
             yield connection
             connection.commit()
@@ -38,11 +40,13 @@ class AuditStore:
                     tiger_preview_json TEXT,
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
+                    claimed_at TEXT,
                     submitted_at TEXT,
                     order_id TEXT
                 )
                 """
             )
+            self._add_column_if_missing(db, "confirmations", "claimed_at", "TEXT")
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -53,6 +57,13 @@ class AuditStore:
                 )
                 """
             )
+
+    def _add_column_if_missing(
+        self, db: sqlite3.Connection, table: str, column: str, definition: str
+    ) -> None:
+        columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def record_event(self, event_type: str, payload: dict[str, Any]) -> None:
         with self.connect() as db:
@@ -92,26 +103,64 @@ class AuditStore:
         return token, expires_at
 
     def consume_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None]:
+        return self.claim_confirmation(token)
+
+    def claim_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None]:
+        now = utc_now().isoformat()
         with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET claimed_at = ?
+                WHERE token = ?
+                  AND submitted_at IS NULL
+                  AND claimed_at IS NULL
+                  AND expires_at >= ?
+                """,
+                (now, token, now),
+            )
             row = db.execute(
                 "SELECT * FROM confirmations WHERE token = ?",
                 (token,),
             ).fetchone()
             if row is None:
                 raise KeyError("unknown confirmation token")
+            if cursor.rowcount == 1:
+                preview = (
+                    json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
+                )
+                return OrderIntent.model_validate_json(row["intent_json"]), preview
             if row["submitted_at"]:
                 raise ValueError("confirmation token has already been submitted")
-            expires_at = datetime.fromisoformat(row["expires_at"])
-            if expires_at < utc_now():
+            if row["claimed_at"]:
+                raise ValueError("confirmation token is already being submitted")
+            if datetime.fromisoformat(row["expires_at"]) < utc_now():
                 raise ValueError("confirmation token has expired")
+            raise ValueError("confirmation token could not be claimed")
 
-            db.execute(
-                "UPDATE confirmations SET submitted_at = ? WHERE token = ?",
-                (utc_now().isoformat(), token),
+    def finalize_confirmation(self, token: str, order_id: str | None = None) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET submitted_at = ?, claimed_at = NULL, order_id = ?
+                WHERE token = ? AND claimed_at IS NOT NULL AND submitted_at IS NULL
+                """,
+                (utc_now().isoformat(), order_id, token),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("confirmation token is not claimed")
 
-        preview = json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
-        return OrderIntent.model_validate_json(row["intent_json"]), preview
+    def release_confirmation(self, token: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE confirmations
+                SET claimed_at = NULL
+                WHERE token = ? AND submitted_at IS NULL
+                """,
+                (token,),
+            )
 
     def mark_order_id(self, token: str, order_id: str | None) -> None:
         with self.connect() as db:

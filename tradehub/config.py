@@ -3,16 +3,17 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+MIN_API_TOKEN_LENGTH = 24
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    api_token: str = Field(alias="TRADEHUB_API_TOKEN")
+    api_token: SecretStr = Field(alias="TRADEHUB_API_TOKEN")
     dry_run: bool = Field(default=True, alias="TRADEHUB_DRY_RUN")
-    require_approval: bool = Field(default=True, alias="TRADEHUB_REQUIRE_APPROVAL")
     bind_host: str = Field(default="127.0.0.1", alias="TRADEHUB_BIND_HOST")
     port: int = Field(default=8787, alias="TRADEHUB_PORT")
     database_path: Path = Field(default=Path("data/tradehub.db"), alias="TRADEHUB_DATABASE_PATH")
@@ -20,19 +21,30 @@ class Settings(BaseSettings):
     symbol_allowlist: set[str] = Field(default_factory=set, alias="TRADEHUB_SYMBOL_ALLOWLIST")
     max_notional_usd: float = Field(default=1000.0, alias="TRADEHUB_MAX_NOTIONAL_USD")
     max_quantity: float = Field(default=100.0, alias="TRADEHUB_MAX_QUANTITY")
-    allow_market_orders: bool = Field(default=False, alias="TRADEHUB_ALLOW_MARKET_ORDERS")
     confirmation_ttl_seconds: int = Field(default=300, alias="TRADEHUB_CONFIRMATION_TTL_SECONDS")
 
     tiger_id: str | None = Field(default=None, alias="TIGEROPEN_TIGER_ID")
     tiger_account: str | None = Field(default=None, alias="TIGEROPEN_ACCOUNT")
     tiger_private_key_path: Path | None = Field(default=None, alias="TIGEROPEN_PRIVATE_KEY_PATH")
-    tiger_private_key: str | None = Field(default=None, alias="TIGEROPEN_PRIVATE_KEY")
+    tiger_private_key: SecretStr | None = Field(default=None, alias="TIGEROPEN_PRIVATE_KEY")
     tiger_sandbox: bool = Field(default=False, alias="TIGEROPEN_SANDBOX")
 
-    telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
+    telegram_bot_token: SecretStr | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_chat_ids: set[int] = Field(
         default_factory=set, alias="TELEGRAM_ALLOWED_CHAT_IDS"
     )
+
+    @field_validator("api_token")
+    @classmethod
+    def validate_api_token(cls, value: SecretStr) -> SecretStr:
+        token = value.get_secret_value()
+        if not token or token == "change-me":
+            raise ValueError("TRADEHUB_API_TOKEN must be set to a strong random token")
+        if len(token) < MIN_API_TOKEN_LENGTH:
+            raise ValueError(
+                f"TRADEHUB_API_TOKEN must be at least {MIN_API_TOKEN_LENGTH} characters"
+            )
+        return value
 
     @field_validator("symbol_allowlist", mode="before")
     @classmethod
@@ -61,7 +73,10 @@ class Settings(BaseSettings):
         )
 
 
+def secret_value(value: SecretStr | None) -> str | None:
+    return value.get_secret_value() if value is not None else None
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
-
