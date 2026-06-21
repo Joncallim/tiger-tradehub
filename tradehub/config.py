@@ -2,11 +2,32 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Any
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 MIN_API_TOKEN_LENGTH = 24
+PLACEHOLDER_API_TOKENS = {
+    "change-me",
+    "replace-with-a-long-random-token",
+    "paste-your-generated-token-here",
+}
+
+
+def validate_api_token_value(token: str) -> str:
+    if not token or token in PLACEHOLDER_API_TOKENS:
+        raise ValueError("TRADEHUB_API_TOKEN must be set to a strong random token")
+    if len(token) < MIN_API_TOKEN_LENGTH:
+        raise ValueError(f"TRADEHUB_API_TOKEN must be at least {MIN_API_TOKEN_LENGTH} characters")
+    return token
+
+
+class BootstrapSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    bind_host: str = Field(default="127.0.0.1", alias="TRADEHUB_BIND_HOST")
+    port: int = Field(default=8787, alias="TRADEHUB_PORT")
 
 
 class Settings(BaseSettings):
@@ -18,7 +39,9 @@ class Settings(BaseSettings):
     port: int = Field(default=8787, alias="TRADEHUB_PORT")
     database_path: Path = Field(default=Path("data/tradehub.db"), alias="TRADEHUB_DATABASE_PATH")
 
-    symbol_allowlist: set[str] = Field(default_factory=set, alias="TRADEHUB_SYMBOL_ALLOWLIST")
+    symbol_allowlist: Annotated[set[str], NoDecode] = Field(
+        default_factory=set, alias="TRADEHUB_SYMBOL_ALLOWLIST"
+    )
     max_notional_usd: float = Field(default=1000.0, alias="TRADEHUB_MAX_NOTIONAL_USD")
     max_quantity: float = Field(default=100.0, alias="TRADEHUB_MAX_QUANTITY")
     confirmation_ttl_seconds: int = Field(default=300, alias="TRADEHUB_CONFIRMATION_TTL_SECONDS")
@@ -30,20 +53,28 @@ class Settings(BaseSettings):
     tiger_sandbox: bool = Field(default=False, alias="TIGEROPEN_SANDBOX")
 
     telegram_bot_token: SecretStr | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
-    telegram_allowed_chat_ids: set[int] = Field(
+    telegram_allowed_chat_ids: Annotated[set[int], NoDecode] = Field(
         default_factory=set, alias="TELEGRAM_ALLOWED_CHAT_IDS"
     )
 
     @field_validator("api_token")
     @classmethod
     def validate_api_token(cls, value: SecretStr) -> SecretStr:
-        token = value.get_secret_value()
-        if not token or token == "change-me":
-            raise ValueError("TRADEHUB_API_TOKEN must be set to a strong random token")
-        if len(token) < MIN_API_TOKEN_LENGTH:
-            raise ValueError(
-                f"TRADEHUB_API_TOKEN must be at least {MIN_API_TOKEN_LENGTH} characters"
-            )
+        validate_api_token_value(value.get_secret_value())
+        return value
+
+    @field_validator(
+        "tiger_id",
+        "tiger_account",
+        "tiger_private_key_path",
+        "tiger_private_key",
+        "telegram_bot_token",
+        mode="before",
+    )
+    @classmethod
+    def empty_optional_value_as_none(cls, value: Any) -> Any:
+        if value == "":
+            return None
         return value
 
     @field_validator("symbol_allowlist", mode="before")
@@ -80,3 +111,8 @@ def secret_value(value: SecretStr | None) -> str | None:
 @lru_cache
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
+
+
+@lru_cache
+def get_bootstrap_settings() -> BootstrapSettings:
+    return BootstrapSettings()  # type: ignore[call-arg]

@@ -53,26 +53,18 @@ testing, see [docs/claude-mcp-paper-account-setup.md](docs/claude-mcp-paper-acco
 
 ```bash
 cd tiger-tradehub
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[mcp]"
-cp .env.example .env
+./setup.sh
 ```
 
-Edit `.env` and set a strong local API token:
+Open `http://127.0.0.1:8787/setup`.
 
-```bash
-TRADEHUB_API_TOKEN=replace-with-a-long-random-token
-TRADEHUB_DRY_RUN=true
-```
+The script creates `.venv`, installs TradeHub with MCP support, and starts the local setup UI. The
+setup page creates `.env`, generates a strong local API token, keeps dry-run enabled by default, and
+can write the Claude MCP config entry for this checkout. Startup no longer requires a prebuilt `.env`;
+the protected trading API still rejects empty, placeholder, and short API tokens.
 
-Generate a token with:
-
-```bash
-python -c 'import secrets; print(secrets.token_urlsafe(32))'
-```
-
-Startup rejects empty, placeholder, and short API tokens.
+The setup page is intended for local use only. It rejects non-loopback clients, non-loopback `Host`
+headers, and non-local browser origins on write requests.
 
 Dry-run mode does not place live Tiger orders. Keep it enabled until the full Claude preview and
 confirmation flow is verified.
@@ -88,12 +80,12 @@ Tiger credentials come from Tiger's developer portal:
 ## Run TradeHub
 
 ```bash
-source .venv/bin/activate
-tradehub
+./setup.sh
 ```
 
 Open:
 
+- Setup: `http://127.0.0.1:8787/setup`
 - API docs: `http://127.0.0.1:8787/docs`
 - OpenAPI schema: `http://127.0.0.1:8787/openapi.json`
 
@@ -106,7 +98,11 @@ curl -s http://127.0.0.1:8787/health \
 
 ## Connect Claude
 
-Run the API first, then add this MCP server to Claude Desktop or Claude Code config:
+Run the API first, then use `http://127.0.0.1:8787/setup` to write the Claude Desktop MCP config.
+The setup page uses the token from `.env` and preserves existing MCP servers in the target config
+file.
+
+Manual config is still supported:
 
 ```json
 {
@@ -133,6 +129,15 @@ Restart Claude after editing the config. Claude should then have TradeHub tools 
 account reads, order previews, order submission, and cancellation.
 
 The MCP tools call TradeHub's guarded REST API; they do not talk to Tiger directly.
+
+## Local Service Or SaaS
+
+Every user does not strictly have to run a separate service, but this release is designed for that
+local single-user model. A hosted SaaS version would be a different architecture: real user auth,
+tenant-isolated broker credentials, managed secrets, per-user policy limits, approval/audit UX,
+abuse controls, operational monitoring, and legal/compliance review for hosted trading workflows.
+
+Do not run the current app unchanged as a multi-user trading service.
 
 ## First Dry-Run Flow
 

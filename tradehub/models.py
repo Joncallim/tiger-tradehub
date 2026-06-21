@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,15}$")
+CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
 
 
 class Side(str, Enum):
@@ -29,10 +33,21 @@ class OrderIntent(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
     client_request_id: str | None = Field(default=None, max_length=128)
 
-    @field_validator("symbol", "currency")
+    @field_validator("symbol")
     @classmethod
-    def uppercase(cls, value: str) -> str:
-        return value.upper()
+    def normalize_symbol(cls, value: str) -> str:
+        symbol = value.upper()
+        if not SYMBOL_PATTERN.fullmatch(symbol):
+            raise ValueError("symbol must use only letters, numbers, dot, dash, or underscore")
+        return symbol
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        currency = value.upper()
+        if not CURRENCY_PATTERN.fullmatch(currency):
+            raise ValueError("currency must be a 3-letter ISO code")
+        return currency
 
     @model_validator(mode="after")
     def validate_price(self) -> OrderIntent:

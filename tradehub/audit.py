@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 from collections.abc import Iterator
@@ -17,8 +18,9 @@ STALE_CLAIM_SECONDS = 120
 class AuditStore:
     def __init__(self, path: Path):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._init_db()
+        self._secure_files()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -31,6 +33,7 @@ class AuditStore:
             connection.commit()
         finally:
             connection.close()
+            self._secure_files()
 
     def _init_db(self) -> None:
         with self.connect() as db:
@@ -66,6 +69,16 @@ class AuditStore:
         columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _secure_files(self) -> None:
+        sidecars = (
+            self.path,
+            self.path.with_name(f"{self.path.name}-wal"),
+            self.path.with_name(f"{self.path.name}-shm"),
+        )
+        for path in sidecars:
+            if path.exists():
+                os.chmod(path, 0o600)
 
     def record_event(self, event_type: str, payload: dict[str, Any]) -> None:
         with self.connect() as db:

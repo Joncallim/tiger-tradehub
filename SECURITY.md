@@ -9,6 +9,7 @@ to `127.0.0.1` by default and is reachable only from the same machine.
 Vulnerabilities in scope:
 
 - Authentication bypass (bearer token handling in `tradehub/app.py`)
+- Setup UI bypass that allows non-local hosts or browser origins to write `.env` or MCP config
 - Confirmation token replay or TTL bypass (`tradehub/audit.py`)
 - Policy engine bypass (symbol allowlist, notional cap, quantity cap, market order gate in
   `tradehub/policy.py`)
@@ -58,6 +59,8 @@ The key controls in the current codebase are documented in the
 [threat model](docs/threat-model.md). The short version:
 
 - The API requires a bearer token on every endpoint.
+- The setup UI is unauthenticated but restricted to loopback clients, loopback `Host` headers, local
+  browser origins for writes, and JSON-only write requests.
 - `dry_run=true` is the default; no live orders are placed without explicitly setting
   `TRADEHUB_DRY_RUN=false`.
 - Every order preview produces a single-use, TTL-bound confirmation token that must be presented

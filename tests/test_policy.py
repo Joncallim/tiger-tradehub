@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from tradehub.config import Settings
 from tradehub.models import OrderIntent
@@ -20,6 +21,17 @@ def test_limit_order_within_policy_is_accepted():
 
     assert intent.symbol == "AAPL"
     assert any("Dry-run" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("symbol", ["../AAPL", "AAPL/USD", "AAPL B"])
+def test_symbol_rejects_unsafe_characters(symbol):
+    with pytest.raises(ValidationError, match="symbol"):
+        OrderIntent(symbol=symbol, side="BUY", quantity=1, limit_price=150)
+
+
+def test_currency_rejects_non_iso_shape():
+    with pytest.raises(ValidationError, match="currency"):
+        OrderIntent(symbol="AAPL", side="BUY", quantity=1, limit_price=150, currency="US1")
 
 
 def test_symbol_allowlist_blocks_unknown_symbol():

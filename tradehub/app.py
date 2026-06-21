@@ -9,10 +9,12 @@ from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import ValidationError
+from pydantic_settings import SettingsError
 
 from tradehub.audit import AuditStore
-from tradehub.config import Settings, get_settings, secret_value
+from tradehub.config import Settings, get_bootstrap_settings, get_settings, secret_value
 from tradehub.models import (
     AccountAssetsResponse,
     CancelOrderRequest,
@@ -26,7 +28,23 @@ from tradehub.models import (
     SubmitOrderResponse,
 )
 from tradehub.policy import PolicyError, validate_order_intent
+from tradehub.setup import (
+    SETUP_HTML,
+    McpConfigRequest,
+    SetupEnvRequest,
+    is_allowed_setup_content_type,
+    is_allowed_setup_host_header,
+    is_allowed_setup_origin,
+    is_local_host,
+    mcp_snippet,
+    setup_status,
+    write_env,
+    write_mcp_config,
+)
 from tradehub.tiger_gateway import TigerGateway
+
+SETUP_PATH_PREFIX = "/setup"
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 logger = logging.getLogger(__name__)
 UPSTREAM_ERROR_MESSAGE = "upstream broker request failed"
@@ -40,6 +58,26 @@ app = FastAPI(
     version="0.1.0",
     description="Guarded Tiger Brokers trading bridge for ChatGPT, Claude, and Telegram.",
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith(SETUP_PATH_PREFIX):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "connect-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none'; "
+            "form-action 'self'"
+        )
+    return response
 
 
 @lru_cache
@@ -79,6 +117,28 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
+@app.exception_handler(SettingsError)
+@app.exception_handler(ValidationError)
+async def settings_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    error_id = uuid.uuid4().hex
+    logger.warning(
+        "Configuration error %s on %s %s (%s)",
+        error_id,
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "detail": {
+                "message": "TradeHub is not configured; open /setup on this machine",
+                "error_id": error_id,
+            }
+        },
+    )
+
+
 def redact_sensitive(text: str, settings: Settings) -> str:
     redacted = PRIVATE_KEY_PATTERN.sub("[REDACTED PRIVATE KEY]", text)
     sensitive_values = [
@@ -96,6 +156,106 @@ def redact_sensitive(text: str, settings: Settings) -> str:
 
 def upstream_error_detail() -> dict[str, str]:
     return {"message": UPSTREAM_ERROR_MESSAGE, "error_id": uuid.uuid4().hex}
+
+
+def require_local_setup(request: Request) -> None:
+    client_host = request.client.host if request.client else None
+    request_host = request.headers.get("host")
+    if not is_local_host(client_host) or not is_allowed_setup_host_header(request_host):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="setup is only available from this machine",
+        )
+    if request.method in UNSAFE_METHODS:
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if not is_allowed_setup_origin(origin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="setup writes require a local browser origin",
+            )
+        if not is_allowed_setup_content_type(request.headers.get("content-type")):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="setup writes require application/json",
+            )
+
+
+def clear_runtime_caches() -> None:
+    get_bootstrap_settings.cache_clear()
+    get_settings.cache_clear()
+    get_store.cache_clear()
+    get_gateway.cache_clear()
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/setup")
+
+
+@app.get(
+    "/setup",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    dependencies=[Depends(require_local_setup)],
+)
+def setup_page() -> HTMLResponse:
+    return HTMLResponse(SETUP_HTML)
+
+
+@app.get(
+    "/setup/status",
+    include_in_schema=False,
+    dependencies=[Depends(require_local_setup)],
+)
+def setup_status_endpoint() -> dict[str, Any]:
+    return setup_status()
+
+
+@app.post(
+    "/setup/env",
+    include_in_schema=False,
+    dependencies=[Depends(require_local_setup)],
+)
+def setup_env_endpoint(request: SetupEnvRequest) -> dict[str, Any]:
+    try:
+        result = write_env(request)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    clear_runtime_caches()
+    return result
+
+
+@app.get(
+    "/setup/mcp-snippet",
+    include_in_schema=False,
+    dependencies=[Depends(require_local_setup)],
+)
+def setup_mcp_snippet_endpoint(command: str | None = Query(default=None)) -> dict[str, Any]:
+    try:
+        return mcp_snippet(command=command)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+
+@app.post(
+    "/setup/mcp-config",
+    include_in_schema=False,
+    dependencies=[Depends(require_local_setup)],
+)
+def setup_mcp_config_endpoint(request: McpConfigRequest) -> dict[str, Any]:
+    try:
+        return write_mcp_config(request)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
 
 
 def record_upstream_error(
@@ -372,7 +532,7 @@ def account_orders(
 
 
 def main() -> None:
-    settings = get_settings()
+    settings = get_bootstrap_settings()
     uvicorn.run("tradehub.app:app", host=settings.bind_host, port=settings.port, reload=False)
 
 

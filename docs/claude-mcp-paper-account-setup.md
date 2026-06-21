@@ -32,43 +32,26 @@ cd ~/projects/tiger-tradehub
 git pull
 ```
 
-## 2. Create A Python Environment
+## 2. Run The Setup Script
 
 Run these commands from inside the `tiger-tradehub` folder:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -e ".[mcp]"
+./setup.sh
 ```
 
-On Windows PowerShell, the activate command is different:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
+The script creates `.venv`, installs TradeHub with MCP support, and starts the local setup UI.
 
 ## 3. Create Your Local Settings File
 
-Copy the example file:
+Open the setup page:
 
-```bash
-cp .env.example .env
+```text
+http://127.0.0.1:8787/setup
 ```
 
-Generate a strong TradeHub API token:
-
-```bash
-python -c 'import secrets; print(secrets.token_urlsafe(32))'
-```
-
-Open `.env` in a text editor and replace `change-me`:
-
-```bash
-TRADEHUB_API_TOKEN=paste-your-generated-token-here
-TRADEHUB_DRY_RUN=true
-```
+Click `Save .env`. The setup page creates `.env`, generates a strong TradeHub API token, and keeps
+`TRADEHUB_DRY_RUN=true` by default.
 
 Keep `TRADEHUB_DRY_RUN=true` for your first tests. In dry-run mode, TradeHub lets you preview and
 confirm orders, but it does not place them with Tiger.
@@ -83,7 +66,7 @@ You need:
 - Tiger account number
 - OpenAPI private key
 
-Put them in `.env`:
+Put them in the setup page, or edit `.env` manually:
 
 ```bash
 TIGEROPEN_TIGER_ID=your-tiger-id
@@ -98,12 +81,11 @@ Important: make sure this is your Tiger paper account, not your live account.
 
 ## 5. Start TradeHub
 
-In one terminal window:
+If TradeHub is not already running, start it in one terminal window:
 
 ```bash
 cd ~/projects/tiger-tradehub
-source .venv/bin/activate
-tradehub
+./setup.sh
 ```
 
 Leave this terminal running. TradeHub should listen on:
@@ -115,7 +97,7 @@ http://127.0.0.1:8787
 Open this page in a browser to confirm it is running:
 
 ```text
-http://127.0.0.1:8787/docs
+http://127.0.0.1:8787/setup
 ```
 
 ## 6. Test TradeHub Without Claude
@@ -140,6 +122,11 @@ You should see JSON with:
 If this fails, fix it before connecting Claude.
 
 ## 7. Add TradeHub To Claude Desktop
+
+Open `http://127.0.0.1:8787/setup` and use `Write MCP config`. This preserves any existing MCP
+servers in Claude's config file.
+
+Manual setup is still supported.
 
 Find Claude Desktop's MCP configuration file.
 
@@ -253,12 +240,12 @@ If Claude does not show TradeHub tools:
 - Restart Claude Desktop.
 - Check that the `command` path is absolute.
 - Check that `tradehub` is running in a separate terminal.
-- Check that the token in Claude's config exactly matches `TRADEHUB_API_TOKEN` in `.env`.
+- Use `Write MCP config` from the setup page again, or check that the token in Claude's config
+  exactly matches `TRADEHUB_API_TOKEN` in `.env`.
 
 If TradeHub says the token is invalid:
 
-- Generate a new token with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`.
-- Put the same token in `.env` and Claude's MCP config.
+- Open `http://127.0.0.1:8787/setup`, save `.env`, then use `Write MCP config`.
 - Restart both TradeHub and Claude.
 
 If Tiger preview or submit fails:

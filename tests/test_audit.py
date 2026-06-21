@@ -28,6 +28,15 @@ def test_create_confirmation_records_preview_and_claim_returns_intent(tmp_path):
     assert event_type == "preview_created"
 
 
+def test_audit_database_file_is_private(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    store = AuditStore(db_path)
+
+    store.record_event("test_event", {"ok": True})
+
+    assert db_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_claim_is_single_use_until_released_or_finalized(tmp_path):
     store = AuditStore(tmp_path / "tradehub.db")
     token, _ = store.create_confirmation(intent(), None, ttl_seconds=300)
