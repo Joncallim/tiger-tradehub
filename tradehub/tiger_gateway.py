@@ -78,6 +78,8 @@ class TigerGateway:
         config = TigerOpenClientConfig(sandbox_debug=self.settings.tiger_sandbox)
         config.tiger_id = self.settings.tiger_id
         config.account = self.settings.tiger_account
+        if self.settings.tiger_license:
+            config.license = self.settings.tiger_license
         config.language = Language.en_US
 
         private_key = secret_value(self.settings.tiger_private_key)

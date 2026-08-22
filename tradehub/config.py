@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     tiger_account: str | None = Field(default=None, alias="TIGEROPEN_ACCOUNT")
     tiger_private_key_path: Path | None = Field(default=None, alias="TIGEROPEN_PRIVATE_KEY_PATH")
     tiger_private_key: SecretStr | None = Field(default=None, alias="TIGEROPEN_PRIVATE_KEY")
+    tiger_license: str | None = Field(default=None, alias="TIGEROPEN_LICENSE")
     tiger_sandbox: bool = Field(default=False, alias="TIGEROPEN_SANDBOX")
 
     telegram_bot_token: SecretStr | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
