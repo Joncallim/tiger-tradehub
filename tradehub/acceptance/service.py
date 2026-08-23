@@ -176,6 +176,39 @@ class ServiceManager:
             return ""
 
 
+# --- shared service lifecycle -------------------------------------------
+
+
+def get_service(ctx: RunContext, env_overrides: dict[str, str] | None = None) -> ServiceManager:
+    """Return a running TradeHub service for this acceptance run.
+
+    One manager is stashed per run context and reused across assertions
+    and MCP calls. If a healthy listener already exists on the configured
+    port (e.g. a leftover from a previous local pack), it is reused;
+    otherwise a fresh instance is started.
+    """
+    manager = getattr(ctx, "_acceptance_service", None)
+    if manager is None:
+        manager = ServiceManager(ctx, env_overrides=env_overrides)
+        ctx._acceptance_service = manager
+        manager.start()
+    elif env_overrides:
+        # env overrides differ: stop and restart with them
+        manager.stop()
+        manager = ServiceManager(ctx, env_overrides=env_overrides)
+        ctx._acceptance_service = manager
+        manager.start()
+    elif not manager.is_listening():
+        manager.start()
+    return manager
+
+
+def stop_service(ctx: RunContext) -> None:
+    manager = getattr(ctx, "_acceptance_service", None)
+    if manager is not None:
+        manager.stop()
+
+
 def assert_loopback_only(manager: ServiceManager) -> None:
     addresses = manager.bind_addresses()
     if not addresses:

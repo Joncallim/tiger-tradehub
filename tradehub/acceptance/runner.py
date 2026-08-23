@@ -218,12 +218,15 @@ def run_pack(pack_id: str, settings: Settings | None = None) -> RunResult:
 
     started_at = utc_now()
     run_id = make_run_id(pack_id)
-    sanitizer = build_sanitizer(settings)
+    # Resolve settings FIRST so the sanitizer is built with real secret
+    # values (fix: previously the sanitizer was built empty, so real
+    # credentials leaked into CLI-run reports).
     if settings is None:
         try:
             settings = get_settings()
         except Exception:  # noqa: BLE001
-            sanitizer = build_sanitizer()
+            settings = None
+    sanitizer = build_sanitizer(settings)
 
     if pack_id not in PACKS:
         return RunResult(
@@ -271,6 +274,15 @@ def run_pack(pack_id: str, settings: Settings | None = None) -> RunResult:
     from tradehub.acceptance.state import record_run
 
     record_run(result)
+    # Persist the full sanitized result artifact (clean JSON evidence).
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    artifact_path = ARTIFACT_DIR / f"{result.run_id}.json"
+    artifact_path.write_text(result.model_dump_json(indent=2))
+    result.artifacts.append(str(artifact_path))
+    # Stop any acceptance-owned service started by this run.
+    from tradehub.acceptance.service import stop_service
+
+    stop_service(ctx)
     return result
 
 
