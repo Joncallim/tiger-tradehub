@@ -16,7 +16,14 @@ from tradehub.acceptance.schema import RunResult
 STATE_FILE = ARTIFACT_DIR / "state.json"
 
 
+OFFICIAL_PACKS = {"FA-00", "FA-01", "FA-02", "FA-03", "FA-04", "FA-05"}
+
+
 def record_run(result: RunResult) -> None:
+    # Only official acceptance packs are lineage-relevant; test-injected
+    # pack IDs (e.g. hang-regression fixtures) must never pollute state.
+    if result.pack_id not in OFFICIAL_PACKS:
+        return
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     state: dict[str, Any] = {}
     if STATE_FILE.exists():
