@@ -175,18 +175,18 @@ def evaluate_assertion(spec: AssertionSpec, ctx: RunContext) -> AssertionResult:
     - timeout          -> ESCALATE (cannot classify a hung boundary)
     """
     started = time.monotonic()
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
         if spec.transient:
             spec.fn(ctx)  # fn must use ctx.retry itself for bounded retries
         else:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(spec.fn, ctx)
-                try:
-                    future.result(timeout=spec.timeout_seconds)
-                except FutureTimeout:
-                    raise AssertionEscalate(
-                        f"assertion timed out after {spec.timeout_seconds}s"
-                    ) from None
+            future = pool.submit(spec.fn, ctx)
+            try:
+                future.result(timeout=spec.timeout_seconds)
+            except FutureTimeout:
+                raise AssertionEscalate(
+                    f"assertion timed out after {spec.timeout_seconds}s"
+                ) from None
         status, detail = Status.PASS, ""
     except AssertionError_ as exc:
         status, detail = Status.FAIL, str(exc)
@@ -196,6 +196,11 @@ def evaluate_assertion(spec: AssertionSpec, ctx: RunContext) -> AssertionResult:
         status, detail = Status.ESCALATE, str(exc)
     except Exception as exc:  # noqa: BLE001 - unexpected boundary
         status, detail = Status.ESCALATE, f"unexpected {type(exc).__name__}: {exc}"
+    finally:
+        # Never join a hung worker: a single stuck assertion must not hang
+        # the whole pack. The timeout is classified as ESCALATE above and
+        # the run proceeds; the leaked worker thread is abandoned.
+        pool.shutdown(wait=False, cancel_futures=True)
     elapsed = time.monotonic() - started
     detail = ctx.sanitizer.sanitize_text(detail) if detail else ""
     if status == Status.PASS:

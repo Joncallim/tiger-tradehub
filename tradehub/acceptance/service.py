@@ -55,6 +55,8 @@ class ServiceManager:
         self.port = int(self.env.get("TRADEHUB_PORT", "8787"))
         self.host = self.env.get("TRADEHUB_BIND_HOST", "127.0.0.1")
         self._process: subprocess.Popen[str] | None = None
+        self._log_file = None
+        self.log_path: Path | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -63,11 +65,15 @@ class ServiceManager:
             raise AssertionBlocked(
                 f"port {self.port} already has a listener; refusing to start a second instance"
             )
+        log_path = REPO_ROOT / "data" / "acceptance" / f"service-{self.ctx.run_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path = log_path
+        self._log_file = open(log_path, "w", encoding="utf-8")
         self._process = subprocess.Popen(
             [str(VENV_BIN / "tradehub")],
             cwd=REPO_ROOT,
             env=self.env,
-            stdout=subprocess.PIPE,
+            stdout=self._log_file,
             stderr=subprocess.STDOUT,
             text=True,
         )
@@ -75,8 +81,9 @@ class ServiceManager:
         while time.monotonic() < deadline:
             code = self._process.poll()
             if code is not None:
-                out = self._drain_output()
-                raise AssertionError_(f"tradehub exited early with code {code}: {out[-2000:]}")
+                raise AssertionError_(
+                    f"tradehub exited early with code {code}: {self.output_since()[-2000:]}"
+                )
             if self.is_listening() and self.health_ok():
                 return
             time.sleep(0.5)
@@ -91,6 +98,9 @@ class ServiceManager:
                 self._process.kill()
                 self._process.wait(timeout=5)
         self._process = None
+        if getattr(self, "_log_file", None) is not None:
+            self._log_file.close()
+            self._log_file = None
 
     def restart(self, wait_seconds: int = 30) -> None:
         self.stop()
@@ -152,10 +162,16 @@ class ServiceManager:
         return self._drain_output()
 
     def _drain_output(self) -> str:
-        if self._process is None or self._process.stdout is None:
+        """Read whatever the service has written to its log file.
+
+        Non-blocking by design: the child writes to a file, so reading
+        the file can never hang waiting for the child to exit.
+        """
+        if getattr(self, "_log_file", None) is None or self.log_path is None:
             return ""
         try:
-            return self._process.stdout.read()
+            self._log_file.flush()
+            return self.log_path.read_text(errors="replace") if self.log_path.exists() else ""
         except Exception:  # noqa: BLE001
             return ""
 
