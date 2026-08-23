@@ -135,6 +135,36 @@ def test_assertion_classification_is_deterministic():
     assert evaluate_assertion(AssertionSpec("escalate", escalate), ctx).status == Status.ESCALATE
 
 
+def test_hung_assertion_escalates_without_hanging_pack():
+    """A stuck assertion must classify ESCALATE and never hang the run."""
+    import time
+
+    from tradehub.acceptance.runner import PackDefinition, run_pack
+
+    def _hang(_):
+        time.sleep(60)  # longer than the assertion timeout
+
+    pack = PackDefinition(
+        pack_id="FA-HANG-TEST",
+        environment="offline",
+        depends_on=[],
+        assertions=[AssertionSpec("hang.", _hang, timeout_seconds=2)],
+        safe_summary="test",
+    )
+    from tradehub.acceptance.packs import PACKS
+
+    PACKS["FA-HANG-TEST"] = pack
+    try:
+        started = time.monotonic()
+        result = run_pack("FA-HANG-TEST")
+        elapsed = time.monotonic() - started
+        assert elapsed < 15, f"pack hung for {elapsed:.1f}s"
+        assert result.status == Status.ESCALATE
+        assert result.assertions[0].detail.startswith("assertion timed out")
+    finally:
+        PACKS.pop("FA-HANG-TEST", None)
+
+
 def test_unknown_pack_fails_closed():
     result = run_pack("FA-99-DOES-NOT-EXIST")
     assert result.status == Status.FAIL
