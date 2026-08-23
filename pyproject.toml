@@ -41,10 +41,15 @@ Issues = "https://github.com/Joncallim/tiger-tradehub/issues"
 tradehub = "tradehub.app:main"
 tradehub-mcp = "tradehub.mcp_server:main"
 tradehub-telegram = "tradehub.telegram_bot:main"
+tradehub-acceptance = "tradehub.acceptance.runner:main"
 
 [build-system]
 requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tradehub*"]
+exclude = ["tests*"]
 
 [tool.ruff]
 line-length = 100
