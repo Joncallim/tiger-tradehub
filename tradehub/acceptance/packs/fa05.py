@@ -67,7 +67,14 @@ def _upstream_packs_pass() -> list[str]:
 
 
 def _quote_last_price(ctx: RunContext) -> float | None:
-    """Fetch current market price via the Tiger quote API (read-only)."""
+    """Fetch current market price via the Tiger quote API (read-only).
+
+    Raises:
+        AssertionBlocked if the broker denies market-data permission
+        (deterministic prerequisite: US market data must be enabled for
+        the OpenAPI account/device in the Developer Center).
+        AssertionEscalate for anything unexpected.
+    """
     from tigeropen.common.consts import Language
     from tigeropen.quote.quote_client import QuoteClient
     from tigeropen.tiger_open_config import TigerOpenClientConfig
@@ -84,7 +91,24 @@ def _quote_last_price(ctx: RunContext) -> float | None:
 
         config.private_key = read_private_key(str(settings.tiger_private_key_path))
     client = QuoteClient(config)
-    quotes = client.get_briefs([ACCEPTANCE_SYMBOL])
+    try:
+        client.grab_quote_permission()
+        quotes = client.get_briefs([ACCEPTANCE_SYMBOL])
+    except AssertionBlocked:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc)
+        if "permission" in message.lower() and "4000" in message:
+            raise AssertionBlocked(
+                "Tiger OpenAPI US market-data permission is not enabled for this "
+                "account/device (code 4000). Enable US stock L1 market data for "
+                "the OpenAPI account in the Developer Center "
+                "(developer.itigerup.com/profile) before FA-05 can prove a "
+                "non-marketable limit."
+            ) from exc
+        from tradehub.acceptance.runner import AssertionEscalate
+
+        raise AssertionEscalate(f"quote fetch failed unexpectedly: {message}") from exc
     if not quotes:
         return None
     quote = quotes[0]
@@ -133,11 +157,38 @@ def build_fa05_pack() -> PackDefinition:
         ctx.artifacts.append(ctx.write_artifact("fa05-quote", {"last": last, "limit": limit}))
 
     def lifecycle(ctx: RunContext) -> None:
+        # Re-verify safety gates immediately before any write authority:
+        # broker-reported PAPER plus a deterministically non-marketable
+        # limit. The write-capable service (dry_run=false) starts only
+        # after both proofs succeed. No allowlist/notional/quantity policy
+        # is loosened: AAPL must already be in the production allowlist and
+        # acceptance caps are stricter.
+        proof = TigerAccountProof(ctx)
+        paper_account = proof.prove_paper()
+        ctx.register_secret(str(paper_account))
+
+        last = _quote_last_price(ctx)
+        if last is None:
+            raise AssertionBlocked(
+                "cannot prove non-marketable limit at submission time (no quote)"
+            )
+        limit_price = round(last * 0.5, 2)
+        if limit_price <= 0:
+            raise AssertionBlocked("derived limit price is not positive")
+        if (
+            ACCEPTANCE_MAX_NOTIONAL_USD
+            and limit_price * ACCEPTANCE_MAX_QUANTITY > ACCEPTANCE_MAX_NOTIONAL_USD
+        ):
+            raise AssertionBlocked("test limit violates acceptance notional cap")
+        if ACCEPTANCE_SYMBOL not in ctx.settings.symbol_allowlist:
+            raise AssertionBlocked(
+                f"acceptance symbol {ACCEPTANCE_SYMBOL} not in production allowlist"
+            )
+
         manager = ServiceManager(
             ctx,
             env_overrides={
                 "TRADEHUB_DRY_RUN": "false",
-                "TRADEHUB_SYMBOL_ALLOWLIST": ACCEPTANCE_SYMBOL,
             },
         )
         manager.start()
@@ -151,14 +202,7 @@ def build_fa05_pack() -> PackDefinition:
             raise AssertionError_(f"pre-read account orders failed: HTTP {before.status_code}")
         before_ids = {o.get("id") for o in before.json().get("orders", [])}
 
-        # 2. current market price -> non-marketable limit
-        last = _quote_last_price(ctx)
-        if last is None:
-            manager.stop()
-            raise AssertionBlocked("cannot prove non-marketable limit at submission time")
-        limit_price = round(last * 0.5, 2)
-
-        # 3. preview through the normal guarded path
+        # 2. preview through the normal guarded path (non-marketable limit)
         preview_payload = {
             "symbol": ACCEPTANCE_SYMBOL,
             "side": "BUY",
@@ -181,7 +225,7 @@ def build_fa05_pack() -> PackDefinition:
             raise AssertionError_("preview returned no confirmation token")
         ctx.register_secret(token)
 
-        # 4. submit through acceptance authority (paper, dry_run=false)
+        # 3. submit through acceptance authority (paper, dry_run=false)
         submit = httpx.post(
             f"{base}/orders/submit",
             headers=headers,
@@ -199,7 +243,7 @@ def build_fa05_pack() -> PackDefinition:
             raise AssertionError_(f"paper submit returned no broker order id: {body}")
         ctx.register_secret(str(order_id))
 
-        # 6. read that order back
+        # 4. read that order back
         manager.start()
         orders = httpx.get(f"{base}/account/orders", headers=headers, timeout=30)
         if orders.status_code != 200:
@@ -210,7 +254,7 @@ def build_fa05_pack() -> PackDefinition:
             manager.stop()
             raise AssertionError_(f"broker order {order_id} not found in account orders")
 
-        # 7. cancel it
+        # 5. cancel it
         cancel = httpx.post(
             f"{base}/orders/cancel",
             headers=headers,
@@ -227,7 +271,7 @@ def build_fa05_pack() -> PackDefinition:
         if cancel.json().get("cancelled") is not True:
             raise AssertionError_(f"cancel not confirmed: {cancel.json()}")
 
-        # 8. read back final state
+        # 6. read back final state
         manager.start()
         final = httpx.get(f"{base}/account/orders", headers=headers, timeout=30)
         manager.stop()
@@ -239,7 +283,7 @@ def build_fa05_pack() -> PackDefinition:
         if not final_order:
             raise AssertionError_(f"cancelled order {order_id} missing from read-back")
 
-        # 9. reconcile audit events to the same broker order id
+        # 7. reconcile audit events to the same broker order id
         db_path = REPO_ROOT / "data" / "tradehub.db"
         audit = _audit_events(db_path)
         live_subs = [e for e in audit if e["event_type"] == "live_submit"]
@@ -249,7 +293,7 @@ def build_fa05_pack() -> PackDefinition:
         if not any(str(e.get("payload", {}).get("order_id")) == str(order_id) for e in cancels):
             raise AssertionError_(f"no cancel audit event for order {order_id}")
 
-        # 10. exactly one intended broker order created by this run
+        # 8. exactly one intended broker order created by this run
         after_ids = {o.get("id") for o in final.json().get("orders", [])}
         new_ids = after_ids - before_ids
         if len(new_ids) != 1:
