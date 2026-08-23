@@ -37,9 +37,13 @@ def _headers(manager: ServiceManager) -> dict[str, str]:
 
 
 def build_fa04_pack() -> PackDefinition:
+    def _get_manager(ctx: RunContext, env_overrides: dict[str, str] | None = None):
+        from tradehub.acceptance.service import get_service
+
+        return get_service(ctx, env_overrides=env_overrides)
+
     def policy_blocks(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        manager = _get_manager(ctx)
         cases = [
             (
                 "market_order",
@@ -107,17 +111,30 @@ def build_fa04_pack() -> PackDefinition:
                 raise AssertionError_(
                     f"{label}: expected 422, got {response.status_code}: {response.text[:300]}"
                 )
+        # All five policy errors must stay sanitized: no configured secret
+        # and no traceback/exception internals in the client-visible body.
+        for label, payload in cases:
+            response = httpx.post(
+                f"{_base(manager)}/orders/preview",
+                headers=_headers(manager),
+                json=payload,
+                timeout=10,
+            )
             text = response.text
-            for secret in ("TRADEHUB", "Bearer", "private_key"):
-                if secret.lower() in text.lower():
-                    # "Bearer" may appear in generic docs; only fail on obvious leaks
-                    if secret == "TRADEHUB" and secret in text:
-                        raise AssertionError_(f"{label}: error leaked internal name")
-        manager.stop()
+            for marker in ("Traceback", 'File "', "MIIC", "-----BEGIN"):
+                if marker in text:
+                    raise AssertionError_(f"{label}: error leaked internal detail: {marker}")
+            configured = {
+                manager.env.get("TRADEHUB_API_TOKEN", ""),
+                manager.env.get("TIGEROPEN_TIGER_ID", ""),
+                manager.env.get("TIGEROPEN_ACCOUNT", ""),
+            }
+            for secret in configured:
+                if secret and secret in text:
+                    raise AssertionError_(f"{label}: configured secret leaked into error")
 
     def malformed_input_fails_closed(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        manager = _get_manager(ctx)
         base = _base(manager)
         bad_payloads = [
             {},  # missing everything
@@ -154,11 +171,9 @@ def build_fa04_pack() -> PackDefinition:
                 raise AssertionError_(
                     f"malformed payload accepted: HTTP {response.status_code}: {payload}"
                 )
-        manager.stop()
 
     def finalized_token_unusable_after_restart(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        manager = _get_manager(ctx)
         base = _base(manager)
         preview = httpx.post(
             f"{base}/orders/preview",
@@ -197,13 +212,11 @@ def build_fa04_pack() -> PackDefinition:
                 "finalized token replay after restart: expected 422, got "
                 f"{replay.status_code}: {replay.text[:300]}"
             )
-        manager.stop()
 
     def expired_token_unusable_after_restart(ctx: RunContext) -> None:
         # Start an instance with a very short TTL, preview, let it expire,
         # restart, and prove the expired token remains rejected.
-        manager = ServiceManager(ctx, env_overrides={"TRADEHUB_CONFIRMATION_TTL_SECONDS": "1"})
-        manager.start()
+        manager = _get_manager(ctx, {"TRADEHUB_CONFIRMATION_TTL_SECONDS": "1"})
         base = _base(manager)
         preview = httpx.post(
             f"{base}/orders/preview",
@@ -234,11 +247,9 @@ def build_fa04_pack() -> PackDefinition:
             raise AssertionError_(
                 f"expired token after restart: expected 422, got {replay.status_code}"
             )
-        manager.stop()
 
     def audit_persists_across_restart(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        manager = _get_manager(ctx)
         db_path = REPO_ROOT / "data" / "tradehub.db"
         before = _count_events(db_path)
         preview = httpx.post(
@@ -262,11 +273,9 @@ def build_fa04_pack() -> PackDefinition:
             raise AssertionError_(
                 f"audit events did not persist across restart: before={before} after={after}"
             )
-        manager.stop()
 
     def errors_are_sanitized(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        manager = _get_manager(ctx)
         base = _base(manager)
         # Force an upstream/internal-style error path deterministically:
         # unknown confirmation token => 422 with clean detail, no stacktrace.
@@ -280,7 +289,14 @@ def build_fa04_pack() -> PackDefinition:
         for leak_marker in ("Traceback", 'File "', "private_key=", "MIIC", "BEGIN"):
             if leak_marker in text:
                 raise AssertionError_(f"error response leaked internal detail: {leak_marker}")
-        manager.stop()
+        configured = {
+            manager.env.get("TRADEHUB_API_TOKEN", ""),
+            manager.env.get("TIGEROPEN_TIGER_ID", ""),
+            manager.env.get("TIGEROPEN_ACCOUNT", ""),
+        }
+        for secret in configured:
+            if secret and secret in text:
+                raise AssertionError_("configured secret leaked into error response")
 
     return PackDefinition(
         pack_id="FA-04",

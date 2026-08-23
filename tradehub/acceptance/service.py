@@ -185,18 +185,22 @@ def get_service(ctx: RunContext, env_overrides: dict[str, str] | None = None) ->
     One manager is stashed per run context and reused across assertions
     and MCP calls. If a healthy listener already exists on the configured
     port (e.g. a leftover from a previous local pack), it is reused;
-    otherwise a fresh instance is started.
+    otherwise a fresh instance is started. When the requested env
+    overrides differ from those last used, the service is restarted with
+    the new overrides (e.g. FA-04's short-TTL instance).
     """
     manager = getattr(ctx, "_acceptance_service", None)
+    used_overrides = getattr(ctx, "_acceptance_service_overrides", None)
     if manager is None:
         manager = ServiceManager(ctx, env_overrides=env_overrides)
         ctx._acceptance_service = manager
+        ctx._acceptance_service_overrides = env_overrides
         manager.start()
-    elif env_overrides:
-        # env overrides differ: stop and restart with them
+    elif used_overrides != env_overrides:
         manager.stop()
         manager = ServiceManager(ctx, env_overrides=env_overrides)
         ctx._acceptance_service = manager
+        ctx._acceptance_service_overrides = env_overrides
         manager.start()
     elif not manager.is_listening():
         manager.start()
