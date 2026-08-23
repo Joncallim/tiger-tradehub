@@ -31,9 +31,9 @@ EXPECTED_TOOLS = {
 
 
 def _mcp_env(ctx: RunContext) -> dict[str, str]:
-    from tradehub.acceptance.service import ServiceManager
+    from tradehub.acceptance.service import get_service
 
-    manager = ServiceManager(ctx)
+    manager = get_service(ctx)
     return {
         "TRADEHUB_BASE_URL": f"http://{manager.host}:{manager.port}",
         "TRADEHUB_API_TOKEN": manager.env.get("TRADEHUB_API_TOKEN", ""),
@@ -105,8 +105,9 @@ def build_fa02_pack() -> PackDefinition:
         body = call_tool(ctx, "account_assets", extra_env=_mcp_env(ctx))
         report = ctx.sanitizer.sanitize_value(body)
         text = str(report)
-        for secret in ("21155143479478282", "U12345678"):
-            if secret in text and secret in dict(account=ctx.settings.tiger_account).values():
+        configured = {ctx.settings.tiger_account, ctx.settings.tiger_id}
+        for secret in configured | {"U12345678", "21155143479478282"}:
+            if secret and secret in text:
                 raise AssertionError_("account identifier leaked into report")
 
     return PackDefinition(

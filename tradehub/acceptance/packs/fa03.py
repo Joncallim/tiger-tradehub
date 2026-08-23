@@ -24,7 +24,6 @@ from tradehub.acceptance.runner import (
     PackDefinition,
     RunContext,
 )
-from tradehub.acceptance.service import ServiceManager
 
 PREVIEW_PAYLOAD = {
     "symbol": "AAPL",
@@ -37,7 +36,9 @@ PREVIEW_PAYLOAD = {
 
 
 def _mcp_env(ctx: RunContext) -> dict[str, str]:
-    manager = ServiceManager(ctx)
+    from tradehub.acceptance.service import get_service
+
+    manager = get_service(ctx)
     return {
         "TRADEHUB_BASE_URL": f"http://{manager.host}:{manager.port}",
         "TRADEHUB_API_TOKEN": manager.env.get("TRADEHUB_API_TOKEN", ""),
@@ -47,10 +48,10 @@ def _mcp_env(ctx: RunContext) -> dict[str, str]:
 
 def build_fa03_pack() -> PackDefinition:
     def preflight_proves_safety(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        from tradehub.acceptance.service import get_service
+
+        manager = get_service(ctx)
         body = manager.health()
-        manager.stop()
         if body.get("dry_run") is not True:
             raise AssertionError_(f"dry_run not true: {body}")
         if body.get("require_approval") is not True:
@@ -95,14 +96,12 @@ def build_fa03_pack() -> PackDefinition:
             raise AssertionError_(f"replay was not blocked: {second}")
 
     def dry_run_cancel_records_event(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        from tradehub.acceptance.service import get_service
+
+        get_service(ctx)
         store_path = REPO_ROOT / "data" / "tradehub.db"
         before = _count_events(store_path, "dry_run_cancel")
-        from tradehub.acceptance.mcp_client import call_tool
-
         result = call_tool(ctx, "cancel_order", {"order_id": "test-order-nope"}, _mcp_env(ctx))
-        manager.stop()
         after = _count_events(store_path, "dry_run_cancel")
         if after <= before:
             raise AssertionError_("dry_run_cancel event not recorded")
@@ -110,10 +109,10 @@ def build_fa03_pack() -> PackDefinition:
             raise AssertionError_(f"dry-run cancel response unexpected: {result}")
 
     def audit_sequence_reconstructs(ctx: RunContext) -> None:
-        manager = ServiceManager(ctx)
-        manager.start()
+        from tradehub.acceptance.service import get_service
+
+        get_service(ctx)
         events = _audit_events(REPO_ROOT / "data" / "tradehub.db")
-        manager.stop()
         types = [e["event_type"] for e in events]
         for expected in ("preview_created", "dry_run_submit", "dry_run_cancel"):
             if expected not in types:

@@ -109,6 +109,23 @@ def test_sanitizer_redacts_secret_in_plain_text():
     )
 
 
+def test_run_sanitizer_includes_settings_secrets():
+    """CLI-run sanitizer must include real settings values (regression:
+    the sanitizer used to be built empty before settings were resolved,
+    letting configured credentials leak into reports)."""
+    from tradehub.config import Settings
+
+    settings = Settings(
+        TRADEHUB_API_TOKEN="test-token-with-enough-length-1234",
+        TIGEROPEN_TIGER_ID="20161327",
+        TIGEROPEN_ACCOUNT="21155143479478282",
+    )
+    result = run_pack("FA-00", settings=settings)
+    text = result.model_dump_json()
+    assert "21155143479478282" not in text
+    assert "20161327" not in text
+
+
 # ---------------------------------------------------------------------------
 # Assertion classification
 # ---------------------------------------------------------------------------
