@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tradehub_research.screening as screening
 from tradehub_research.acceptance.runner import PACK_REGISTRY
 from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
@@ -68,6 +69,79 @@ def test_run_screening_end_to_end_persists_holding_candidate(tmp_path) -> None:
         )
         == run_id
     )
+
+
+def test_live_screening_uses_one_read_snapshot_across_loaders(tmp_path, monkeypatch) -> None:
+    database = ResearchDB(tmp_path / "concurrent.db")
+    database.init()
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("S", "S", "NYSE", "S", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+        db.execute(
+            "INSERT INTO evidence_source VALUES (?,?,?,?,?)", ("src", "x", 1, "", "source_reported")
+        )
+    UniverseMembershipStore(database).insert(
+        security_id="S",
+        price=10,
+        market_cap=1e9,
+        avg_dollar_volume=1e7,
+        price_eligible=True,
+        market_cap_eligible=True,
+        liquidity_eligible=True,
+        eligible=True,
+        valid_from="2020-01-01",
+        knowledge_time="2025-01-01",
+        pat_provenance="derived_from_index",
+    )
+
+    original_load_facts = screening._load_facts
+    original_input_view_hash = screening._input_view_hash
+    captured: dict[str, object] = {}
+
+    def load_facts_after_concurrent_commit(db, as_of, universe):
+        assert db.in_transaction
+        evidence_id = EvidenceStore(database).insert(
+            security_id="S",
+            source_id="src",
+            structured_fields={"record_type": "xbrl_fact", "value": 99},
+            extraction_confidence=1,
+            event_time="2025-01-02",
+            public_available_time="2025-01-03",
+            pat_provenance="source_reported",
+            ingested_time="2025-01-04",
+        )
+        captured["post_commit_evidence_id"] = evidence_id
+        facts = original_load_facts(db, as_of, universe)
+        captured["facts"] = facts
+        return facts
+
+    def capture_input_view_hash(*args, **kwargs):
+        value = original_input_view_hash(*args, **kwargs)
+        captured["input_view_hash"] = value
+        return value
+
+    monkeypatch.setattr(screening, "_load_facts", load_facts_after_concurrent_commit)
+    monkeypatch.setattr(screening, "_input_view_hash", capture_input_view_hash)
+
+    run_id = run_screening("2025-04-01T00:00:00Z", None, ScreeningConfig(), database=database)
+
+    facts = captured["facts"]
+    assert isinstance(facts, dict)
+    assert facts == {}
+    with database.connect(read_only=True) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM evidence_event WHERE evidence_id=?",
+                (captured["post_commit_evidence_id"],),
+            ).fetchone()[0]
+            == 1
+        )
+        stored_hash = db.execute(
+            "SELECT input_view_hash FROM pipeline_run WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+    assert stored_hash == captured["input_view_hash"]
 
 
 def test_holdings_change_run_identity(tmp_path) -> None:

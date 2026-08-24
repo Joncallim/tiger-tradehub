@@ -414,17 +414,21 @@ def run_screening(
             db.close()
     else:
         with database.connect(read_only=True) as db:
-            universe_rows = _load_universe(db, as_of, config.universe_coverage)
-            universe = [row["security_id"] for row in universe_rows]
-            facts = _load_facts(db, as_of, universe)
-            price_bars = _load_record_kind(db, as_of, universe, "price_bar")
-            form4 = _load_record_kind(db, as_of, universe, "form4_transaction")
-            corporate_actions_split = _load_record_kind(db, as_of, universe, "split")
-            corporate_actions_div = _load_record_kind(db, as_of, universe, "dividend")
-            identity_events = _load_identity_events(db, as_of, universe)
-            form4_coverage = _load_form4_coverage(db, as_of, universe)
-            identity_feed_complete = _load_identity_feed_state(db, as_of, universe)
-            cluster_lookup = store.cluster_ids_by_evidence(as_of, connection=db)
+            db.execute("BEGIN")
+            try:
+                universe_rows = _load_universe(db, as_of, config.universe_coverage)
+                universe = [row["security_id"] for row in universe_rows]
+                facts = _load_facts(db, as_of, universe)
+                price_bars = _load_record_kind(db, as_of, universe, "price_bar")
+                form4 = _load_record_kind(db, as_of, universe, "form4_transaction")
+                corporate_actions_split = _load_record_kind(db, as_of, universe, "split")
+                corporate_actions_div = _load_record_kind(db, as_of, universe, "dividend")
+                identity_events = _load_identity_events(db, as_of, universe)
+                form4_coverage = _load_form4_coverage(db, as_of, universe)
+                identity_feed_complete = _load_identity_feed_state(db, as_of, universe)
+                cluster_lookup = store.cluster_ids_by_evidence(as_of, connection=db)
+            finally:
+                db.rollback()
 
     corporate_actions: dict[str, list[dict[str, Any]]] = {}
     for grouped, kind in ((corporate_actions_split, "split"), (corporate_actions_div, "dividend")):
