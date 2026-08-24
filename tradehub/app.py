@@ -22,6 +22,8 @@ from tradehub.models import (
     OrdersResponse,
     PositionsResponse,
     PreviewResponse,
+    ReconcileOrderRequest,
+    ReconcileOrderResponse,
     SubmitOrderRequest,
     SubmitOrderResponse,
 )
@@ -215,19 +217,44 @@ def submit_order(
             tiger_response=tiger_preview,
         )
 
+    reserved_order_id: str | None = None
+    order_created = False
     try:
-        order_id, tiger_response = gateway.place_order(intent)
+        _, _, existing_reserved_order_id = store.get_confirmation(request.confirmation_token)
+        reserved_order_id = existing_reserved_order_id
+        order = gateway.create_order(intent)
+        order_created = True
+        if existing_reserved_order_id is not None:
+            gateway.assign_order_id(order, existing_reserved_order_id)
+        reserved_order_id = gateway.get_order_id(order)
+        store.record_reserved_order_id(request.confirmation_token, reserved_order_id)
+        order_id, tiger_response = gateway.place_order(order)
     except Exception as exc:
         detail = upstream_error_detail()
-        record_upstream_error(
-            store,
-            settings,
-            "submit_error",
-            {"intent": intent.model_dump()},
-            exc,
-            detail,
-        )
-        store.release_confirmation(request.confirmation_token)
+        payload = {"intent": intent.model_dump(), "reserved_order_id": reserved_order_id}
+        if order_created:
+            record_upstream_error(
+                store,
+                settings,
+                "submit_indeterminate",
+                payload,
+                exc,
+                detail,
+            )
+            store.mark_submission_indeterminate(
+                request.confirmation_token,
+                reserved_order_id,
+            )
+        else:
+            record_upstream_error(
+                store,
+                settings,
+                "submit_error",
+                payload,
+                exc,
+                detail,
+            )
+            store.release_confirmation(request.confirmation_token)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
     store.finalize_confirmation(request.confirmation_token, order_id)
@@ -238,6 +265,88 @@ def submit_order(
         order_id=order_id,
         intent=intent,
         tiger_response=tiger_response,
+    )
+
+
+@app.post(
+    "/orders/submit/reconcile",
+    response_model=ReconcileOrderResponse,
+    dependencies=[Depends(require_auth)],
+)
+def reconcile_order(
+    request: ReconcileOrderRequest,
+    settings: Settings = Depends(get_settings),
+    store: AuditStore = Depends(get_store),
+    gateway: TigerGateway = Depends(get_gateway),
+):
+    try:
+        intent, tiger_preview, reserved_order_id = store.load_indeterminate_confirmation(
+            request.confirmation_token
+        )
+    except (KeyError, ValueError) as exc:
+        store.record_event("reconcile_block", {"reason": str(exc)})
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+    if not reserved_order_id:
+        store.record_event(
+            "reconcile_block",
+            {
+                "confirmation_token": request.confirmation_token,
+                "reason": "missing reserved_order_id",
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="confirmation is indeterminate but missing reserved order id",
+        )
+
+    try:
+        order = gateway.get_order(reserved_order_id)
+    except Exception as exc:
+        detail = upstream_error_detail()
+        record_upstream_error(
+            store,
+            settings,
+            "reconcile_error",
+            {
+                "confirmation_token": request.confirmation_token,
+                "reserved_order_id": reserved_order_id,
+            },
+            exc,
+            detail,
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+
+    if order is not None:
+        resolved_order_id = str(
+            gateway.get_order_id(order) or order.get("order_id") or order.get("id")
+        )
+        store.finalize_confirmation(request.confirmation_token, resolved_order_id)
+        store.record_event(
+            "submit_reconciled",
+            {"intent": intent.model_dump(), "order_id": resolved_order_id},
+        )
+        return ReconcileOrderResponse(
+            status="resolved",
+            submitted=True,
+            intent=intent,
+            order_id=resolved_order_id,
+            tiger_response=order,
+        )
+
+    store.mark_reconciliation_retry_allowed(request.confirmation_token)
+    store.record_event(
+        "submit_reconcile_retryable",
+        {"confirmation_token": request.confirmation_token, "intent": intent.model_dump()},
+    )
+    return ReconcileOrderResponse(
+        status="retryable",
+        submitted=False,
+        intent=intent,
+        tiger_response=tiger_preview,
     )
 
 
