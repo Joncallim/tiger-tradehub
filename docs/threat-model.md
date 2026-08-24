@@ -169,19 +169,31 @@ tradehub REST API (127.0.0.1:8787)  →  Tiger Brokers OpenAPI
 ```
 
 `tradehub-research` is a separate process, separate port, separate SQLite database
-(`data/research.db`), and separate bearer token from the execution core. It holds no Tiger
-credentials. Its only interaction with the execution core is as an authenticated HTTP client of the
-existing, unmodified `/orders/preview` endpoint (never `/orders/submit`) — the same class of access
-the MCP server and Telegram bot already have today.
+(`data/research/research.db`, architecture doc §5), and separate bearer token from the execution
+core. It holds no Tiger credentials. Its own client code calls the existing, unmodified
+`/orders/preview` endpoint (never `/orders/submit`) — it therefore holds **preview authority, i.e.
+confirmation-token issuance** (corrected 2026-08-24, see T16); consuming those tokens is the
+human-confirmed flow, and the T16 controls keep consumption out of reach of committee sessions.
 
 ### Load-Bearing Invariant
 
 A fully compromised research plane — a poisoned evidence source, a hallucinating or adversarially
 manipulated model, or even a compromised Hermes session — can at worst produce a bad `trade_proposal`
-or request a bad order preview. **It cannot submit a live order.** No V2 code path calls
-`/orders/submit`; every submission still requires the same human-confirmed flow and the same
+or request a bad order preview. **It cannot submit a live order.**
+
+**Corrected 2026-08-24 (independent adversarial review):** the research plane *can* obtain a
+confirmation token — `/orders/preview` *is* token issuance, and the research plane is granted the
+bearer token by design (architecture doc §4/§14) — so the earlier framing "does not hold the
+confirmation token issuance authority" was false. The invariant holds only under three deployment
+requirements, enforced as T16 below: (1) the committee session is never attached to `tradehub-mcp`
+(the MCP server exposing `submit_order`); (2) raw confirmation tokens never enter any Hermes session
+context that has touched evidence text — briefings carry opaque references only, tokens are
+retrieved out-of-band; (3) the human confirming principal is a different device and session than the
+committee run. No V2 code path calls `/orders/submit`; every token consumption still passes the same
 `policy.py` checks (symbol allowlist, notional cap, quantity cap, market-order rejection, USD-only)
-that govern the execution core today, entirely independent of anything the research plane claims.
+that govern the execution core today. A **daily aggregate notional + order-count budget** enforced
+by the research plane is additionally required: T7's aggregate-exposure acceptance assumed a
+human-paced flow, and V2's bulk preview-token generation invalidates that premise.
 
 ### New Threats
 
@@ -312,6 +324,30 @@ sanitization pattern already proven in `tradehub/acceptance/sanitize.py` (secret
 redaction before any artifact is written) should be reused for any research-plane artifact writer
 (Epic 7).
 
+#### T16 — Committee/Execution Session Co-location (submit reachable from an injected session)
+
+**What:** The same Hermes session both ingests untrusted evidence text (committee runs) and is
+attached to the execution MCP server that can consume a confirmation token. `tradehub/mcp_server.py`
+exposes `submit_order(confirmation_token)`; the T1 control table admits there is no server-side
+proof of human review ("Token proves a prior preview, not that a human reviewed it"). A prompt
+injection through filing/news text in a committee session that also holds the execution MCP tools,
+plus a raw token rendered in the same context (as architecture §14 originally proposed), is one tool
+call from a real order whenever `TRADEHUB_DRY_RUN=false`.
+
+**Impact:** Unauthorized live trade from a prompt-injected or compromised Hermes session — the
+original T1 scenario, reintroduced at the V2 orchestration layer instead of the tool layer.
+
+**Relevant to:** MCP server attachment (`tradehub/mcp_server.py`), architecture §14 briefing
+content, committee session hygiene.
+
+**Control:** Different principals by construction — committee sessions attach
+`tradehub-research-mcp` only, never `tradehub-mcp`; raw confirmation tokens never enter committee
+session context (briefings carry opaque references only; the operator retrieves tokens out-of-band
+via Telegram, which remains the only consuming principal); Telegram `/confirm` is upgraded to
+re-render symbol/side/qty/limit and demand a second affirmation (architecture §14); a daily
+aggregate notional + order-count budget enforced by the research plane bounds the worst case even if
+a token leaks into a session.
+
 ### V2 Controls Table
 
 | Threat | Control | Status | Gap / Missing |
@@ -324,6 +360,7 @@ redaction before any artifact is written) should be reused for any research-plan
 | T13 Runaway orchestration | Bounded candidate funnel; gated Stage 3/4; reject out-of-run submissions | Design | Not yet built (Phase 1/2). |
 | T14 Research plane altering policy | No write code path to execution-core config; recommend separate OS users | Design | OS-user separation is a deployment recommendation (Epic 7), not yet enforced. |
 | T15 Secrets in research artifacts | Opaque token references only; reuse `acceptance/sanitize.py` pattern | Design | Not yet built (Epic 7). |
+| T16 Committee/execution session co-location | Session separation (committee sessions never attach `tradehub-mcp`); opaque token references only; Telegram-only confirmation with re-rendered order; daily aggregate notional + order-count budget | Design | Deployment requirement (Epic 7). Supersedes the claim that a compromised Hermes environment is limited to "bad research input" (see Residual Risks below). |
 
 All statuses are **Design** — none of this is implemented yet. This table should be updated to
 **Done** per-row as each Epic (see `docs/v2-architecture-review.md`) lands, the same discipline the
@@ -336,9 +373,17 @@ existing T1–T7 table already follows.
   canonical spec, citing ICML 2025 correlated-LLM-error research). Deterministic scoring gates
   everything downstream specifically because model output cannot be assumed independent.
 - **Hermes credential surface**: LLM provider API keys live with Hermes, outside this document's
-  direct scope. If Hermes's own operating environment is compromised, the blast radius is "bad
-  research input," not "unauthorized trade," per the load-bearing invariant above — but Hermes's own
-  security posture is out of scope for this document and should be tracked separately.
+  direct scope. **Corrected 2026-08-24 (independent adversarial review):** if Hermes's own operating
+  environment is compromised, the blast radius is *not* limited to "bad research input" — an
+  injected committee session attached to `tradehub-mcp` with a token in context can reach
+  `submit_order` (T16). With the T16 controls in force, the blast radius is bound back to "bad
+  research input plus a bounded, human-confirmed preview backlog." Hermes's own security posture
+  remains out of scope for this document and should be tracked separately.
+- **Aggregate exposure under V2 token volume**: T7's aggregate-exposure acceptance assumed a
+  human-paced flow (residual risk above, original T1–T7 section). V2 generates confirmation tokens
+  in bulk (40–60 candidates, M/W/F, architecture §10). Compensating control (design, Epic 3/7): a
+  research-plane-enforced daily aggregate notional + order-count budget, and SELL proposals
+  restricted to existing paper-account holdings (no naked-short proposals, architecture §13).
 - **OS-level process isolation between `tradehub` and `tradehub-research`**: recommended (T14) but
   not yet enforced by deployment tooling; both currently run as the same local user in the existing
   Hearth deployment pattern. Tracked as an Epic 7 deliverable.
