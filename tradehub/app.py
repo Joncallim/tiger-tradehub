@@ -5,6 +5,7 @@ import logging
 import re
 import uuid
 from functools import lru_cache
+from time import sleep
 from typing import Any
 
 import uvicorn
@@ -36,6 +37,7 @@ PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     re.DOTALL,
 )
+RECONCILE_ORDER_ID_RETRY_DELAY_SECONDS = 0.05
 
 app = FastAPI(
     title="Tiger TradeHub",
@@ -117,6 +119,23 @@ def record_upstream_error(
             "error_id": detail["error_id"],
         },
     )
+
+
+def get_order_with_retries(gateway: TigerGateway, order_id: str) -> dict[str, Any] | None:
+    order = gateway.get_order(order_id)
+    if order is not None:
+        return order
+
+    sleep(RECONCILE_ORDER_ID_RETRY_DELAY_SECONDS)
+    order = gateway.get_order(order_id)
+    if order is not None:
+        return order
+
+    for entry in gateway.get_orders(limit=100):
+        if str(entry.get("order_id")) == str(order_id) or str(entry.get("id")) == str(order_id):
+            return entry
+
+    return None
 
 
 @app.get("/health", response_model=HealthResponse, dependencies=[Depends(require_auth)])
@@ -228,6 +247,7 @@ def submit_order(
             gateway.assign_order_id(order, existing_reserved_order_id)
         reserved_order_id = gateway.get_order_id(order)
         store.record_reserved_order_id(request.confirmation_token, reserved_order_id)
+        store.mark_submission_in_progress(request.confirmation_token, reserved_order_id)
         order_id, tiger_response = gateway.place_order(order)
     except Exception as exc:
         detail = upstream_error_detail()
@@ -280,7 +300,7 @@ def reconcile_order(
     gateway: TigerGateway = Depends(get_gateway),
 ):
     try:
-        intent, tiger_preview, reserved_order_id = store.load_indeterminate_confirmation(
+        intent, tiger_preview, reserved_order_id = store.claim_reconciliation_confirmation(
             request.confirmation_token
         )
     except (KeyError, ValueError) as exc:
@@ -304,7 +324,7 @@ def reconcile_order(
         )
 
     try:
-        order = gateway.get_order(reserved_order_id)
+        order = get_order_with_retries(gateway, reserved_order_id)
     except Exception as exc:
         detail = upstream_error_detail()
         record_upstream_error(
@@ -324,7 +344,14 @@ def reconcile_order(
         resolved_order_id = str(
             gateway.get_order_id(order) or order.get("order_id") or order.get("id")
         )
-        store.finalize_confirmation(request.confirmation_token, resolved_order_id)
+        try:
+            store.finalize_confirmation(request.confirmation_token, resolved_order_id)
+        except ValueError as exc:
+            store.record_event("reconcile_block", {"reason": str(exc)})
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
         store.record_event(
             "submit_reconciled",
             {"intent": intent.model_dump(), "order_id": resolved_order_id},
@@ -337,7 +364,14 @@ def reconcile_order(
             tiger_response=order,
         )
 
-    store.mark_reconciliation_retry_allowed(request.confirmation_token)
+    try:
+        store.mark_reconciliation_retry_allowed(request.confirmation_token)
+    except ValueError as exc:
+        store.record_event("reconcile_block", {"reason": str(exc)})
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     store.record_event(
         "submit_reconcile_retryable",
         {"confirmation_token": request.confirmation_token, "intent": intent.model_dump()},

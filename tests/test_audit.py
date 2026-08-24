@@ -5,6 +5,7 @@ from datetime import timedelta
 import pytest
 
 from tradehub.audit import (
+    CONFIRMATION_STATE_SUBMITTING,
     STALE_CLAIM_SECONDS,
     AuditStore,
     utc_now,
@@ -136,3 +137,23 @@ def test_recorded_reserved_order_id_is_retrieved(tmp_path):
     _, _, reserved_order_id = store.get_confirmation(token)
 
     assert reserved_order_id == "reserved-42"
+
+
+def test_mark_submission_in_progress_prevents_reclaim_before_finalize(tmp_path):
+    store = AuditStore(tmp_path / "tradehub.db")
+    token, _ = store.create_confirmation(intent(), None, ttl_seconds=300)
+
+    store.claim_confirmation(token)
+    store.record_reserved_order_id(token, "reserved-42")
+    store.mark_submission_in_progress(token, "reserved-42")
+
+    with sqlite3.connect(tmp_path / "tradehub.db") as db:
+        db.execute(
+            "UPDATE confirmations SET claimed_at = ? WHERE token = ?",
+            ((utc_now() - timedelta(seconds=STALE_CLAIM_SECONDS + 1)).isoformat(), token),
+        )
+
+    with pytest.raises(ValueError, match="indeterminate"):
+        store.claim_confirmation(token)
+
+    assert store.get_submission_state(token) == CONFIRMATION_STATE_SUBMITTING
