@@ -45,19 +45,56 @@ class FakePosition:
 class FakeTradeClient:
     def __init__(self):
         self.cancel_kwargs = None
+        self.create_kwargs = None
         self.place_response = {"order_id": "broker-order-123"}
+        self.placed_order = None
+        self.get_order_kwargs = None
 
     def cancel_order(self, **kwargs):
         self.cancel_kwargs = kwargs
         return {"cancelled": True}
 
+    def create_order(self, **kwargs):
+        self.create_kwargs = kwargs
+        order = type("Order", (), {})()
+        order.contract = kwargs["contract"]
+        order.order_type = kwargs["order_type"]
+        order.action = kwargs["action"]
+        order.quantity = kwargs["quantity"]
+        order.limit_price = kwargs.get("limit_price")
+        order.order_id = kwargs.get("order_id") or "reserved-999"
+        return order
+
     def place_order(self, order):
+        self.placed_order = order
         return self.place_response
+
+    def get_order(self, **kwargs):
+        self.get_order_kwargs = kwargs
+        if str(kwargs["order_id"]) == "reserved-999":
+            return {"id": "global-999", "order_id": "reserved-999"}
+        if str(kwargs["order_id"]) == "0":
+            return {"id": "global-missing", "order_id": "0"}
+        return None
 
 
 class FakeGateway(TigerGateway):
     def _build_order(self, intent):
-        return type("Order", (), {"id": "local-order-456"})()
+        order_type = (
+            intent.order_type.value if hasattr(intent.order_type, "value") else intent.order_type
+        )
+        return type(
+            "Order",
+            (),
+            {
+                "id": "local-order-456",
+                "contract": FakeContract(),
+                "action": intent.side.value,
+                "order_type": order_type,
+                "quantity": intent.quantity,
+                "limit_price": intent.limit_price,
+            },
+        )()
 
 
 def settings():
@@ -98,10 +135,11 @@ def test_cancel_order_casts_order_id_to_int_for_sdk():
 def test_place_order_prefers_broker_response_order_id():
     gateway = FakeGateway(settings())
     gateway._trade_client = FakeTradeClient()
-
-    order_id, response = gateway.place_order(
+    order = gateway.create_order(
         OrderIntent(symbol="AAPL", side="BUY", quantity=1, limit_price=150)
     )
+
+    order_id, response = gateway.place_order(order)
 
     assert order_id == "broker-order-123"
     assert response == {"order_id": "broker-order-123"}
@@ -112,13 +150,41 @@ def test_place_order_accepts_scalar_broker_order_id():
     client = FakeTradeClient()
     client.place_response = 12345
     gateway._trade_client = client
-
-    order_id, response = gateway.place_order(
+    order = gateway.create_order(
         OrderIntent(symbol="AAPL", side="BUY", quantity=1, limit_price=150)
     )
 
+    order_id, response = gateway.place_order(order)
+
     assert order_id == "12345"
     assert response == {"value": "12345"}
+
+
+def test_create_order_generates_reserved_order_and_place_order_uses_same_id():
+    gateway = FakeGateway(settings())
+    client = FakeTradeClient()
+    gateway._trade_client = client
+
+    intent = OrderIntent(symbol="AAPL", side="BUY", quantity=1, limit_price=150)
+    order = gateway.create_order(intent)
+    gateway.place_order(order)
+
+    assert order.order_id == "reserved-999"
+    assert client.create_kwargs["account"] == "account-123"
+    assert client.create_kwargs["contract"] is not None
+    assert client.placed_order.order_id == "reserved-999"
+    assert client.placed_order.action == "BUY"
+
+
+def test_get_order_prefers_sdk_order_lookup():
+    gateway = FakeGateway(settings())
+    client = FakeTradeClient()
+    gateway._trade_client = client
+
+    order = gateway.get_order("reserved-999")
+
+    assert order == {"id": "global-999", "order_id": "reserved-999"}
+    assert client.get_order_kwargs == {"account": "account-123", "order_id": "reserved-999"}
 
 
 def test_normalize_converts_nested_contract_object_to_plain_dict():

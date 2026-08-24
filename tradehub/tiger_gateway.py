@@ -21,13 +21,64 @@ class TigerGateway:
         response = self.trade_client.preview_order(order)
         return normalize(response)
 
-    def place_order(self, intent: OrderIntent) -> tuple[str | None, dict[str, Any] | None]:
+    def create_order(self, intent: OrderIntent) -> Any:
         if not self.is_configured():
             raise RuntimeError("Tiger credentials are not configured")
         order = self._build_order(intent)
-        response = self.trade_client.place_order(order)
-        order_id = extract_order_id(response) or extract_order_id(order)
-        return str(order_id) if order_id is not None else None, normalize(response or order)
+        return self.trade_client.create_order(
+            account=self.settings.tiger_account,
+            contract=order.contract,
+            action=order.action,
+            order_type=order.order_type,
+            quantity=order.quantity,
+            limit_price=order.limit_price,
+        )
+
+    def get_order(self, order_id: str) -> dict[str, Any] | None:
+        if not self.is_configured():
+            raise RuntimeError("Tiger credentials are not configured")
+        getter = getattr(self.trade_client, "get_order", None)
+        if callable(getter):
+            # create_order.order_id is the account-specific reserved number. Tiger's
+            # `id` parameter is a different namespace: the global order identifier.
+            response = getter(
+                account=self.settings.tiger_account,
+                order_id=int(order_id) if str(order_id).isdigit() else order_id,
+            )
+            response_value = normalize(response)
+            if response_value:
+                return response_value
+
+        return next(
+            (
+                entry
+                for entry in self.get_orders(limit=100)
+                if str(entry.get("order_id")) == str(order_id)
+                or str(entry.get("id")) == str(order_id)
+            ),
+            None,
+        )
+
+    def place_order(self, order: OrderIntent | Any) -> tuple[str | None, dict[str, Any] | None]:
+        if not self.is_configured():
+            raise RuntimeError("Tiger credentials are not configured")
+        order_to_send = self._build_order(order) if isinstance(order, OrderIntent) else order
+        response = self.trade_client.place_order(order_to_send)
+        order_id = extract_order_id(response) or extract_order_id(order_to_send)
+        return str(order_id) if order_id is not None else None, normalize(response or order_to_send)
+
+    def assign_order_id(self, order: Any, order_id: str) -> Any:
+        order.order_id = order_id
+        return order
+
+    def get_order_id(self, order: Any) -> str | None:
+        value = extract_order_id(order)
+        return str(value) if value is not None else None
+
+    def get_global_order_id(self, order: Any) -> str | None:
+        normalized = normalize(order)
+        value = normalized.get("id") if normalized else None
+        return str(value) if value is not None else None
 
     def cancel_order(self, order_id: str) -> dict[str, Any] | None:
         if not self.is_configured():
