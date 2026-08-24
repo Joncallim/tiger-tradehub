@@ -13,6 +13,12 @@ from tradehub_research.acceptance.schema import AssertionResult, RunResult, Stat
 
 
 def commit_sha() -> str:
+    try:
+        from tradehub_research._commit import __commit_sha__
+
+        return __commit_sha__
+    except ImportError:
+        pass
     repository_root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
