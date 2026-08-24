@@ -270,6 +270,8 @@ def test_form4_amendment_reorder_change_remove_and_add_ingests(tmp_path):
     adapter = sec(tmp_path)
     original_transactions = [
         ("Reordered", "2025-01-01", 10, 1),
+        ("Same lot", "2025-01-01", 11, 1.1),
+        ("Same lot", "2025-01-01", 12, 1.2),
         ("Changed", "2025-01-02", 20, 2),
         ("Removed", "2025-01-03", 30, 3),
     ]
@@ -288,9 +290,11 @@ def test_form4_amendment_reorder_change_remove_and_add_ingests(tmp_path):
             filing(
                 "4/A",
                 [
+                    ("Same lot", "2025-01-01", 12, 1.2),
                     ("Changed", "2025-01-02", 200, 2.5),
                     ("Added", "2025-01-04", 40, 4),
                     ("Reordered", "2025-01-01", 10, 1),
+                    ("Same lot", "2025-01-01", 11, 1.1),
                 ],
             ),
             fetched("sec_form4.xml"),
@@ -307,11 +311,23 @@ def test_form4_amendment_reorder_change_remove_and_add_ingests(tmp_path):
     ingest_records(amendment, store)
 
     transaction_rows = [row for row in amendment if not row.envelope.withdrawn]
-    assert len(transaction_rows) == 3
+    assert len(original) == len({row.envelope.source_record_id for row in original}) == 5
+    assert len(transaction_rows) == 5
     superseding = [
         row for row in transaction_rows if row.envelope.supersedes_source_record_id is not None
     ]
-    assert len(superseding) == 2
+    assert len(superseding) == 4
+    original_lots = {
+        row.structured_fields["shares"]: row.envelope.source_record_id
+        for row in original
+        if row.structured_fields["security_title"] == "Same lot"
+    }
+    amended_lots = {
+        row.structured_fields["shares"]: row.envelope.supersedes_source_record_id
+        for row in amendment
+        if row.structured_fields.get("security_title") == "Same lot"
+    }
+    assert amended_lots == original_lots
     added = next(
         row for row in transaction_rows if row.structured_fields["security_title"] == "Added"
     )
@@ -322,6 +338,7 @@ def test_form4_amendment_reorder_change_remove_and_add_ingests(tmp_path):
     current = [json.loads(row["structured_fields"]) for row in store.current("s1")]
     assert {row["security_title"] for row in current} == {
         "Reordered",
+        "Same lot",
         "Changed",
         "Added",
     }

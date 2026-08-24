@@ -310,13 +310,13 @@ def _load_form4_coverage(db, as_of: str, universe: list[str]) -> dict[str, froze
     return {sid: frozenset(dates) for sid, dates in coverage.items()}
 
 
-def _load_identity_feed_state(db, as_of: str, universe: list[str]) -> bool:
-    """The identity feed is complete when a settled feed marker exists."""
+def _load_identity_feed_state(db, as_of: str, universe: list[str]) -> dict[str, bool]:
+    """Return settled identity-feed completeness independently per security."""
     if not universe:
-        return False
+        return {}
     placeholders = ",".join("?" for _ in universe)
-    row = db.execute(
-        f"SELECT COUNT(*) FROM evidence_event WHERE security_id IN ({placeholders}) "
+    rows = db.execute(
+        f"SELECT DISTINCT security_id FROM evidence_event WHERE security_id IN ({placeholders}) "
         "AND json_extract(structured_fields,'$.record_type')='identity_feed_marker' "
         "AND public_available_time IS NOT NULL AND public_available_time <= ? "
         "AND pat_provenance IN ('source_reported','derived_from_index') AND withdrawn=0 "
@@ -325,8 +325,9 @@ def _load_identity_feed_state(db, as_of: str, universe: list[str]) -> bool:
         "AND successor.public_available_time IS NOT NULL "
         "AND successor.public_available_time <= ?)",
         (*universe, as_of, as_of),
-    ).fetchone()
-    return bool(row and row[0] > 0)
+    ).fetchall()
+    covered = {row["security_id"] for row in rows}
+    return {security_id: security_id in covered for security_id in universe}
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +343,7 @@ def _input_view_hash(
     identity_events: dict[str, list[dict[str, Any]]],
     corporate_actions: dict[str, list[dict[str, Any]]],
     form4_coverage: dict[str, frozenset[str]],
-    identity_feed_complete: bool,
+    identity_feed_complete: dict[str, bool],
     cluster_lookup: dict[str, set[str]],
 ) -> str:
     """Canonical hash of the read-only as-of evidence view."""
@@ -408,6 +409,7 @@ def run_screening(
             identity_events = _load_identity_events(db, as_of, universe)
             form4_coverage = _load_form4_coverage(db, as_of, universe)
             identity_feed_complete = _load_identity_feed_state(db, as_of, universe)
+            cluster_lookup = store.cluster_ids_by_evidence(as_of, connection=db)
         finally:
             db.close()
     else:
@@ -422,6 +424,7 @@ def run_screening(
             identity_events = _load_identity_events(db, as_of, universe)
             form4_coverage = _load_form4_coverage(db, as_of, universe)
             identity_feed_complete = _load_identity_feed_state(db, as_of, universe)
+            cluster_lookup = store.cluster_ids_by_evidence(as_of, connection=db)
 
     corporate_actions: dict[str, list[dict[str, Any]]] = {}
     for grouped, kind in ((corporate_actions_split, "split"), (corporate_actions_div, "dividend")):
@@ -439,8 +442,6 @@ def run_screening(
             ]
         )
     )
-    cluster_lookup = store.cluster_ids_by_evidence(as_of)
-
     manifest = []
     for spec, _fn in specs:
         store.save_screen_definition(spec)

@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
 from typing import Any
 
 from tradehub_research.db import ResearchDB, normalize_ts, utc_now
@@ -289,13 +290,20 @@ class ScreenStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def cluster_ids_by_evidence(self, as_of: str | None = None) -> dict[str, set[str]]:
+    def cluster_ids_by_evidence(
+        self, as_of: str | None = None, *, connection: sqlite3.Connection | None = None
+    ) -> dict[str, set[str]]:
         """One bounded scan resolving every evidence cluster membership.
 
         Maps evidence_id -> set(cluster_id).  Cluster ids are resolved at rank
         time only and are never copied into screen_result rows (design 3).
         """
-        with self.database.connect(read_only=True) as db:
+        with (
+            nullcontext(connection)
+            if connection is not None
+            else self.database.connect(read_only=True)
+        ) as db:
+            assert db is not None
             if as_of is None:
                 rows = db.execute(
                     "SELECT evidence_id,cluster_id FROM evidence_cluster_member "
@@ -305,10 +313,12 @@ class ScreenStore:
                 rows = db.execute(
                     "SELECT m.evidence_id,m.cluster_id FROM evidence_cluster_member m "
                     "JOIN evidence_event e ON e.evidence_id=m.evidence_id "
+                    "JOIN evidence_cluster c ON c.cluster_id=m.cluster_id "
                     "WHERE e.public_available_time IS NOT NULL AND e.public_available_time <= ? "
                     "AND e.pat_provenance IN ('source_reported','derived_from_index') "
+                    "AND c.formed_at <= ? "
                     "ORDER BY m.evidence_id,m.cluster_id",
-                    (normalize_ts(as_of),),
+                    (normalize_ts(as_of), normalize_ts(as_of)),
                 ).fetchall()
         lookup: dict[str, set[str]] = {}
         for row in rows:

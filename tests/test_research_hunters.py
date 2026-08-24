@@ -38,6 +38,18 @@ def test_event_complete_zero_and_incomplete_are_distinct() -> None:
     assert (negative.sufficient_data, negative.passed) == (True, False)
 
 
+def test_event_feed_completeness_is_per_security() -> None:
+    ctx = context(
+        universe=["A", "B"],
+        identity_feed_complete={"A": True, "B": False},
+        sectors={"A": "Technology", "B": "Technology"},
+    )
+    assert event.evaluate(ctx, "A").reason_codes == ["no_identity_event"]
+    uncovered = event.evaluate(ctx, "B")
+    assert not uncovered.sufficient_data
+    assert uncovered.reason_codes == ["incomplete_identity_feed"]
+
+
 def test_form4_zero_requires_complete_window() -> None:
     result = informed_activity.evaluate(context(), "S")
     assert not result.sufficient_data

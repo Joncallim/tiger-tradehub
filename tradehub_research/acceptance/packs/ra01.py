@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import inspect
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from tradehub_research.adapters.base import FetchResult
 from tradehub_research.adapters.tiingo import TiingoEodAdapter
@@ -20,8 +20,20 @@ from tradehub_research.hunters import (
     valuation,
 )
 from tradehub_research.hunters.common import adjusted_close_series
-from tradehub_research.screening import _load_facts, _load_form4_coverage, _load_identity_feed_state
-from tradehub_research.screens import ScreenContext, canonical_json, registered_screens
+from tradehub_research.screen_store import ScreenStore
+from tradehub_research.screening import (
+    ScreeningConfig,
+    _load_facts,
+    _load_form4_coverage,
+    _load_identity_feed_state,
+    run_screening,
+)
+from tradehub_research.screens import (
+    ScreenContext,
+    ScreenResult,
+    canonical_json,
+    registered_screens,
+)
 
 
 def _context(**changes) -> ScreenContext:
@@ -84,14 +96,52 @@ def population_tristate(tmp: Path) -> None:
         ),
         "S",
     )
-    assert [(x.sufficient_data, x.passed) for x in (strong, weak, missing)] == [
+    payloads = (strong, weak, missing)
+    assert [(x.sufficient_data, x.passed) for x in payloads] == [
         (True, True),
         (True, False),
         (False, False),
     ]
-    assert "evaluated" not in inspect.getsource(
-        __import__("tradehub_research.screens", fromlist=["ScreenResult"]).ScreenResult
+    database = ResearchDB(tmp / "tristate.db")
+    _seed_db(database)
+    with database.connect() as db:
+        for sid in ("strong", "weak", "missing"):
+            db.execute(
+                "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+                (sid, sid, "NYSE", sid, None, None, "SUPPORTED", "2020-01-01", None),
+            )
+    store = ScreenStore(database)
+    store.save_screen_definition(event.SCREEN_SPEC)
+    run_id = store.begin_run(
+        as_of="2025-04-01",
+        universe_hash="u",
+        screen_manifest=[{"config_hash": event.SCREEN_SPEC.config_hash, "expected_count": 3}],
+        funnel_config={},
+        input_view_hash="v",
+        expected_security_count=3,
     )
+    rows = [
+        ScreenResult.create(
+            run_id=run_id,
+            security_id=sid,
+            config_hash=event.SCREEN_SPEC.config_hash,
+            raw_features=payload.raw_features,
+            evidence_ids=payload.evidence_ids,
+            reason_codes=payload.reason_codes,
+            sufficient_data=payload.sufficient_data,
+            passed=payload.passed,
+            confidence=payload.confidence,
+            data_quality=payload.data_quality,
+        )
+        for sid, payload in zip(("strong", "weak", "missing"), payloads, strict=True)
+    ]
+    store.persist_screen_population(run_id, event.SCREEN_SPEC.config_hash, rows)
+    with database.connect(read_only=True) as db:
+        persisted = db.execute(
+            "SELECT sufficient_data,passed FROM screen_result "
+            "ORDER BY CASE security_id WHEN 'strong' THEN 1 WHEN 'weak' THEN 2 ELSE 3 END"
+        ).fetchall()
+    assert [tuple(row) for row in persisted] == [(1, 1), (1, 0), (0, 0)]
 
 
 def raw_feature_lineage(tmp: Path) -> None:
@@ -122,7 +172,7 @@ def pit_cutoff_and_unknown(tmp: Path) -> None:
         )
     with db.connect(read_only=True) as conn:
         assert _load_form4_coverage(conn, "2025-04-01", ["S"]) == {"S": frozenset({"2025-03-01"})}
-        assert not _load_identity_feed_state(conn, "2025-04-01", ["S"])
+        assert _load_identity_feed_state(conn, "2025-04-01", ["S"]) == {"S": False}
 
 
 def restatement_replay(tmp: Path) -> None:
@@ -353,11 +403,20 @@ def isolation_and_complexity(tmp: Path) -> None:
                         else [node.module or ""]
                     )
                     assert not any(n == "tradehub" or n.startswith("tradehub.") for n in names)
-            lowered = file.read_text().lower()
-            assert not any(
-                token in lowered
-                for token in ("requests.", "urllib", "preview_order", "submit_order")
-            )
+    database = ResearchDB(tmp / "isolated.db")
+    _seed_db(database)
+    with (
+        patch("httpx.Client.request", side_effect=AssertionError("network called")),
+        patch("subprocess.run", side_effect=AssertionError("external command called")),
+    ):
+        run_id = run_screening(
+            "2025-04-01", None, ScreeningConfig(holdings=frozenset({"S"})), database=database
+        )
+    with database.connect(read_only=True) as db:
+        assert (
+            db.execute("SELECT status FROM pipeline_run WHERE run_id=?", (run_id,)).fetchone()[0]
+            == "COMPLETE"
+        )
 
 
 ASSERTIONS = [

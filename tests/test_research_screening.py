@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from tradehub_research.acceptance.runner import PACK_REGISTRY
 from tradehub_research.db import ResearchDB
+from tradehub_research.evidence import EvidenceStore
 from tradehub_research.funnel import FunnelConfig
-from tradehub_research.screening import ScreeningConfig, run_screening
+from tradehub_research.screen_store import ScreenStore
+from tradehub_research.screening import ScreeningConfig, _load_identity_feed_state, run_screening
+from tradehub_research.snapshot import create_snapshot, open_snapshot_read_only
 from tradehub_research.universe import UniverseMembershipStore
 
 
@@ -83,3 +86,79 @@ def test_holdings_change_run_identity(tmp_path) -> None:
     a = store.begin_run(**args, funnel_config={"holdings": ["A"]})
     b = store.begin_run(**args, funnel_config={"holdings": ["B"]})
     assert a != b
+
+
+def test_identity_feed_completeness_is_loaded_per_security(tmp_path) -> None:
+    database = ResearchDB(tmp_path / "coverage.db")
+    database.init()
+    with database.connect() as db:
+        for sid in ("A", "B"):
+            db.execute(
+                "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+                (sid, sid, "NYSE", sid, None, None, "SUPPORTED", "2020-01-01", None),
+            )
+        db.execute(
+            "INSERT INTO evidence_source VALUES (?,?,?,?,?)", ("src", "x", 1, "", "source_reported")
+        )
+    EvidenceStore(database).insert(
+        security_id="A",
+        source_id="src",
+        structured_fields={"record_type": "identity_feed_marker"},
+        extraction_confidence=1,
+        event_time="2025-01-01",
+        public_available_time="2025-01-02",
+        pat_provenance="source_reported",
+        ingested_time="2025-01-03",
+    )
+    with database.connect(read_only=True) as db:
+        assert _load_identity_feed_state(db, "2025-04-01", ["A", "B"]) == {"A": True, "B": False}
+
+
+def test_cluster_lookup_is_as_of_and_uses_snapshot_connection(tmp_path) -> None:
+    database = ResearchDB(tmp_path / "clusters.db")
+    database.init()
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("S", "S", "NYSE", "S", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+        db.execute(
+            "INSERT INTO evidence_source VALUES (?,?,?,?,?)", ("src", "x", 1, "", "source_reported")
+        )
+    evidence_id = EvidenceStore(database).insert(
+        security_id="S",
+        source_id="src",
+        structured_fields={"record_type": "xbrl_fact"},
+        extraction_confidence=1,
+        event_time="2025-01-01",
+        public_available_time="2025-01-02",
+        pat_provenance="source_reported",
+        ingested_time="2025-01-03",
+    )
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO evidence_cluster VALUES (?,?,?)", ("past", "past", "2025-01-03T00:00:00Z")
+        )
+        db.execute(
+            "INSERT INTO evidence_cluster VALUES (?,?,?)",
+            ("future", "future", "2025-05-01T00:00:00Z"),
+        )
+        db.execute("INSERT INTO evidence_cluster_member VALUES (?,?)", (evidence_id, "past"))
+        db.execute("INSERT INTO evidence_cluster_member VALUES (?,?)", (evidence_id, "future"))
+    store = ScreenStore(database)
+    assert store.cluster_ids_by_evidence("2025-04-01") == {evidence_id: {"past"}}
+    snapshot_path = tmp_path / "snapshot.db"
+    create_snapshot(database, snapshot_path)
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO evidence_cluster VALUES (?,?,?)",
+            ("live-only", "live", "2025-01-03T00:00:00Z"),
+        )
+        db.execute("INSERT INTO evidence_cluster_member VALUES (?,?)", (evidence_id, "live-only"))
+    snapshot_db = open_snapshot_read_only(snapshot_path).connection()
+    try:
+        assert store.cluster_ids_by_evidence("2025-04-01", connection=snapshot_db) == {
+            evidence_id: {"past"}
+        }
+    finally:
+        snapshot_db.close()

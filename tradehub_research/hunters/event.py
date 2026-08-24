@@ -69,7 +69,12 @@ def evaluate(context: ScreenContext, security_id: SecurityId) -> ScreenResultPay
     window_start = as_of.date() - timedelta(days=lookback)
     window = (window_start.isoformat(), as_of.date().isoformat())
 
-    feed_complete = context.identity_feed_complete
+    feed_state = context.identity_feed_complete
+    feed_complete = (
+        bool(feed_state.get(security_id, False))
+        if isinstance(feed_state, dict) or hasattr(feed_state, "get")
+        else bool(feed_state)
+    )
     events = _active_events(context.identity_events.get(security_id, []))
     in_window = [
         event
