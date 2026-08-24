@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PHASE_0_SCHEMA_VERSION = 3
+PHASE_0_SCHEMA_VERSION = 4
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -261,6 +261,65 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
                     AND NEW.knowledge_time < p.knowledge_time
             ) THEN RAISE(ABORT, 'membership supersession cannot backdate knowledge time') END;
         END;
+        """,
+    ),
+    (
+        4,
+        "PIT-safe identity history and recoverable snapshot publication",
+        """
+        ALTER TABLE security_identity_event RENAME TO security_identity_event_v3;
+        CREATE TABLE security_identity_event (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            event_type TEXT NOT NULL CHECK (event_type IN (
+                'baseline','ticker_change','share_class_change','corporate_action','delisting'
+            )),
+            old_value TEXT, new_value TEXT, event_time TEXT NOT NULL,
+            public_available_time TEXT,
+            pat_provenance TEXT NOT NULL CHECK (pat_provenance IN (
+                'source_reported','derived_from_index','observed_at_ingest','unknown'
+            )),
+            ingested_time TEXT NOT NULL,
+            supersedes_id INTEGER REFERENCES security_identity_event(id),
+            CHECK (public_available_time IS NOT NULL OR pat_provenance IN (
+                'unknown','observed_at_ingest'
+            )),
+            CHECK (public_available_time IS NULL OR public_available_time <= ingested_time)
+        );
+        INSERT INTO security_identity_event(
+            id,security_id,event_type,old_value,new_value,event_time,
+            public_available_time,pat_provenance,ingested_time
+        ) SELECT id,security_id,event_type,old_value,new_value,event_time,
+            public_available_time,pat_provenance,
+            COALESCE(public_available_time,event_time) FROM security_identity_event_v3;
+        DROP TABLE security_identity_event_v3;
+        CREATE INDEX security_identity_event_idx ON security_identity_event(
+            security_id,event_type,public_available_time
+        );
+        CREATE UNIQUE INDEX identity_single_successor_uq
+            ON security_identity_event(supersedes_id) WHERE supersedes_id IS NOT NULL;
+        CREATE INDEX identity_supersedes_idx ON security_identity_event(supersedes_id);
+        CREATE TRIGGER identity_no_update BEFORE UPDATE ON security_identity_event BEGIN
+            SELECT RAISE(ABORT, 'security_identity_event is append-only'); END;
+        CREATE TRIGGER identity_no_delete BEFORE DELETE ON security_identity_event BEGIN
+            SELECT RAISE(ABORT, 'security_identity_event is append-only'); END;
+        CREATE TRIGGER identity_supersession_valid BEFORE INSERT ON security_identity_event
+        WHEN NEW.supersedes_id IS NOT NULL BEGIN
+            SELECT CASE WHEN NEW.supersedes_id = NEW.id
+                THEN RAISE(ABORT, 'identity event cannot supersede itself') END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
+                    AND p.security_id=NEW.security_id
+            ) THEN RAISE(ABORT, 'identity supersession requires same security') END;
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
+                    AND NEW.public_available_time < p.public_available_time
+            ) THEN RAISE(ABORT, 'identity supersession cannot backdate knowledge time') END;
+        END;
+
+        ALTER TABLE snapshot_version ADD COLUMN status TEXT NOT NULL DEFAULT 'READY'
+            CHECK (status IN ('PENDING','READY'));
+        ALTER TABLE snapshot_version ADD COLUMN destination_path TEXT;
         """,
     ),
 )

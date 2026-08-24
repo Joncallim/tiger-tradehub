@@ -6,6 +6,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import venv
 
 import pytest
 
@@ -31,7 +32,7 @@ def test_schema_and_migration_are_idempotent(tmp_path):
     assert database.migrate() == PHASE_0_SCHEMA_VERSION
     assert database.check()["ok"]
     with database.connect(read_only=True) as db:
-        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 3
+        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 4
 
 
 def test_settings_use_only_research_prefix(monkeypatch, tmp_path):
@@ -56,13 +57,22 @@ def test_identity_and_membership_reconstruct_history(tmp_path):
         db.execute(
             "INSERT INTO security_identity_event("
             "security_id,event_type,old_value,new_value,event_time,"
-            "public_available_time,pat_provenance) VALUES (?,?,?,?,?,?,?)",
-            ("s1", "ticker_change", "OLD", "NEW", "2025-02-01", "2025-02-01", "source_reported"),
+            "public_available_time,pat_provenance,ingested_time) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "s1",
+                "ticker_change",
+                "OLD",
+                "NEW",
+                "2025-02-01",
+                "2025-02-01",
+                "source_reported",
+                "2025-02-01",
+            ),
         )
         db.execute(
             "INSERT INTO security_identity_event("
             "security_id,event_type,old_value,new_value,event_time,"
-            "public_available_time,pat_provenance) VALUES (?,?,?,?,?,?,?)",
+            "public_available_time,pat_provenance,ingested_time) VALUES (?,?,?,?,?,?,?,?)",
             (
                 "s1",
                 "delisting",
@@ -71,6 +81,7 @@ def test_identity_and_membership_reconstruct_history(tmp_path):
                 "2025-04-01",
                 "2025-03-15",
                 "source_reported",
+                "2025-03-15",
             ),
         )
         db.execute(
@@ -145,6 +156,15 @@ def test_universe_knowledge_gate_corrections_and_identity_events(tmp_path):
             db.execute("UPDATE universe_membership SET eligible=1 WHERE id=?", (correction,))
 
     identities = SecurityIdentityStore(database)
+    identities.insert(
+        security_id="s1",
+        event_type="baseline",
+        old_value=None,
+        new_value="OLD",
+        event_time="2020-01-01",
+        public_available_time="2020-01-01",
+        pat_provenance="source_reported",
+    )
     identities.insert(
         security_id="s1",
         event_type="ticker_change",
@@ -224,6 +244,138 @@ def test_universe_historical_provenance_gate(tmp_path):
     )
     assert memberships.pit_valid("s1", "2020-01-02") == []
     assert [row["id"] for row in memberships.current("s1")] == [membership]
+
+
+def test_universe_full_chain_terminal_semantics(tmp_path):
+    database = initialized(tmp_path)
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s1", "ONE", "NYSE", "One", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+    memberships = UniverseMembershipStore(database)
+    args = dict(
+        security_id="s1",
+        valid_from="2020-01-01",
+        price_eligible=True,
+        market_cap_eligible=True,
+        liquidity_eligible=True,
+        eligible=True,
+    )
+    chain = [
+        memberships.insert(knowledge_time="2025-01-01", pat_provenance="source_reported", **args)
+    ]
+    for day, provenance in (
+        (2, "observed_at_ingest"),
+        (3, "source_reported"),
+        (4, "derived_from_index"),
+    ):
+        chain.append(
+            memberships.insert(
+                knowledge_time=f"2025-01-0{day}",
+                pat_provenance=provenance,
+                supersedes_id=chain[-1],
+                **args,
+            )
+        )
+    assert [row["id"] for row in memberships.pit_valid("s1", "2025-01-04")] == [chain[-1]]
+
+    observed = memberships.insert(
+        knowledge_time="2025-02-01", pat_provenance="source_reported", **args
+    )
+    memberships.insert(
+        knowledge_time="2025-02-02",
+        pat_provenance="observed_at_ingest",
+        supersedes_id=observed,
+        **args,
+    )
+    assert observed not in [row["id"] for row in memberships.pit_valid("s1", "2025-02-03")]
+
+
+def test_identity_is_pit_safe_append_only_and_correctable(tmp_path):
+    database = initialized(tmp_path)
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s1", "CURRENT", "NYSE", "One", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s2", "TWO", "NYSE", "Two", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+    identities = SecurityIdentityStore(database)
+    assert identities.ticker_at("s1", "2019-01-01") is None
+    baseline = identities.insert(
+        security_id="s1",
+        event_type="baseline",
+        old_value=None,
+        new_value="OLD",
+        event_time="2020-01-01",
+        public_available_time="2020-01-02",
+        pat_provenance="source_reported",
+    )
+    assert identities.ticker_at("s1", "2020-01-01") is None
+    observed = identities.insert(
+        security_id="s1",
+        event_type="ticker_change",
+        old_value="OLD",
+        new_value="POISON",
+        event_time="2025-01-01",
+        public_available_time=None,
+        pat_provenance="observed_at_ingest",
+        ingested_time="2025-01-02",
+    )
+    assert identities.ticker_at("s1", "2025-01-03") == "OLD"
+    corrected = identities.insert(
+        security_id="s1",
+        event_type="ticker_change",
+        old_value="OLD",
+        new_value="NEW",
+        event_time="2025-01-01",
+        public_available_time="2025-01-03",
+        pat_provenance="source_reported",
+        supersedes_id=observed,
+    )
+    assert identities.ticker_at("s1", "2025-01-02") == "OLD"
+    assert identities.ticker_at("s1", "2025-01-03") == "NEW"
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        identities.insert(
+            security_id="s1",
+            event_type="ticker_change",
+            old_value="OLD",
+            new_value="FORK",
+            event_time="2025-01-01",
+            public_available_time="2025-01-04",
+            pat_provenance="source_reported",
+            supersedes_id=observed,
+        )
+    with database.connect() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            db.execute("UPDATE security_identity_event SET new_value='X' WHERE id=?", (baseline,))
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            db.execute("DELETE FROM security_identity_event WHERE id=?", (baseline,))
+    with pytest.raises(ValueError, match="backdate"):
+        identities.insert(
+            security_id="s1",
+            event_type="ticker_change",
+            old_value="OLD",
+            new_value="X",
+            event_time="2025-01-01",
+            public_available_time="2025-01-02",
+            pat_provenance="source_reported",
+            supersedes_id=corrected,
+        )
+    with pytest.raises(ValueError, match="same security"):
+        identities.insert(
+            security_id="s2",
+            event_type="ticker_change",
+            old_value="TWO",
+            new_value="X",
+            event_time="2025-01-01",
+            public_available_time="2025-01-04",
+            pat_provenance="source_reported",
+            supersedes_id=corrected,
+        )
 
 
 def test_experiment_reruns_and_attempts_append(tmp_path):
@@ -329,7 +481,7 @@ def test_snapshot_rejects_live_path_overwrite_and_failed_publication(tmp_path, m
         create_snapshot(database, destination)
     assert not destination.exists()
     with database.connect(read_only=True) as db:
-        assert db.execute("SELECT COUNT(*) FROM snapshot_version").fetchone()[0] == 0
+        assert db.execute("SELECT status FROM snapshot_version").fetchone()[0] == "PENDING"
 
 
 def test_snapshot_handle_rejects_replaced_file(tmp_path):
@@ -343,6 +495,48 @@ def test_snapshot_handle_rejects_replaced_file(tmp_path):
     os.replace(replacement_path, first_path)
     with pytest.raises(sqlite3.DatabaseError, match="identity does not match"):
         handle.connection()
+
+
+def test_snapshot_handle_rejects_manifest_and_schema_tampering(tmp_path):
+    database = initialized(tmp_path)
+    paths = []
+    for name in ("manifest", "view", "index", "trigger"):
+        path = tmp_path / f"{name}.db"
+        create_snapshot(database, path)
+        paths.append(path)
+    handles = [open_snapshot_read_only(path) for path in paths]
+    mutations = (
+        "UPDATE snapshot_manifest SET created_at='tampered'",
+        "CREATE VIEW poison AS SELECT 1 AS poisoned",
+        "DROP INDEX evidence_pit_idx",
+        "DROP TRIGGER evidence_no_delete",
+    )
+    for path, handle, mutation in zip(paths, handles, mutations, strict=True):
+        with sqlite3.connect(path) as db:
+            db.execute(mutation)
+        with pytest.raises(sqlite3.DatabaseError):
+            handle.connection()
+
+
+def test_published_pending_snapshot_is_refused_then_reconciled(tmp_path):
+    database = initialized(tmp_path)
+    first_path = tmp_path / "first.db"
+    snapshot_id = create_snapshot(database, first_path)
+    with database.connect() as db:
+        db.execute(
+            "UPDATE snapshot_version SET status='PENDING' WHERE snapshot_id=?", (snapshot_id,)
+        )
+    with pytest.raises(sqlite3.DatabaseError, match="not READY"):
+        open_snapshot_read_only(first_path)
+    create_snapshot(database, tmp_path / "second.db")
+    open_snapshot_read_only(first_path).connection().close()
+    with database.connect(read_only=True) as db:
+        assert (
+            db.execute(
+                "SELECT status FROM snapshot_version WHERE snapshot_id=?", (snapshot_id,)
+            ).fetchone()[0]
+            == "READY"
+        )
 
 
 def test_cli_init_and_check(tmp_path):
@@ -395,6 +589,39 @@ def test_installed_ra00_command_runs_outside_repository(tmp_path):
             "cli.init",
         )
     ]
+
+
+def test_wheel_embeds_commit_for_outside_repository_execution(tmp_path):
+    root = os.path.dirname(os.path.dirname(__file__))
+    wheel_dir = tmp_path / "wheel"
+    built = subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(wheel_dir)],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert built.returncode == 0, built.stderr
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = environment / "bin" / "python"
+    wheel = next(wheel_dir.glob("*.whl"))
+    installed = subprocess.run(
+        [str(python), "-m", "pip", "install", str(wheel)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert installed.returncode == 0, installed.stderr
+    result = subprocess.run(
+        [str(environment / "bin" / "tradehub-research-acceptance"), "RA-00"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert re.fullmatch(r"[0-9a-f]{40}", json.loads(result.stdout)["commit_sha"])
 
 
 def test_package_has_no_tradehub_imports():

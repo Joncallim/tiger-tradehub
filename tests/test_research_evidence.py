@@ -85,6 +85,55 @@ def test_duplicate_is_idempotent_per_source_and_security(store):
         assert db.execute("SELECT COUNT(*) FROM evidence_event").fetchone()[0] == 1
 
 
+def test_caller_hash_cannot_bypass_canonical_content_deduplication(store):
+    first = add(store, {"same": True}, "2025-01-05", content_hash="claimed-one")
+    second = add(store, {"same": True}, "2025-01-05", content_hash="claimed-two")
+    assert second == first
+    with store.database.connect(read_only=True) as db:
+        assert db.execute("SELECT COUNT(*) FROM evidence_event").fetchone()[0] == 1
+
+
+def test_full_supersession_chain_uses_only_terminal_state(store):
+    chain = [add(store, {"v": 1}, "2025-01-01", source_record_id="chain-1")]
+    provenances = ["observed_at_ingest", "source_reported", "derived_from_index"]
+    for position, provenance in enumerate(provenances, start=2):
+        chain.append(
+            add(
+                store,
+                {"v": position},
+                f"2025-01-0{position}",
+                source_record_id=f"chain-{position}",
+                pat_provenance=provenance,
+                supersedes_evidence_id=chain[-1],
+            )
+        )
+    assert [row["evidence_id"] for row in store.historical("2025-01-04")] == [chain[-1]]
+
+
+def test_unapproved_or_withdrawn_terminal_suppresses_predecessor(store):
+    approved = add(store, {"v": 1}, "2025-01-01", source_record_id="approved")
+    add(
+        store,
+        {"v": 2},
+        "2025-01-02",
+        source_record_id="observed",
+        pat_provenance="observed_at_ingest",
+        supersedes_evidence_id=approved,
+    )
+    assert store.historical("2025-01-03") == []
+
+    other = add(store, {"v": 3}, "2025-01-01", source_record_id="other")
+    add(
+        store,
+        {},
+        "2025-01-02",
+        source_record_id="withdrawn",
+        supersedes_evidence_id=other,
+        withdrawn=True,
+    )
+    assert store.historical("2025-01-03") == []
+
+
 def test_retraction_removes_live_content_but_retains_rows(store):
     original = add(store, {"claim": True}, "2025-01-05")
     retraction = add(store, {}, "2025-01-08", supersedes_evidence_id=original, withdrawn=True)

@@ -76,20 +76,30 @@ class UniverseMembershipStore:
         with self.database.connect(read_only=True) as db:
             return list(
                 db.execute(
-                    """SELECT membership.* FROM universe_membership membership
+                    """WITH RECURSIVE visible_chain(root_id, descendant_id) AS (
+                        SELECT id,id FROM universe_membership WHERE knowledge_time <= ?
+                        UNION ALL
+                        SELECT chain.root_id, correction.id
+                        FROM visible_chain chain JOIN universe_membership correction
+                          ON correction.supersedes_id=chain.descendant_id
+                        WHERE correction.knowledge_time <= ?
+                    ), terminal(root_id,descendant_id) AS (
+                        SELECT chain.root_id,chain.descendant_id FROM visible_chain chain
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM visible_chain child
+                            JOIN universe_membership item ON item.id=child.descendant_id
+                            WHERE child.root_id=chain.root_id
+                              AND item.supersedes_id=chain.descendant_id)
+                    )
+                    SELECT DISTINCT membership.* FROM universe_membership membership
+                    JOIN terminal ON terminal.descendant_id=membership.id
                     WHERE membership.security_id=? AND membership.valid_from <= ?
                       AND (membership.valid_to IS NULL OR membership.valid_to > ?)
                       AND membership.knowledge_time <= ?
                       AND membership.pat_provenance IN (
                         'source_reported','derived_from_index')
-                      AND NOT EXISTS (
-                        SELECT 1 FROM universe_membership correction
-                        WHERE correction.supersedes_id=membership.id
-                          AND correction.knowledge_time <= ?
-                          AND correction.pat_provenance IN (
-                            'source_reported','derived_from_index'))
                     ORDER BY membership.knowledge_time, membership.id""",
-                    (security_id, as_of, as_of, as_of, as_of),
+                    (as_of, as_of, security_id, as_of, as_of, as_of),
                 )
             )
 
@@ -125,48 +135,80 @@ class SecurityIdentityStore:
         event_time: str,
         public_available_time: str | None,
         pat_provenance: str,
+        ingested_time: str | None = None,
+        supersedes_id: int | None = None,
     ) -> int:
+        event_time = normalize_ts(event_time)
+        public_available_time = (
+            normalize_ts(public_available_time) if public_available_time is not None else None
+        )
+        ingested_time = normalize_ts(ingested_time or public_available_time or event_time)
+        if public_available_time is not None and public_available_time > ingested_time:
+            raise ValueError("public_available_time cannot follow ingested_time")
         values: tuple[Any, ...] = (
             security_id,
             event_type,
             old_value,
             new_value,
-            normalize_ts(event_time),
-            normalize_ts(public_available_time) if public_available_time is not None else None,
+            event_time,
+            public_available_time,
             pat_provenance,
+            ingested_time,
+            supersedes_id,
         )
         with self.database.connect() as db:
+            if supersedes_id is not None:
+                predecessor = db.execute(
+                    "SELECT security_id,public_available_time "
+                    "FROM security_identity_event WHERE id=?",
+                    (supersedes_id,),
+                ).fetchone()
+                if predecessor is None:
+                    raise ValueError("superseded identity event does not exist")
+                if predecessor["security_id"] != security_id:
+                    raise ValueError("identity supersession requires the same security")
+                if public_available_time is None or (
+                    predecessor["public_available_time"] is not None
+                    and public_available_time < predecessor["public_available_time"]
+                ):
+                    raise ValueError("identity supersession cannot backdate knowledge time")
             cursor = db.execute(
                 """INSERT INTO security_identity_event(
                     security_id,event_type,old_value,new_value,event_time,
-                    public_available_time,pat_provenance) VALUES (?,?,?,?,?,?,?)""",
+                    public_available_time,pat_provenance,ingested_time,supersedes_id)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 values,
             )
             return int(cursor.lastrowid)
 
-    def ticker_at(self, security_id: str, as_of: str) -> str:
+    def ticker_at(self, security_id: str, as_of: str) -> str | None:
         as_of = normalize_ts(as_of)
         with self.database.connect(read_only=True) as db:
             event = db.execute(
-                """SELECT old_value,new_value FROM security_identity_event
-                WHERE security_id=? AND event_type='ticker_change'
-                  AND public_available_time IS NOT NULL AND public_available_time <= ?
-                ORDER BY public_available_time DESC,id DESC LIMIT 1""",
-                (security_id, as_of),
+                """WITH RECURSIVE visible_chain(root_id,descendant_id) AS (
+                    SELECT id,id FROM security_identity_event
+                    WHERE public_available_time IS NOT NULL AND public_available_time <= ?
+                    UNION ALL
+                    SELECT chain.root_id,successor.id FROM visible_chain chain
+                    JOIN security_identity_event successor
+                      ON successor.supersedes_id=chain.descendant_id
+                    WHERE successor.public_available_time IS NOT NULL
+                      AND successor.public_available_time <= ?
+                ), terminal(root_id,descendant_id) AS (
+                    SELECT chain.root_id,chain.descendant_id FROM visible_chain chain
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM visible_chain child
+                        JOIN security_identity_event item ON item.id=child.descendant_id
+                        WHERE child.root_id=chain.root_id
+                          AND item.supersedes_id=chain.descendant_id)
+                )
+                SELECT identity.new_value FROM security_identity_event identity
+                JOIN terminal ON terminal.descendant_id=identity.id
+                WHERE identity.security_id=?
+                  AND identity.event_type IN ('baseline','ticker_change')
+                  AND identity.pat_provenance IN ('source_reported','derived_from_index')
+                ORDER BY identity.event_time DESC,identity.public_available_time DESC,
+                    identity.id DESC LIMIT 1""",
+                (as_of, as_of, security_id),
             ).fetchone()
-            if event is not None:
-                return str(event["new_value"])
-            first = db.execute(
-                """SELECT old_value FROM security_identity_event
-                WHERE security_id=? AND event_type='ticker_change'
-                ORDER BY public_available_time,id LIMIT 1""",
-                (security_id,),
-            ).fetchone()
-            if first is not None:
-                return str(first["old_value"])
-            current = db.execute(
-                "SELECT canonical_ticker FROM security WHERE security_id=?", (security_id,)
-            ).fetchone()
-            if current is None:
-                raise KeyError(security_id)
-            return str(current[0])
+            return str(event["new_value"]) if event is not None else None

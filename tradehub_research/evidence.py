@@ -31,7 +31,9 @@ class EvidenceStore:
         evidence_id: str | None = None,
     ) -> str:
         content = json.dumps(structured_fields, sort_keys=True, separators=(",", ":"))
-        digest = content_hash or hashlib.sha256(content.encode()).hexdigest()
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        # Retained for API compatibility, but callers cannot select fallback identity.
+        _ = content_hash
         identifier = evidence_id or str(uuid.uuid4())
         event_time = normalize_ts(event_time)
         public_available_time = (
@@ -145,25 +147,35 @@ class EvidenceStore:
     def historical(self, as_of: str, security_id: str | None = None) -> list[sqlite3.Row]:
         security_clause = "AND e.security_id = ?" if security_id else ""
         as_of = normalize_ts(as_of)
-        parameters: list[Any] = [as_of]
-        if security_id:
-            parameters.append(security_id)
-        parameters.append(as_of)
-        sql = f"""
-            SELECT e.* FROM evidence_event e
+        sql = f"""WITH RECURSIVE visible_chain(root_id, descendant_id) AS (
+                SELECT evidence_id, evidence_id FROM evidence_event
+                WHERE public_available_time IS NOT NULL AND public_available_time <= ?
+                UNION ALL
+                SELECT chain.root_id, successor.evidence_id
+                FROM visible_chain chain JOIN evidence_event successor
+                  ON successor.supersedes_evidence_id=chain.descendant_id
+                WHERE successor.public_available_time IS NOT NULL
+                  AND successor.public_available_time <= ?
+            ), terminal(root_id, descendant_id) AS (
+                SELECT chain.root_id, chain.descendant_id FROM visible_chain chain
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM visible_chain child
+                    WHERE child.root_id=chain.root_id
+                      AND child.descendant_id IN (
+                        SELECT evidence_id FROM evidence_event
+                        WHERE supersedes_evidence_id=chain.descendant_id))
+            )
+            SELECT DISTINCT e.* FROM evidence_event e
+            JOIN terminal t ON t.descendant_id=e.evidence_id
             WHERE e.public_available_time IS NOT NULL
               AND e.pat_provenance IN ('source_reported','derived_from_index')
               AND e.public_available_time <= ? {security_clause}
               AND e.withdrawn = 0
-              AND NOT EXISTS (
-                SELECT 1 FROM evidence_event successor
-                WHERE successor.supersedes_evidence_id = e.evidence_id
-                  AND successor.public_available_time IS NOT NULL
-                  AND successor.pat_provenance IN ('source_reported','derived_from_index')
-                  AND successor.public_available_time <= ?
-              )
             ORDER BY e.public_available_time, e.evidence_id
         """
+        parameters = [as_of, as_of, as_of]
+        if security_id:
+            parameters.append(security_id)
         with self.database.connect(read_only=True) as db:
             return list(db.execute(sql, parameters))
 

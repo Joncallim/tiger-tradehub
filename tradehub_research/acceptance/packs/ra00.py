@@ -153,8 +153,17 @@ def identity_membership(tmp: Path) -> None:
         db.execute(
             "INSERT INTO security_identity_event("
             "security_id,event_type,old_value,new_value,event_time,"
-            "public_available_time,pat_provenance) VALUES (?,?,?,?,?,?,?)",
-            ("sec", "ticker_change", "OLD", "ABC", "2025-02-01", "2025-02-01", "source_reported"),
+            "public_available_time,pat_provenance,ingested_time) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                "sec",
+                "ticker_change",
+                "OLD",
+                "ABC",
+                "2025-02-01",
+                "2025-02-01",
+                "source_reported",
+                "2025-02-01",
+            ),
         )
     memberships = UniverseMembershipStore(database)
     memberships.insert(
