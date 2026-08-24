@@ -145,11 +145,18 @@ class EvidenceStore:
         return identifier
 
     def historical(self, as_of: str, security_id: str | None = None) -> list[sqlite3.Row]:
+        """Return evidence knowable by ``as_of``; PAT, not event time, is authoritative."""
         security_clause = "AND e.security_id = ?" if security_id else ""
         as_of = normalize_ts(as_of)
         sql = f"""WITH RECURSIVE visible_chain(root_id, descendant_id) AS (
-                SELECT evidence_id, evidence_id FROM evidence_event
-                WHERE public_available_time IS NOT NULL AND public_available_time <= ?
+                SELECT candidate.evidence_id, candidate.evidence_id FROM evidence_event candidate
+                WHERE candidate.public_available_time IS NOT NULL
+                  AND candidate.public_available_time <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM evidence_event predecessor
+                    WHERE predecessor.evidence_id=candidate.supersedes_evidence_id
+                      AND predecessor.public_available_time IS NOT NULL
+                      AND predecessor.public_available_time <= ?)
                 UNION ALL
                 SELECT chain.root_id, successor.evidence_id
                 FROM visible_chain chain JOIN evidence_event successor
@@ -173,7 +180,7 @@ class EvidenceStore:
               AND e.withdrawn = 0
             ORDER BY e.public_available_time, e.evidence_id
         """
-        parameters = [as_of, as_of, as_of]
+        parameters = [as_of, as_of, as_of, as_of]
         if security_id:
             parameters.append(security_id)
         with self.database.connect(read_only=True) as db:
