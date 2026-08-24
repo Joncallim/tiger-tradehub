@@ -293,7 +293,9 @@ def test_fa05_limit_is_deterministically_derived():
 
 
 def test_fa05_limit_rejects_bad_reference_and_caps():
-    from tradehub.acceptance.packs.fa05 import derive_acceptance_limit
+    from tradehub.acceptance.packs.fa05 import (
+        derive_acceptance_limit,
+    )
 
     with pytest.raises(AssertionBlocked):
         derive_acceptance_limit(0)
@@ -301,9 +303,24 @@ def test_fa05_limit_rejects_bad_reference_and_caps():
         derive_acceptance_limit(-5)
     with pytest.raises(AssertionBlocked):
         derive_acceptance_limit(None)
-    # qty 1, notional cap 100: a 250 reference at 0.5 => 125 notional -> blocked
-    with pytest.raises(AssertionBlocked):
-        derive_acceptance_limit(250.00, quantity=1, max_notional_usd=100.0)
+
+
+def test_fa05_limit_rule_shrinks_fraction_to_fit_cap():
+    """High-priced reference: base 0.5 fraction would breach the $100
+    notional cap, so the runner deterministically shrinks the fraction;
+    the derived order stays under the cap, far below the reference, and
+    never switches to MARKET."""
+    from tradehub.acceptance.packs.fa05 import acceptance_limit_rule
+
+    limit, fraction_used = acceptance_limit_rule(250.00, quantity=1, max_notional_usd=100.0)
+    assert limit * 1 <= 100.0
+    assert limit < 250.00
+    assert fraction_used < 0.5
+    assert fraction_used > 0  # deterministic, positive
+    # AAPL-like reference from the live delayed quote
+    limit2, _ = acceptance_limit_rule(309.35, quantity=1, max_notional_usd=100.0)
+    assert limit2 * 1 <= 100.0
+    assert limit2 < 100.0  # margin under the cap, per the 0.8 factor
 
 
 def test_fa05_delayed_quote_record_is_labeled_delayed():

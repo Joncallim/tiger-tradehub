@@ -89,28 +89,54 @@ def _upstream_packs_pass() -> list[str]:
     return missing
 
 
+def acceptance_limit_rule(
+    delayed_price: float,
+    quantity: float = ACCEPTANCE_MAX_QUANTITY,
+    max_notional_usd: float = ACCEPTANCE_MAX_NOTIONAL_USD,
+    fraction: float = ACCEPTANCE_LIMIT_FRACTION,
+) -> tuple[float, float]:
+    """Deterministic conservative limit from a delayed reference price.
+
+    rule: limit = delayed_price * fraction, rounded to cents, strictly
+    positive, and within the acceptance notional cap. When the base
+    fraction would breach the notional cap (e.g. a high-priced symbol),
+    the fraction is deterministically shrunk so the order still fits
+    under the cap with margin while remaining deliberately far below the
+    delayed reference. Returns (limit, fraction_used). Raises
+    AssertionBlocked for unusable references.
+    """
+    if delayed_price is None or delayed_price <= 0:
+        raise AssertionBlocked("delayed reference price is not positive")
+    fraction_used = float(fraction)
+    limit = round(delayed_price * fraction_used, 2)
+    notional = limit * quantity
+    if notional > max_notional_usd:
+        # Runner-owned deterministic adjustment: shrink the fraction so the
+        # derived order fits under the acceptance cap with margin. The
+        # adjustment is documented in the artifact record; the runner never
+        # raises the cap or switches to MARKET to make the test work.
+        fraction_used = (max_notional_usd / (delayed_price * quantity)) * 0.8
+        limit = round(delayed_price * fraction_used, 2)
+        notional = limit * quantity
+    if limit <= 0:
+        raise AssertionBlocked("derived limit price is not positive")
+    if notional > max_notional_usd:
+        raise AssertionBlocked(
+            f"derived notional {notional:.2f} exceeds acceptance cap {max_notional_usd:.2f}"
+        )
+    return limit, fraction_used
+
+
 def derive_acceptance_limit(
     delayed_price: float,
     quantity: float = ACCEPTANCE_MAX_QUANTITY,
     max_notional_usd: float = ACCEPTANCE_MAX_NOTIONAL_USD,
     fraction: float = ACCEPTANCE_LIMIT_FRACTION,
 ) -> float:
-    """Deterministic conservative limit from a delayed reference price.
-
-    rule: limit = delayed_price * fraction, rounded to cents, strictly
-    positive, and within the acceptance notional cap. Raises
-    AssertionBlocked when the derived order violates acceptance caps.
-    """
-    if delayed_price is None or delayed_price <= 0:
-        raise AssertionBlocked("delayed reference price is not positive")
-    limit = round(delayed_price * fraction, 2)
-    if limit <= 0:
-        raise AssertionBlocked("derived limit price is not positive")
-    notional = limit * quantity
-    if notional > max_notional_usd:
-        raise AssertionBlocked(
-            f"derived notional {notional:.2f} exceeds acceptance cap {max_notional_usd:.2f}"
-        )
+    """Return just the limit (see acceptance_limit_rule)."""
+    limit, _ = acceptance_limit_rule(
+        delayed_price, quantity=quantity, max_notional_usd=max_notional_usd, fraction=fraction
+    )
     return limit
 
 
@@ -222,12 +248,14 @@ def build_fa05_pack() -> PackDefinition:
 
     def gate_delayed_reference(ctx: RunContext) -> None:
         price, quote_time_ms = _delayed_quote(ctx)
-        limit = derive_acceptance_limit(price)
+        limit, fraction_used = acceptance_limit_rule(price)
         record = _delayed_quote_record(ctx, price, quote_time_ms)
         record["acceptance_limit"] = limit
         record["limit_rule"] = (
-            f"delayed_price * {ACCEPTANCE_LIMIT_FRACTION} "
-            f"= {price} * {ACCEPTANCE_LIMIT_FRACTION} = {limit}"
+            f"delayed_price * {fraction_used} "
+            f"= {price} * {fraction_used} = {limit} "
+            f"(base fraction {ACCEPTANCE_LIMIT_FRACTION}; deterministic "
+            "adjustment applied if notional cap required it)"
         )
         ctx.artifacts.append(ctx.write_artifact("fa05-delayed-quote", record))
 
@@ -241,12 +269,14 @@ def build_fa05_pack() -> PackDefinition:
         ctx.register_secret(str(paper_account))
 
         delayed_price, quote_time_ms = _delayed_quote(ctx)
-        limit_price = derive_acceptance_limit(delayed_price)
+        limit_price, fraction_used = acceptance_limit_rule(delayed_price)
         quote_record = _delayed_quote_record(ctx, delayed_price, quote_time_ms)
         quote_record["acceptance_limit"] = limit_price
         quote_record["limit_rule"] = (
-            f"delayed_price * {ACCEPTANCE_LIMIT_FRACTION} "
-            f"= {delayed_price} * {ACCEPTANCE_LIMIT_FRACTION} = {limit_price}"
+            f"delayed_price * {fraction_used} "
+            f"= {delayed_price} * {fraction_used} = {limit_price} "
+            f"(base fraction {ACCEPTANCE_LIMIT_FRACTION}; deterministic "
+            "adjustment applied if notional cap required it)"
         )
         ctx.register_secret(str(paper_account))
 
