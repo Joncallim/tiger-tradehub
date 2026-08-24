@@ -185,6 +185,19 @@ class ScreenContext:
     market_caps: Mapping[SecurityId, float | None]
     universe: list[SecurityId]
     as_of: str
+    # I2 extensions: coverage/status metadata the orchestration layer resolves
+    # alongside the evidence maps.  Absence of the whole feed is represented by
+    # an empty/absent window set, never by dropping the key.
+    sectors: Mapping[SecurityId, str | None] | None = None
+    form4_coverage: Mapping[SecurityId, frozenset[str]] | None = None
+    identity_feed_complete: bool = False
+    corporate_actions: Mapping[SecurityId, list[dict[str, Any]]] | None = None
+
+    def __post_init__(self) -> None:
+        # Frozen dataclass: fill deterministic defaults without mutating callers.
+        object.__setattr__(self, "sectors", self.sectors or {})
+        object.__setattr__(self, "form4_coverage", self.form4_coverage or {})
+        object.__setattr__(self, "corporate_actions", self.corporate_actions or {})
 
 
 HunterFn: TypeAlias = Callable[[ScreenContext, SecurityId], ScreenResultPayload]

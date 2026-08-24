@@ -42,6 +42,7 @@ tradehub = "tradehub.app:main"
 tradehub-mcp = "tradehub.mcp_server:main"
 tradehub-telegram = "tradehub.telegram_bot:main"
 tradehub-acceptance = "tradehub.acceptance.runner:main"
+tradehub-research = "tradehub_research.cli:main"
 tradehub-research-acceptance = "tradehub_research.acceptance.runner:main"
 research-db = "tradehub_research.cli:main"
 
