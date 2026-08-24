@@ -165,6 +165,19 @@ curl -s http://127.0.0.1:8787/orders/submit \
   -d '{"confirmation_token":"token-from-preview"}'
 ```
 
+### Indeterminate order recovery
+
+An interrupted live submission stays non-retryable until `/orders/submit/reconcile` finds the
+reserved Tiger order or, for a completed-but-indeterminate submit attempt, conclusively finds no
+order. A stale `SUBMITTING` claim remains non-retryable after a negative lookup because its old
+broker call may still be in flight. Legacy claimed confirmations are migrated to
+`INDETERMINATE`; because they have no reserved order number, reconciliation reports
+`manual_reconciliation_required`. After externally verifying the broker account, an operator using
+the same bearer authentication resolves one through `/orders/submit/resolve`, supplying a
+`resolver` name and exactly one of `global_order_id` (mark submitted) or
+`no_submission_occurred: true` (return to retryable `READY`). The resolution is recorded in the
+audit log.
+
 ## ChatGPT Actions
 
 For ChatGPT Actions, the service must be reachable from ChatGPT. In practice that means deploying it

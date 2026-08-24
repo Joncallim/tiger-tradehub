@@ -25,6 +25,8 @@ from tradehub.models import (
     PreviewResponse,
     ReconcileOrderRequest,
     ReconcileOrderResponse,
+    ResolveOrderRequest,
+    ResolveOrderResponse,
     SubmitOrderRequest,
     SubmitOrderResponse,
 )
@@ -208,7 +210,9 @@ def submit_order(
     gateway: TigerGateway = Depends(get_gateway),
 ):
     try:
-        intent, tiger_preview = store.claim_confirmation(request.confirmation_token)
+        intent, tiger_preview, submit_lease_id = store.claim_confirmation(
+            request.confirmation_token
+        )
     except (KeyError, ValueError) as exc:
         store.record_event("submit_block", {"reason": str(exc)})
         raise HTTPException(
@@ -219,7 +223,12 @@ def submit_order(
     try:
         validate_order_intent(intent, settings)
     except PolicyError as exc:
-        store.release_confirmation(request.confirmation_token)
+        try:
+            store.release_confirmation(request.confirmation_token, submit_lease_id)
+        except ValueError as lease_exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(lease_exc)
+            ) from lease_exc
         store.record_event("submit_block", {"reason": str(exc)})
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -227,7 +236,10 @@ def submit_order(
         ) from exc
 
     if settings.dry_run:
-        store.finalize_confirmation(request.confirmation_token)
+        try:
+            store.finalize_confirmation(request.confirmation_token, submit_lease_id=submit_lease_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         store.record_event("dry_run_submit", {"intent": intent.model_dump()})
         return SubmitOrderResponse(
             submitted=False,
@@ -246,8 +258,12 @@ def submit_order(
         if existing_reserved_order_id is not None:
             gateway.assign_order_id(order, existing_reserved_order_id)
         reserved_order_id = gateway.get_order_id(order)
-        store.record_reserved_order_id(request.confirmation_token, reserved_order_id)
-        store.mark_submission_in_progress(request.confirmation_token, reserved_order_id)
+        store.record_reserved_order_id(
+            request.confirmation_token, reserved_order_id, submit_lease_id
+        )
+        store.mark_submission_in_progress(
+            request.confirmation_token, reserved_order_id, submit_lease_id
+        )
         order_id, tiger_response = gateway.place_order(order)
     except Exception as exc:
         detail = upstream_error_detail()
@@ -261,10 +277,17 @@ def submit_order(
                 exc,
                 detail,
             )
-            store.mark_submission_indeterminate(
-                request.confirmation_token,
-                reserved_order_id,
-            )
+            try:
+                store.mark_submission_indeterminate(
+                    request.confirmation_token,
+                    submit_lease_id,
+                    reserved_order_id,
+                )
+            except ValueError as lease_exc:
+                store.record_event("submit_block", {"reason": str(lease_exc)})
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail=str(lease_exc)
+                ) from lease_exc
         else:
             record_upstream_error(
                 store,
@@ -274,10 +297,22 @@ def submit_order(
                 exc,
                 detail,
             )
-            store.release_confirmation(request.confirmation_token)
+            try:
+                store.release_confirmation(request.confirmation_token, submit_lease_id)
+            except ValueError as lease_exc:
+                store.record_event("submit_block", {"reason": str(lease_exc)})
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail=str(lease_exc)
+                ) from lease_exc
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
-    store.finalize_confirmation(request.confirmation_token, order_id)
+    try:
+        store.finalize_confirmation(
+            request.confirmation_token, order_id, submit_lease_id=submit_lease_id
+        )
+    except ValueError as exc:
+        store.record_event("submit_block", {"reason": str(exc)})
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     store.record_event("live_submit", {"intent": intent.model_dump(), "order_id": order_id})
     return SubmitOrderResponse(
         submitted=True,
@@ -300,7 +335,7 @@ def reconcile_order(
     gateway: TigerGateway = Depends(get_gateway),
 ):
     try:
-        intent, tiger_preview, reserved_order_id, reconcile_lease_id = (
+        intent, tiger_preview, reserved_order_id, reconcile_lease_id, prior_state = (
             store.claim_reconciliation_confirmation(request.confirmation_token)
         )
     except (KeyError, ValueError) as exc:
@@ -316,15 +351,17 @@ def reconcile_order(
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         store.record_event(
-            "reconcile_block",
+            "manual_reconciliation_required",
             {
                 "confirmation_token": request.confirmation_token,
                 "reason": "missing reserved_order_id",
             },
         )
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="confirmation is indeterminate but missing reserved order id",
+        return ReconcileOrderResponse(
+            status="manual_reconciliation_required",
+            submitted=False,
+            intent=intent,
+            tiger_response=tiger_preview,
         )
 
     try:
@@ -364,7 +401,9 @@ def reconcile_order(
             )
         try:
             store.finalize_confirmation(
-                request.confirmation_token, resolved_order_id, reconcile_lease_id
+                request.confirmation_token,
+                resolved_order_id,
+                reconcile_lease_id=reconcile_lease_id,
             )
         except ValueError as exc:
             store.record_event("reconcile_block", {"reason": str(exc)})
@@ -384,6 +423,22 @@ def reconcile_order(
             tiger_response=order,
         )
 
+    # A stolen SUBMITTING worker may still be inside place_order. Broker absence at
+    # this instant cannot fence that call, so preserve non-retryable SUBMITTING and
+    # reconcile again; only ordinary indeterminate failures become retryable.
+    if prior_state == "SUBMITTING":
+        try:
+            store.preserve_stolen_submission(request.confirmation_token, reconcile_lease_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        store.record_event(
+            "submit_reconcile_pending",
+            {"confirmation_token": request.confirmation_token, "intent": intent.model_dump()},
+        )
+        return ReconcileOrderResponse(
+            status="indeterminate", submitted=False, intent=intent, tiger_response=tiger_preview
+        )
+
     try:
         store.mark_reconciliation_retry_allowed(request.confirmation_token, reconcile_lease_id)
     except ValueError as exc:
@@ -401,6 +456,33 @@ def reconcile_order(
         submitted=False,
         intent=intent,
         tiger_response=tiger_preview,
+    )
+
+
+@app.post(
+    "/orders/submit/resolve",
+    response_model=ResolveOrderResponse,
+    dependencies=[Depends(require_auth)],
+)
+def resolve_order(
+    request: ResolveOrderRequest,
+    store: AuditStore = Depends(get_store),
+):
+    try:
+        resolved_state = store.resolve_indeterminate_confirmation(
+            request.confirmation_token,
+            request.resolver,
+            request.global_order_id,
+            request.no_submission_occurred,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    return ResolveOrderResponse(
+        status="submitted" if resolved_state == "SUBMITTED" else "retryable",
+        submitted=resolved_state == "SUBMITTED",
+        order_id=request.global_order_id,
     )
 
 
