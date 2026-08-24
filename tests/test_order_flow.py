@@ -14,6 +14,7 @@ class FakeGateway:
         self.placed = False
         self.fail_place = False
         self.fail_preview = False
+        self.cancel_order_id = None
 
     def is_configured(self):
         return True
@@ -28,6 +29,10 @@ class FakeGateway:
         if self.fail_place:
             raise RuntimeError("temporary broker failure for sensitive-account")
         return "order-123", {"order_id": "order-123"}
+
+    def cancel_order(self, order_id):
+        self.cancel_order_id = order_id
+        return {"cancelled": True}
 
 
 def headers():
@@ -181,3 +186,28 @@ def test_submit_policy_revalidation_blocks_and_records_event(tmp_path):
     assert blocked.status_code == 422
     assert "notional" in blocked.json()["detail"]
     assert event_types(db_path) == ["preview_created", "submit_block"]
+
+
+def test_live_cancel_forwards_recorded_order_id_to_gateway_and_records_event(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    install(settings, store, gateway)
+
+    try:
+        client = TestClient(app)
+        cancel = client.post(
+            "/orders/cancel", json={"order_id": "44386595912828928"}, headers=headers()
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert cancel.status_code == 200
+    assert cancel.json()["cancelled"] is True
+    assert gateway.cancel_order_id == "44386595912828928"
+    assert event_types(db_path) == ["cancel"]

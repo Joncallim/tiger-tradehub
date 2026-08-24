@@ -69,15 +69,30 @@ def settings():
     )
 
 
-def test_cancel_order_uses_explicit_account_and_order_id_keywords():
+def test_cancel_order_passes_global_order_id_via_id_param():
+    """tigeropen's cancel_order has two distinct params: `id` (global order id, what
+    place_order returns and what TradeHub records) and `order_id` (account-specific
+    id). Passing the global id via `order_id` is rejected by Tiger with
+    ApiException code=1010 'biz param error'; only `id` works."""
     gateway = TigerGateway(settings())
     client = FakeTradeClient()
     gateway._trade_client = client
 
-    response = gateway.cancel_order("order-123")
+    response = gateway.cancel_order("44386595912828928")
 
     assert response == {"cancelled": True}
-    assert client.cancel_kwargs == {"account": "account-123", "order_id": "order-123"}
+    assert client.cancel_kwargs == {"account": "account-123", "id": 44386595912828928}
+
+
+def test_cancel_order_casts_order_id_to_int_for_sdk():
+    gateway = TigerGateway(settings())
+    client = FakeTradeClient()
+    gateway._trade_client = client
+
+    gateway.cancel_order("27")
+
+    assert client.cancel_kwargs == {"account": "account-123", "id": 27}
+    assert isinstance(client.cancel_kwargs["id"], int)
 
 
 def test_place_order_prefers_broker_response_order_id():
