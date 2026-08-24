@@ -77,7 +77,12 @@ class UniverseMembershipStore:
             return list(
                 db.execute(
                     """WITH RECURSIVE visible_chain(root_id, descendant_id) AS (
-                        SELECT id,id FROM universe_membership WHERE knowledge_time <= ?
+                        SELECT candidate.id,candidate.id FROM universe_membership candidate
+                        WHERE candidate.knowledge_time <= ?
+                          AND NOT EXISTS (
+                            SELECT 1 FROM universe_membership predecessor
+                            WHERE predecessor.id=candidate.supersedes_id
+                              AND predecessor.knowledge_time <= ?)
                         UNION ALL
                         SELECT chain.root_id, correction.id
                         FROM visible_chain chain JOIN universe_membership correction
@@ -99,7 +104,7 @@ class UniverseMembershipStore:
                       AND membership.pat_provenance IN (
                         'source_reported','derived_from_index')
                     ORDER BY membership.knowledge_time, membership.id""",
-                    (as_of, as_of, security_id, as_of, as_of, as_of),
+                    (as_of, as_of, as_of, security_id, as_of, as_of, as_of),
                 )
             )
 
@@ -186,14 +191,23 @@ class SecurityIdentityStore:
         with self.database.connect(read_only=True) as db:
             event = db.execute(
                 """WITH RECURSIVE visible_chain(root_id,descendant_id) AS (
-                    SELECT id,id FROM security_identity_event
-                    WHERE public_available_time IS NOT NULL AND public_available_time <= ?
+                    SELECT candidate.id,candidate.id FROM security_identity_event candidate
+                    WHERE candidate.public_available_time IS NOT NULL
+                      AND candidate.public_available_time <= ?
+                      AND candidate.event_time <= ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM security_identity_event predecessor
+                        WHERE predecessor.id=candidate.supersedes_id
+                          AND predecessor.public_available_time IS NOT NULL
+                          AND predecessor.public_available_time <= ?
+                          AND predecessor.event_time <= ?)
                     UNION ALL
                     SELECT chain.root_id,successor.id FROM visible_chain chain
                     JOIN security_identity_event successor
                       ON successor.supersedes_id=chain.descendant_id
                     WHERE successor.public_available_time IS NOT NULL
                       AND successor.public_available_time <= ?
+                      AND successor.event_time <= ?
                 ), terminal(root_id,descendant_id) AS (
                     SELECT chain.root_id,chain.descendant_id FROM visible_chain chain
                     WHERE NOT EXISTS (
@@ -209,6 +223,6 @@ class SecurityIdentityStore:
                   AND identity.pat_provenance IN ('source_reported','derived_from_index')
                 ORDER BY identity.event_time DESC,identity.public_available_time DESC,
                     identity.id DESC LIMIT 1""",
-                (as_of, as_of, security_id),
+                (as_of, as_of, as_of, as_of, as_of, as_of, security_id),
             ).fetchone()
             return str(event["new_value"]) if event is not None else None
