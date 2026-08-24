@@ -39,9 +39,11 @@ class TigerGateway:
             raise RuntimeError("Tiger credentials are not configured")
         getter = getattr(self.trade_client, "get_order", None)
         if callable(getter):
+            # create_order.order_id is the account-specific reserved number. Tiger's
+            # `id` parameter is a different namespace: the global order identifier.
             response = getter(
                 account=self.settings.tiger_account,
-                id=int(order_id) if str(order_id).isdigit() else order_id,
+                order_id=int(order_id) if str(order_id).isdigit() else order_id,
             )
             response_value = normalize(response)
             if response_value:

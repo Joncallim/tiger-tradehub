@@ -48,6 +48,7 @@ class FakeTradeClient:
         self.create_kwargs = None
         self.place_response = {"order_id": "broker-order-123"}
         self.placed_order = None
+        self.get_order_kwargs = None
 
     def cancel_order(self, **kwargs):
         self.cancel_kwargs = kwargs
@@ -69,9 +70,10 @@ class FakeTradeClient:
         return self.place_response
 
     def get_order(self, **kwargs):
-        if str(kwargs["id"]) == "reserved-999":
+        self.get_order_kwargs = kwargs
+        if str(kwargs["order_id"]) == "reserved-999":
             return {"id": "global-999", "order_id": "reserved-999"}
-        if str(kwargs["id"]) == "0":
+        if str(kwargs["order_id"]) == "0":
             return {"id": "global-missing", "order_id": "0"}
         return None
 
@@ -182,6 +184,7 @@ def test_get_order_prefers_sdk_order_lookup():
     order = gateway.get_order("reserved-999")
 
     assert order == {"id": "global-999", "order_id": "reserved-999"}
+    assert client.get_order_kwargs == {"account": "account-123", "order_id": "reserved-999"}
 
 
 def test_normalize_converts_nested_contract_object_to_plain_dict():

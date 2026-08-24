@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from tradehub.app import app, get_gateway, get_settings, get_store
 from tradehub.audit import STALE_CLAIM_SECONDS, AuditStore, utc_now
 from tradehub.config import Settings
+from tradehub.models import OrderIntent
 
 STRONG_TOKEN = "test-token-with-enough-length"
 
@@ -369,6 +370,52 @@ def test_reconcile_failure_stays_indeterminate(tmp_path):
     ]
 
 
+def test_missing_reserved_id_reports_manual_resolution_and_admin_resolves(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    install(settings, store, gateway)
+    token, _ = store.create_confirmation(OrderIntent(**preview_payload()), None, ttl_seconds=300)
+    *_, submit_lease = store.claim_confirmation(token)
+    store.mark_submission_indeterminate(token, submit_lease)
+
+    try:
+        client = TestClient(app)
+        reconciled = client.post(
+            "/orders/submit/reconcile",
+            json={"confirmation_token": token},
+            headers=headers(),
+        )
+        resolved = client.post(
+            "/orders/submit/resolve",
+            json={
+                "confirmation_token": token,
+                "resolver": "on-call@example",
+                "global_order_id": "global-verified",
+            },
+            headers=headers(),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert reconciled.status_code == 200
+    assert reconciled.json()["status"] == "manual_reconciliation_required"
+    assert store.get_submission_state(token) == "SUBMITTED"
+    assert resolved.status_code == 200
+    assert resolved.json() == {
+        "status": "submitted",
+        "submitted": True,
+        "order_id": "global-verified",
+    }
+    assert "manual_reconciliation_required" in event_types(db_path)
+    assert "submit_manual_resolution" in event_types(db_path)
+
+
 def test_preview_failure_is_sanitized_and_does_not_create_token(tmp_path):
     db_path = tmp_path / "tradehub.db"
     settings = Settings(
@@ -470,10 +517,10 @@ def test_submit_crash_point_2_reconcile_recovers_submit_before_finalize(tmp_path
         token = client.post("/orders/preview", json=preview_payload(), headers=headers()).json()[
             "confirmation_token"
         ]
-        store.claim_confirmation(token)
+        *_, submit_lease = store.claim_confirmation(token)
         gateway.placed_orders = ["reserved-1"]
-        store.record_reserved_order_id(token, "reserved-1")
-        store.mark_submission_in_progress(token, "reserved-1")
+        store.record_reserved_order_id(token, "reserved-1", submit_lease)
+        store.mark_submission_in_progress(token, "reserved-1", submit_lease)
         gateway.broker_orders = {
             "reserved-1": {"id": "global-reserved-1", "order_id": "reserved-1"}
         }
@@ -524,6 +571,40 @@ def test_reconcile_retry_uses_bounded_retry_lookup(tmp_path):
     assert reconciled.status_code == 200
     assert reconciled.json()["status"] == "resolved"
     assert reconciled.json()["order_id"] == "global-reserved-1"
+
+
+def test_stolen_submitting_negative_reconcile_does_not_become_retryable(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    install(settings, store, gateway)
+    token, _ = store.create_confirmation(OrderIntent(**preview_payload()), None, ttl_seconds=300)
+    *_, submit_lease = store.claim_confirmation(token)
+    store.record_reserved_order_id(token, "reserved-1", submit_lease)
+    store.mark_submission_in_progress(token, "reserved-1", submit_lease)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE confirmations SET claimed_at = ? WHERE token = ?",
+            ((utc_now() - timedelta(seconds=STALE_CLAIM_SECONDS + 1)).isoformat(), token),
+        )
+
+    try:
+        reconciled = TestClient(app).post(
+            "/orders/submit/reconcile",
+            json={"confirmation_token": token},
+            headers=headers(),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert reconciled.status_code == 200
+    assert reconciled.json()["status"] == "indeterminate"
+    assert store.get_submission_state(token) == "SUBMITTING"
 
 
 def test_reconcile_fallback_scan_is_used_before_retryable(tmp_path):

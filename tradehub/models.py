@@ -83,6 +83,25 @@ class ReconcileOrderResponse(BaseModel):
     tiger_response: dict[str, Any] | None = None
 
 
+class ResolveOrderRequest(BaseModel):
+    confirmation_token: str = Field(min_length=16)
+    resolver: str = Field(min_length=1, max_length=128)
+    global_order_id: str | None = Field(default=None, min_length=1)
+    no_submission_occurred: bool = False
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> ResolveOrderRequest:
+        if (self.global_order_id is None) == (not self.no_submission_occurred):
+            raise ValueError("provide exactly one of global_order_id or no_submission_occurred")
+        return self
+
+
+class ResolveOrderResponse(BaseModel):
+    status: str
+    submitted: bool
+    order_id: str | None = None
+
+
 class CancelOrderRequest(BaseModel):
     order_id: str = Field(min_length=1)
 
