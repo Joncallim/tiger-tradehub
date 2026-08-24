@@ -444,6 +444,63 @@ def test_identity_supersession_domains_do_not_erase_ticker_history(tmp_path):
     assert identities.ticker_at("s1", "2026-01-01") == "NEW"
 
 
+def test_raw_null_pat_identity_successor_does_not_consume_successor_slot(tmp_path):
+    database = initialized(tmp_path)
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s1", "OLD", "NYSE", "One", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+        baseline = db.execute(
+            """INSERT INTO security_identity_event(
+            security_id,event_type,new_value,event_time,public_available_time,
+            pat_provenance,ingested_time
+            ) VALUES (?,?,?,?,?,?,?)""",
+            (
+                "s1",
+                "baseline",
+                "OLD",
+                "2020-01-01",
+                "2020-01-01",
+                "source_reported",
+                "2020-01-01",
+            ),
+        ).lastrowid
+        with pytest.raises(sqlite3.IntegrityError, match="cannot backdate knowledge time"):
+            db.execute(
+                """INSERT INTO security_identity_event(
+                security_id,event_type,old_value,new_value,event_time,public_available_time,
+                pat_provenance,ingested_time,supersedes_id
+                ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    "s1",
+                    "ticker_change",
+                    "OLD",
+                    "UNPUBLISHED",
+                    "2025-01-01",
+                    None,
+                    "observed_at_ingest",
+                    "2025-01-02",
+                    baseline,
+                ),
+            )
+
+    identities = SecurityIdentityStore(database)
+    assert identities.ticker_at("s1", "2025-01-02") == "OLD"
+    identities.insert(
+        security_id="s1",
+        event_type="ticker_change",
+        old_value="OLD",
+        new_value="NEW",
+        event_time="2025-01-01",
+        public_available_time="2025-01-03",
+        pat_provenance="source_reported",
+        supersedes_id=baseline,
+    )
+    assert identities.ticker_at("s1", "2025-01-02") == "OLD"
+    assert identities.ticker_at("s1", "2025-01-03") == "NEW"
+
+
 def test_ticker_lineage_ignores_legacy_cross_domain_successors(tmp_path):
     database = initialized(tmp_path)
     with database.connect() as db:

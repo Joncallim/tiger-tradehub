@@ -311,8 +311,9 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
                 SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
                     AND p.security_id=NEW.security_id
             ) THEN RAISE(ABORT, 'identity supersession requires same security') END;
-            SELECT CASE WHEN EXISTS (
+            SELECT CASE WHEN NEW.public_available_time IS NULL OR EXISTS (
                 SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
+                    AND p.public_available_time IS NOT NULL
                     AND NEW.public_available_time < p.public_available_time
             ) THEN RAISE(ABORT, 'identity supersession cannot backdate knowledge time') END;
         END;
@@ -343,8 +344,9 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
                          NEW.event_type IN ('baseline','ticker_change'))
                     )
             ) THEN RAISE(ABORT, 'identity supersession requires compatible event domain') END;
-            SELECT CASE WHEN EXISTS (
+            SELECT CASE WHEN NEW.public_available_time IS NULL OR EXISTS (
                 SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
+                    AND p.public_available_time IS NOT NULL
                     AND NEW.public_available_time < p.public_available_time
             ) THEN RAISE(ABORT, 'identity supersession cannot backdate knowledge time') END;
         END;
