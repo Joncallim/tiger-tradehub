@@ -351,6 +351,54 @@ class SecAdapter(NetworkClient):
             ("nonDerivativeTable/nonDerivativeTransaction", False),
             ("derivativeTable/derivativeTransaction", True),
         )
+        transaction_ordinals: dict[int, int] = {}
+        grouped_transactions: dict[str, list[ET.Element]] = {}
+
+        def transaction_value(tx: ET.Element, path: str) -> str | None:
+            return tx.findtext(path + "/value")
+
+        for table_path, derivative in paths:
+            for tx in root.findall(table_path):
+                signature = canonical_hash(
+                    {
+                        "derivative": derivative,
+                        "owner_id": owner_fields["reporting_owner_cik"],
+                        "security_title": transaction_value(tx, "securityTitle"),
+                        "transaction_date": transaction_value(tx, "transactionDate")
+                        or get("periodOfReport"),
+                        "transaction_code": tx.findtext("transactionCoding/transactionCode"),
+                        "acquired_disposed": transaction_value(
+                            tx, "transactionAmounts/transactionAcquiredDisposedCode"
+                        ),
+                        "direct_indirect": transaction_value(
+                            tx, "ownershipNature/directOrIndirectOwnership"
+                        ),
+                        "footnote_ids": [x.attrib.get("id") for x in tx.findall(".//footnoteId")],
+                    }
+                )
+                grouped_transactions.setdefault(signature, []).append(tx)
+        for transactions in grouped_transactions.values():
+            ordered = sorted(
+                transactions,
+                key=lambda tx: (
+                    canonical_hash(
+                        {
+                            "shares": _number(
+                                tx.findtext("transactionAmounts/transactionShares/value")
+                            ),
+                            "price": _number(
+                                tx.findtext("transactionAmounts/transactionPricePerShare/value")
+                            ),
+                            "post_shares": tx.findtext(
+                                "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+                            ),
+                        }
+                    ),
+                    ET.tostring(tx, encoding="unicode"),
+                ),
+            )
+            for ordinal, tx in enumerate(ordered, 1):
+                transaction_ordinals[id(tx)] = ordinal
         for table_path, derivative in paths:
             for tx in root.findall(table_path):
 
@@ -395,6 +443,7 @@ class SecAdapter(NetworkClient):
                         "footnote_ids": fields["footnote_ids"],
                     }
                 )
+                transaction_key = f"{transaction_key}:occ:{transaction_ordinals[id(tx)]}"
                 source_id = f"{accession}:tx:{transaction_key}"
                 predecessor = None
                 if (

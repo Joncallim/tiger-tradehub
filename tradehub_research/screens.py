@@ -190,7 +190,7 @@ class ScreenContext:
     # an empty/absent window set, never by dropping the key.
     sectors: Mapping[SecurityId, str | None] | None = None
     form4_coverage: Mapping[SecurityId, frozenset[str]] | None = None
-    identity_feed_complete: bool = False
+    identity_feed_complete: Mapping[SecurityId, bool] | bool = False
     corporate_actions: Mapping[SecurityId, list[dict[str, Any]]] | None = None
 
     def __post_init__(self) -> None:
