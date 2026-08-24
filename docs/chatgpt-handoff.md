@@ -23,22 +23,50 @@ Current deployed commit: `3f844ee` (main, pushed). Lineage state in `data/accept
 
 ## The single blocker (FA-05 / #29)
 
-Tiger OpenAPI returns `ApiException code=4 msg=4000: permission denied (Current user and device do not have permissions in the US market)` for every quote call (`get_briefs`, `quote_real_time`, `timeline`, `trade_tick`), even though `grab_quote_permission` returns `aStockQuoteLv1` with `expire_at=-1`.
+**Corrected diagnosis (2026-08-23):** the account's only market-data permission is `aStockQuoteLv1`, which is **China A-share L1** — NOT US market data. Tiger's official permission table (docs-en.itigerup.com/docs/quote-common.md) defines the US entitlements as:
+- `usQuoteBasic` — US stock L1 market data access
+- `usStockQuote` — US real-time stock market data access
 
-Per the acceptance spec, FA-05 must **deterministically prove the test limit is non-marketable from a current quote** before placing the order. Without US Stock L1 quotes, that proof is impossible → the runner correctly returns **BLOCKED** and never places an order (verified: no broker write occurred).
+`get_quote_permission()` / `grab_quote_permission()` currently return ONLY `[{'name': 'aStockQuoteLv1', 'expire_at': -1}]`. With no `usQuoteBasic`/`usStockQuote`, every US quote call (`get_briefs`, `quote_real_time`, `timeline`, `trade_tick`) correctly fails with `ApiException code=4 msg=4000: permission denied (…US market)`.
 
-Note: PAPER is already positively proven ($1,000,000 paper balance, broker-reported accountType=PAPER via get_managed_accounts) — this is NOT an account-type problem. It is purely the quote-entitlement prerequisite.
+Per the acceptance spec, FA-05 must **deterministically prove the test limit is non-marketable from a current quote** before placing the order. Without US L1 quotes that proof is impossible → the runner correctly returns **BLOCKED** and never places an order (verified: no broker write occurred).
 
-### What needs to happen to unblock
+Note: PAPER is already positively proven ($1,000,000 paper balance, broker-reported accountType=PAPER via get_managed_accounts) — this is NOT an account-type problem. It is purely the missing US quote entitlement.
 
-1. Enable/purchase **US Stock L1 market data** for the OpenAPI account/device at https://developer.itigerup.com/profile (Tiger requires it for real-time quotes; docs: docs-en.itigerup.com/docs/permission.md). May also require binding the OpenAPI device.
-2. Then rerun:
+### Activation route (for Jon)
+
+1. **Developer Center:** https://developer.itigerup.com/profile → API market data / quota → **US L1** (yields `usQuoteBasic`); real-time US market data must be purchased/enabled separately (docs: `permission.md`).
+   Or **Tiger Trade app:** Profile → **Market Data Store** → **API** → **US L1**.
+2. **Verify after activation** (one call, reuse a single module-level QuoteClient — `grab_quote_permission()` transfers device access and does NOT purchase permission; only one device can hold access at a time; repeated grabs from fresh clients cause device-access contention):
    ```bash
    cd /home/jon/tiger-tradehub
+   .venv/bin/python - <<'EOF'
+   from tigeropen.common.consts import Language
+   from tigeropen.common.util.signature_utils import read_private_key
+   from tigeropen.quote.quote_client import QuoteClient
+   from tigeropen.tiger_open_config import TigerOpenClientConfig
+   from tradehub.config import get_settings
+   s = get_settings()
+   config = TigerOpenClientConfig(sandbox_debug=s.tiger_sandbox)
+   config.tiger_id = s.tiger_id or ""; config.account = s.tiger_account or ""
+   if s.tiger_license: config.license = s.tiger_license
+   config.language = Language.en_US
+   config.private_key = read_private_key(str(s.tiger_private_key_path))
+   client = QuoteClient(config)  # ONE instance, reused
+   print("perms:", client.grab_quote_permission())
+   print("briefs:", client.get_briefs(["AAPL"]))
+   EOF
+   ```
+   Expected now: `perms` includes `usQuoteBasic`/`usStockQuote`, and `briefs` returns AAPL prices.
+   If the US entitlement appears but quote calls STILL return code 4000 → investigate **device-access contention** next (only one device holds real-time quote access; grab transfers it).
+3. Only then rerun:
+   ```bash
    env TRADEHUB_ACCEPTANCE_PAPER_WRITE=true .venv/bin/tradehub-acceptance run FA-05 --json
    ```
    Expected: gates PASS → lifecycle places ONE tiny non-marketable limit BUY (AAPL, qty 1, limit = 50% of market), reads it back, cancels it, reconciles audit, proves exactly one order.
-3. Post result to #29; if PASS, close it and update #23.
+4. Post result to #29; if PASS, close it and update #23.
+
+**Do not place any broker order until FA-05 independently proves PAPER account + current quote + non-marketable limit.**
 
 ## How to operate the acceptance runner
 
