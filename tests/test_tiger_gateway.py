@@ -1,8 +1,45 @@
+import json
+
 from tradehub.config import Settings
 from tradehub.models import OrderIntent
-from tradehub.tiger_gateway import TigerGateway
+from tradehub.tiger_gateway import TigerGateway, normalize, normalize_collection
 
 STRONG_TOKEN = "test-token-with-enough-length"
+
+
+class FakeContract:
+    """Mimics tigeropen.trade.domain.contract.Contract: has to_dict() but is not a dict."""
+
+    def __init__(self):
+        self.symbol = "AAPL"
+        self.currency = "USD"
+        self.sec_type = "STK"
+
+    def to_dict(self):
+        return {"symbol": self.symbol, "currency": self.currency, "sec_type": self.sec_type}
+
+
+class FakeOrder:
+    """Mimics tigeropen.trade.domain.order.Order.to_dict(), which embeds a raw Contract object."""
+
+    def __init__(self):
+        self.contract = FakeContract()
+        self.order_id = "broker-order-123"
+        self.status = "SUBMITTED"
+
+    def to_dict(self):
+        return {"contract": self.contract, "order_id": self.order_id, "status": self.status}
+
+
+class FakePosition:
+    """Mimics tigeropen Position.to_dict(), which embeds a raw Contract object under 'contract'."""
+
+    def __init__(self):
+        self.contract = FakeContract()
+        self.quantity = 10
+
+    def to_dict(self):
+        return {"contract": self.contract, "quantity": self.quantity}
 
 
 class FakeTradeClient:
@@ -67,3 +104,21 @@ def test_place_order_accepts_scalar_broker_order_id():
 
     assert order_id == "12345"
     assert response == {"value": "12345"}
+
+
+def test_normalize_converts_nested_contract_object_to_plain_dict():
+    normalized = normalize(FakeOrder())
+
+    assert normalized["contract"] == {"symbol": "AAPL", "currency": "USD", "sec_type": "STK"}
+    assert normalized["order_id"] == "broker-order-123"
+    json.dumps(normalized)
+
+
+def test_normalize_collection_converts_nested_contract_objects_for_orders_and_positions():
+    orders = normalize_collection([FakeOrder()])
+    positions = normalize_collection([FakePosition()])
+
+    assert orders[0]["contract"] == {"symbol": "AAPL", "currency": "USD", "sec_type": "STK"}
+    assert positions[0]["contract"] == {"symbol": "AAPL", "currency": "USD", "sec_type": "STK"}
+    json.dumps(orders)
+    json.dumps(positions)

@@ -115,9 +115,9 @@ def normalize(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if isinstance(value, dict):
-        return value
+        return {key: _json_safe(item) for key, item in value.items()}
     if hasattr(value, "to_dict"):
-        return value.to_dict()
+        return {key: _json_safe(item) for key, item in value.to_dict().items()}
     if hasattr(value, "__dict__"):
         return {
             key: item
@@ -125,6 +125,23 @@ def normalize(value: Any) -> dict[str, Any] | None:
             if not key.startswith("_") and isinstance(item, str | int | float | bool | type(None))
         }
     return {"value": str(value)}
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively convert SDK objects (e.g. tigeropen Contract) into JSON-safe values."""
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "to_dict"):
+        return _json_safe(value.to_dict())
+    if hasattr(value, "__dict__"):
+        return {
+            key: _json_safe(item) for key, item in vars(value).items() if not key.startswith("_")
+        }
+    return str(value)
 
 
 def extract_order_id(value: Any) -> Any:
