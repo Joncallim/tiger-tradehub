@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from collections.abc import Iterator
@@ -11,9 +12,13 @@ from typing import Any
 
 from tradehub.models import OrderIntent
 
+logger = logging.getLogger(__name__)
+
 STALE_CLAIM_SECONDS = 120
 CONFIRMATION_STATE_READY = "READY"
+CONFIRMATION_STATE_SUBMITTING = "SUBMITTING"
 CONFIRMATION_STATE_INDETERMINATE = "INDETERMINATE"
+CONFIRMATION_STATE_RECONCILING = "RECONCILING"
 CONFIRMATION_STATE_SUBMITTED = "SUBMITTED"
 
 
@@ -60,22 +65,28 @@ class AuditStore:
             self._add_column_if_missing(db, "confirmations", "claimed_at", "TEXT")
             self._add_column_if_missing(db, "confirmations", "submission_state", "TEXT")
             self._add_column_if_missing(db, "confirmations", "reserved_order_id", "TEXT")
-            db.execute(
+            ready_backfilled = db.execute(
                 """
                 UPDATE confirmations
                 SET submission_state = ?
                 WHERE submitted_at IS NULL AND submission_state IS NULL
                 """,
                 (CONFIRMATION_STATE_READY,),
-            )
-            db.execute(
+            ).rowcount
+            submitted_backfilled = db.execute(
                 """
                 UPDATE confirmations
                 SET submission_state = ?
                 WHERE submitted_at IS NOT NULL AND submission_state IS NULL
                 """,
                 (CONFIRMATION_STATE_SUBMITTED,),
-            )
+            ).rowcount
+            if ready_backfilled or submitted_backfilled:
+                logger.info(
+                    "migrated confirmation states: %d ready, %d submitted",
+                    ready_backfilled,
+                    submitted_backfilled,
+                )
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -184,9 +195,14 @@ class AuditStore:
                     json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
                 )
                 return OrderIntent.model_validate_json(row["intent_json"]), preview
+            state = _coalesce_state(row["submission_state"])
             if row["submitted_at"]:
                 raise ValueError("confirmation token has already been submitted")
-            if _coalesce_state(row["submission_state"]) == CONFIRMATION_STATE_INDETERMINATE:
+            if state in {
+                CONFIRMATION_STATE_INDETERMINATE,
+                CONFIRMATION_STATE_SUBMITTING,
+                CONFIRMATION_STATE_RECONCILING,
+            }:
                 raise ValueError(
                     "confirmation token is in indeterminate state and must be reconciled"
                 )
@@ -206,13 +222,21 @@ class AuditStore:
                     claimed_at = NULL,
                     submission_state = ?,
                     order_id = ?
-                WHERE token = ? AND submitted_at IS NULL AND claimed_at IS NOT NULL
+                WHERE token = ?
+                  AND submitted_at IS NULL
+                  AND claimed_at IS NOT NULL
+                  AND COALESCE(submission_state, ?) IN (?, ?, ?, ?)
                 """,
                 (
                     utc_now().isoformat(),
                     CONFIRMATION_STATE_SUBMITTED,
                     order_id,
                     token,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_SUBMITTING,
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    CONFIRMATION_STATE_RECONCILING,
                 ),
             )
             if cursor.rowcount != 1:
@@ -233,6 +257,32 @@ class AuditStore:
     def mark_order_id(self, token: str, order_id: str | None) -> None:
         with self.connect() as db:
             db.execute("UPDATE confirmations SET order_id = ? WHERE token = ?", (order_id, token))
+
+    def mark_submission_in_progress(self, token: str, reserved_order_id: str | None) -> None:
+        if reserved_order_id is None:
+            raise ValueError("reserved order id is required to start submission")
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET
+                    submission_state = ?,
+                    reserved_order_id = COALESCE(reserved_order_id, ?),
+                    claimed_at = COALESCE(claimed_at, ?)
+                WHERE token = ? AND submitted_at IS NULL
+                AND COALESCE(submission_state, ?) = ?
+                """,
+                (
+                    CONFIRMATION_STATE_SUBMITTING,
+                    reserved_order_id,
+                    utc_now().isoformat(),
+                    token,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_READY,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("confirmation token is not in a submittable state")
 
     def record_reserved_order_id(self, token: str, order_id: str | None) -> None:
         if order_id is None:
@@ -270,10 +320,36 @@ class AuditStore:
             if cursor.rowcount != 1:
                 raise ValueError("confirmation token is not claimed")
 
-    def load_indeterminate_confirmation(
+    def claim_reconciliation_confirmation(
         self, token: str
     ) -> tuple[OrderIntent, dict[str, Any] | None, str | None]:
+        now = utc_now()
+        stale_before = now - timedelta(seconds=STALE_CLAIM_SECONDS)
         with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?, claimed_at = ?
+                WHERE token = ?
+                AND submitted_at IS NULL
+                AND (
+                    submission_state = ?
+                    OR (
+                        submission_state IN (?, ?)
+                        AND (claimed_at IS NULL OR claimed_at < ?)
+                    )
+                )
+                """,
+                (
+                    CONFIRMATION_STATE_RECONCILING,
+                    now.isoformat(),
+                    token,
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    CONFIRMATION_STATE_SUBMITTING,
+                    CONFIRMATION_STATE_RECONCILING,
+                    stale_before.isoformat(),
+                ),
+            )
             row = db.execute(
                 "SELECT * FROM confirmations WHERE token = ?",
                 (token,),
@@ -282,32 +358,53 @@ class AuditStore:
                 raise KeyError("unknown confirmation token")
             if row["submitted_at"]:
                 raise ValueError("confirmation token has already been submitted")
-            if _coalesce_state(row["submission_state"]) != CONFIRMATION_STATE_INDETERMINATE:
-                raise ValueError("confirmation token is not in reconciliation-required state")
-            preview = json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
-            return (
-                OrderIntent.model_validate_json(row["intent_json"]),
-                preview,
-                row["reserved_order_id"],
-            )
+            if cursor.rowcount == 1:
+                preview = (
+                    json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
+                )
+                return (
+                    OrderIntent.model_validate_json(row["intent_json"]),
+                    preview,
+                    row["reserved_order_id"],
+                )
+            state = _coalesce_state(row["submission_state"])
+            if state == CONFIRMATION_STATE_RECONCILING and row["claimed_at"]:
+                raise ValueError("confirmation token is already being reconciled")
+            if state in {CONFIRMATION_STATE_INDETERMINATE, CONFIRMATION_STATE_SUBMITTING}:
+                raise ValueError(
+                    "confirmation token is in indeterminate state and must be reconciled"
+                )
+            if row["claimed_at"]:
+                raise ValueError("confirmation token is already being reconciled")
+            raise ValueError("confirmation token is not in reconciliation-required state")
 
-    def mark_reconciliation_retry_allowed(self, token: str) -> None:
+    def load_indeterminate_confirmation(
+        self, token: str
+    ) -> tuple[OrderIntent, dict[str, Any] | None, str | None]:
+        return self.claim_reconciliation_confirmation(token)
+
+    def mark_submission_ready_for_retry(self, token: str) -> None:
         with self.connect() as db:
             cursor = db.execute(
                 """
                 UPDATE confirmations
                 SET claimed_at = NULL, submission_state = ?
-                WHERE token = ? AND submitted_at IS NULL AND COALESCE(submission_state, ?) = ?
+                WHERE token = ? AND submitted_at IS NULL
+                AND submission_state = ?
                 """,
                 (
                     CONFIRMATION_STATE_READY,
                     token,
-                    CONFIRMATION_STATE_INDETERMINATE,
-                    CONFIRMATION_STATE_INDETERMINATE,
+                    CONFIRMATION_STATE_RECONCILING,
                 ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("confirmation token is not in reconciliation-required state")
+
+    # Backward-compatible helper retained for existing imports/tests. Retry/reconcile now
+    # goes through claim_reconciliation_confirmation for atomic transitions.
+    def mark_reconciliation_retry_allowed(self, token: str) -> None:
+        self.mark_submission_ready_for_retry(token)
 
     def get_submission_state(self, token: str) -> str | None:
         with self.connect() as db:

@@ -68,6 +68,14 @@ def main() -> None:
         return await client.post("/orders/submit", {"confirmation_token": confirmation_token})
 
     @mcp.tool()
+    async def reconcile_order(confirmation_token: str) -> dict[str, Any]:
+        """Reconcile a pending submission by confirmation token."""
+        return await client.post(
+            "/orders/submit/reconcile",
+            {"confirmation_token": confirmation_token},
+        )
+
+    @mcp.tool()
     async def cancel_order(order_id: str) -> dict[str, Any]:
         """Cancel an order by Tiger order id."""
         return await client.post("/orders/cancel", {"order_id": order_id})
