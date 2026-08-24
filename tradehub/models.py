@@ -71,6 +71,18 @@ class SubmitOrderResponse(BaseModel):
     tiger_response: dict[str, Any] | None = None
 
 
+class ReconcileOrderRequest(BaseModel):
+    confirmation_token: str = Field(min_length=16)
+
+
+class ReconcileOrderResponse(BaseModel):
+    status: str
+    submitted: bool
+    order_id: str | None = None
+    intent: OrderIntent
+    tiger_response: dict[str, Any] | None = None
+
+
 class CancelOrderRequest(BaseModel):
     order_id: str = Field(min_length=1)
 

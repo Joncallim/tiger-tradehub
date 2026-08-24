@@ -9,12 +9,21 @@ from tradehub.config import Settings
 STRONG_TOKEN = "test-token-with-enough-length"
 
 
+class FakeOrder:
+    def __init__(self, order_id: str):
+        self.order_id = order_id
+
+
 class FakeGateway:
     def __init__(self):
-        self.placed = False
+        self.placed_orders = []
+        self.created_orders = []
         self.fail_place = False
         self.fail_preview = False
+        self.accept_and_fail = False
+        self.fail_reconcile = False
         self.cancel_order_id = None
+        self.broker_orders = {}
 
     def is_configured(self):
         return True
@@ -24,11 +33,43 @@ class FakeGateway:
             raise RuntimeError("preview failed for sensitive-account")
         return {"preview_symbol": intent.symbol}
 
-    def place_order(self, intent):
-        self.placed = True
-        if self.fail_place:
+    def create_order(self, intent):
+        order_id = f"reserved-{len(self.created_orders) + 1}"
+        self.created_orders.append(order_id)
+        return FakeOrder(order_id)
+
+    def place_order(self, order):
+        order_id = getattr(order, "order_id", None)
+        self.placed_orders.append(order_id)
+        if self.fail_place or self.accept_and_fail:
+            if self.accept_and_fail and order_id is not None:
+                self.broker_orders[str(order_id)] = {
+                    "id": f"global-{order_id}",
+                    "order_id": str(order_id),
+                }
             raise RuntimeError("temporary broker failure for sensitive-account")
-        return "order-123", {"order_id": "order-123"}
+        if order_id is None:
+            raise RuntimeError("missing order_id")
+        order_response = {
+            "id": f"global-{order_id}",
+            "order_id": str(order_id),
+        }
+        self.broker_orders[str(order_id)] = order_response
+        return f"global-{order_id}", order_response
+
+    def get_order(self, order_id):
+        if self.fail_reconcile:
+            raise RuntimeError("broker reconciliation error for sensitive-account")
+        return self.broker_orders.get(str(order_id))
+
+    def assign_order_id(self, order, order_id):
+        order.order_id = order_id
+        return order
+
+    def get_order_id(self, order):
+        if isinstance(order, dict):
+            return order.get("order_id") or order.get("id")
+        return str(order.order_id)
 
     def cancel_order(self, order_id):
         self.cancel_order_id = order_id
@@ -88,12 +129,12 @@ def test_preview_and_dry_run_submit_create_and_finalize_confirmation(tmp_path):
     assert token
     assert submit.status_code == 200
     assert submit.json()["submitted"] is False
-    assert gateway.placed is False
+    assert gateway.placed_orders == []
     assert replay.status_code == 422
     assert event_types(db_path) == ["preview_created", "dry_run_submit", "submit_block"]
 
 
-def test_live_place_failure_releases_confirmation_for_retry(tmp_path):
+def test_live_place_indeterminate_requires_reconcile_before_retry(tmp_path):
     db_path = tmp_path / "tradehub.db"
     settings = Settings(
         TRADEHUB_API_TOKEN=STRONG_TOKEN,
@@ -113,8 +154,7 @@ def test_live_place_failure_releases_confirmation_for_retry(tmp_path):
         failed = client.post(
             "/orders/submit", json={"confirmation_token": token}, headers=headers()
         )
-        gateway.fail_place = False
-        retried = client.post(
+        replay = client.post(
             "/orders/submit", json={"confirmation_token": token}, headers=headers()
         )
     finally:
@@ -123,9 +163,143 @@ def test_live_place_failure_releases_confirmation_for_retry(tmp_path):
     assert failed.status_code == 502
     assert failed.json()["detail"]["message"] == "upstream broker request failed"
     assert "sensitive-account" not in failed.text
+    assert replay.status_code == 422
+    assert "reconciled" in replay.json()["detail"] or "indeterminate" in replay.json()["detail"]
+    assert event_types(db_path) == [
+        "preview_created",
+        "submit_indeterminate",
+        "submit_block",
+    ]
+
+
+def test_reconcile_retry_allows_submit_with_same_reserved_number(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    gateway.fail_place = True
+    install(settings, store, gateway)
+
+    try:
+        client = TestClient(app)
+        token = client.post("/orders/preview", json=preview_payload(), headers=headers()).json()[
+            "confirmation_token"
+        ]
+        failed = client.post(
+            "/orders/submit", json={"confirmation_token": token}, headers=headers()
+        )
+        gateway.fail_place = False
+        reconciled = client.post(
+            "/orders/submit/reconcile", json={"confirmation_token": token}, headers=headers()
+        )
+        retried = client.post(
+            "/orders/submit", json={"confirmation_token": token}, headers=headers()
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert failed.status_code == 502
+    assert reconciled.status_code == 200
+    assert reconciled.json()["status"] == "retryable"
     assert retried.status_code == 200
     assert retried.json()["submitted"] is True
-    assert event_types(db_path) == ["preview_created", "submit_error", "live_submit"]
+    assert len(gateway.placed_orders) == 2
+    assert gateway.placed_orders[0] == gateway.placed_orders[1]
+    assert event_types(db_path) == [
+        "preview_created",
+        "submit_indeterminate",
+        "submit_reconcile_retryable",
+        "live_submit",
+    ]
+
+
+def test_reconcile_with_existing_broker_order_prevents_duplicate_submit(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    gateway.accept_and_fail = True
+    install(settings, store, gateway)
+
+    try:
+        client = TestClient(app)
+        token = client.post("/orders/preview", json=preview_payload(), headers=headers()).json()[
+            "confirmation_token"
+        ]
+        failed = client.post(
+            "/orders/submit", json={"confirmation_token": token}, headers=headers()
+        )
+        reconciled = client.post(
+            "/orders/submit/reconcile", json={"confirmation_token": token}, headers=headers()
+        )
+        duplicate_retry = client.post(
+            "/orders/submit", json={"confirmation_token": token}, headers=headers()
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert failed.status_code == 502
+    assert reconciled.status_code == 200
+    assert reconciled.json()["status"] == "resolved"
+    assert duplicate_retry.status_code == 422
+    assert gateway.placed_orders == ["reserved-1"]
+    assert event_types(db_path) == [
+        "preview_created",
+        "submit_indeterminate",
+        "submit_reconciled",
+        "submit_block",
+    ]
+
+
+def test_reconcile_failure_stays_indeterminate(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+        TIGEROPEN_ACCOUNT="sensitive-account",
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    gateway.accept_and_fail = True
+    install(settings, store, gateway)
+
+    try:
+        client = TestClient(app)
+        token = client.post("/orders/preview", json=preview_payload(), headers=headers()).json()[
+            "confirmation_token"
+        ]
+        failed = client.post(
+            "/orders/submit", json={"confirmation_token": token}, headers=headers()
+        )
+        gateway.fail_reconcile = True
+        reconciled = client.post(
+            "/orders/submit/reconcile", json={"confirmation_token": token}, headers=headers()
+        )
+        replay = client.post(
+            "/orders/submit", json={"confirmation_token": token}, headers=headers()
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert failed.status_code == 502
+    assert reconciled.status_code == 502
+    assert replay.status_code == 422
+    assert "indeterminate" in replay.json()["detail"]
+    assert event_types(db_path) == [
+        "preview_created",
+        "submit_indeterminate",
+        "reconcile_error",
+        "submit_block",
+    ]
 
 
 def test_preview_failure_is_sanitized_and_does_not_create_token(tmp_path):
