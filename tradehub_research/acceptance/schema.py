@@ -25,7 +25,7 @@ class RunResult:
     status: Status
     assertions: list[AssertionResult]
     commit_sha: str
-    pack_id: str = "RA-00"
+    pack_id: str
     schema_version: int = 1
     artifacts: list[str] = field(default_factory=list)
 

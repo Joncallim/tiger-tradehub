@@ -5,11 +5,22 @@ import json
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
-from tradehub_research.acceptance.packs.ra00 import ASSERTIONS
+from tradehub_research.acceptance.packs.ra00 import ASSERTIONS as RA00_ASSERTIONS
+from tradehub_research.acceptance.packs.ra01 import ASSERTIONS as RA01_ASSERTIONS
 from tradehub_research.acceptance.sanitize import sanitize
 from tradehub_research.acceptance.schema import AssertionResult, RunResult, Status
+
+PackAssertion = tuple[str, Callable[[Path], None]]
+
+# Pack registration is an explicit whitelist: import each known pack above and add its
+# assertions here. Never resolve a user-supplied pack ID through dynamic imports.
+PACK_REGISTRY: dict[str, list[PackAssertion]] = {
+    "RA-00": RA00_ASSERTIONS,
+    "RA-01": RA01_ASSERTIONS,
+}
 
 
 def commit_sha() -> str:
@@ -31,14 +42,15 @@ def commit_sha() -> str:
 
 
 def run_pack(pack_id: str) -> RunResult:
-    run_id = f"ra00-{uuid.uuid4().hex[:12]}"
-    if pack_id != "RA-00":
+    run_id = f"{pack_id.lower().replace('-', '')}-{uuid.uuid4().hex[:12]}"
+    pack_assertions = PACK_REGISTRY.get(pack_id)
+    if pack_assertions is None:
         assertions = [AssertionResult("pack.lookup", Status.FAIL, "unknown pack")]
     else:
         assertions = []
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for assertion_id, function in ASSERTIONS:
+            for assertion_id, function in pack_assertions:
                 try:
                     function(root)
                     assertions.append(AssertionResult(assertion_id, Status.PASS, "ok"))
@@ -58,11 +70,11 @@ def run_pack(pack_id: str) -> RunResult:
         status = Status.BLOCKED
     else:
         status = Status.PASS
-    return RunResult(run_id, status, assertions, commit_sha())
+    return RunResult(run_id, status, assertions, commit_sha(), pack_id)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run RA-00, e.g. ``tradehub-research-acceptance RA-00`` from any directory."""
+    """Run a registered pack, e.g. ``tradehub-research-acceptance RA-00``."""
     parser = argparse.ArgumentParser()
     parser.add_argument("pack", nargs="?", default="RA-00")
     args = parser.parse_args(argv)

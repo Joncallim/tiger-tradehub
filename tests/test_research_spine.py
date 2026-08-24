@@ -32,7 +32,8 @@ def test_schema_and_migration_are_idempotent(tmp_path):
     assert database.migrate() == PHASE_0_SCHEMA_VERSION
     assert database.check()["ok"]
     with database.connect(read_only=True) as db:
-        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 5
+        migration_count = db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        assert migration_count == PHASE_0_SCHEMA_VERSION
 
 
 def test_settings_use_only_research_prefix(monkeypatch, tmp_path):
@@ -774,8 +775,50 @@ def test_ra00_is_deterministic_pass_with_required_shape():
     result = run_pack("RA-00")
     payload = result.to_safe_dict()
     assert result.status == Status.PASS
+    assert result.pack_id == "RA-00"
+    assert result.run_id.startswith("ra00-")
     assert {"run_id", "status", "assertions", "commit_sha"} <= payload.keys()
     assert all(a["status"] in {s.value for s in Status} for a in payload["assertions"])
+
+
+def test_research_acceptance_registry_is_an_explicit_whitelist():
+    from tradehub_research.acceptance.packs.ra00 import ASSERTIONS as RA00_ASSERTIONS
+    from tradehub_research.acceptance.packs.ra01 import ASSERTIONS as RA01_ASSERTIONS
+    from tradehub_research.acceptance.runner import PACK_REGISTRY
+
+    assert PACK_REGISTRY == {"RA-00": RA00_ASSERTIONS, "RA-01": RA01_ASSERTIONS}
+    assert [assertion_id for assertion_id, _ in PACK_REGISTRY["RA-00"]] == [
+        "schema.version",
+        "db.fresh_init",
+        "config.research_only",
+        "pit.fixture_timing",
+        "pat.unknown_behavior",
+        "evidence.append_only_supersession",
+        "evidence.idempotent_ingestion",
+        "pit.identity_membership",
+        "pit.retraction",
+        "cli.init",
+    ]
+
+
+def test_research_acceptance_registry_drives_prefix_and_pack_id(monkeypatch):
+    from tradehub_research.acceptance.runner import PACK_REGISTRY
+
+    monkeypatch.setitem(PACK_REGISTRY, "RA-01", [])
+    result = run_pack("RA-01")
+
+    assert result.status == Status.PASS
+    assert result.pack_id == "RA-01"
+    assert result.run_id.startswith("ra01-")
+
+
+def test_unknown_research_acceptance_pack_fails_closed():
+    result = run_pack("RA-99")
+
+    assert result.status == Status.FAIL
+    assert result.pack_id == "RA-99"
+    actual = [(assertion.id, assertion.status, assertion.detail) for assertion in result.assertions]
+    assert actual == [("pack.lookup", Status.FAIL, "unknown pack")]
 
 
 def test_installed_ra00_command_runs_outside_repository(tmp_path):
