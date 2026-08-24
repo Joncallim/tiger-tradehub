@@ -73,6 +73,11 @@ class TigerGateway:
         value = extract_order_id(order)
         return str(value) if value is not None else None
 
+    def get_global_order_id(self, order: Any) -> str | None:
+        normalized = normalize(order)
+        value = normalized.get("id") if normalized else None
+        return str(value) if value is not None else None
+
     def cancel_order(self, order_id: str) -> dict[str, Any] | None:
         if not self.is_configured():
             raise RuntimeError("Tiger credentials are not configured")

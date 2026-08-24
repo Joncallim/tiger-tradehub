@@ -58,18 +58,32 @@ class AuditStore:
                     submitted_at TEXT,
                     order_id TEXT,
                     submission_state TEXT,
-                    reserved_order_id TEXT
+                    reserved_order_id TEXT,
+                    reconcile_lease_id TEXT
                 )
                 """
             )
             self._add_column_if_missing(db, "confirmations", "claimed_at", "TEXT")
             self._add_column_if_missing(db, "confirmations", "submission_state", "TEXT")
             self._add_column_if_missing(db, "confirmations", "reserved_order_id", "TEXT")
+            self._add_column_if_missing(db, "confirmations", "reconcile_lease_id", "TEXT")
+            indeterminate_backfilled = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?
+                WHERE submitted_at IS NULL
+                  AND submission_state IS NULL
+                  AND claimed_at IS NOT NULL
+                """,
+                (CONFIRMATION_STATE_INDETERMINATE,),
+            ).rowcount
             ready_backfilled = db.execute(
                 """
                 UPDATE confirmations
                 SET submission_state = ?
-                WHERE submitted_at IS NULL AND submission_state IS NULL
+                WHERE submitted_at IS NULL
+                  AND submission_state IS NULL
+                  AND claimed_at IS NULL
                 """,
                 (CONFIRMATION_STATE_READY,),
             ).rowcount
@@ -81,10 +95,11 @@ class AuditStore:
                 """,
                 (CONFIRMATION_STATE_SUBMITTED,),
             ).rowcount
-            if ready_backfilled or submitted_backfilled:
+            if ready_backfilled or indeterminate_backfilled or submitted_backfilled:
                 logger.info(
-                    "migrated confirmation states: %d ready, %d submitted",
+                    "migrated confirmation states: %d ready, %d indeterminate, %d submitted",
                     ready_backfilled,
+                    indeterminate_backfilled,
                     submitted_backfilled,
                 )
             db.execute(
@@ -212,7 +227,12 @@ class AuditStore:
                 raise ValueError("confirmation token has expired")
             raise ValueError("confirmation token could not be claimed")
 
-    def finalize_confirmation(self, token: str, order_id: str | None = None) -> None:
+    def finalize_confirmation(
+        self,
+        token: str,
+        order_id: str | None = None,
+        reconcile_lease_id: str | None = None,
+    ) -> None:
         with self.connect() as db:
             cursor = db.execute(
                 """
@@ -221,22 +241,30 @@ class AuditStore:
                     submitted_at = ?,
                     claimed_at = NULL,
                     submission_state = ?,
-                    order_id = ?
+                    order_id = ?,
+                    reconcile_lease_id = NULL
                 WHERE token = ?
                   AND submitted_at IS NULL
                   AND claimed_at IS NOT NULL
-                  AND COALESCE(submission_state, ?) IN (?, ?, ?, ?)
+                  AND (
+                    (? IS NULL AND COALESCE(submission_state, ?) IN (?, ?, ?))
+                    OR
+                    (? IS NOT NULL AND submission_state = ? AND reconcile_lease_id = ?)
+                  )
                 """,
                 (
                     utc_now().isoformat(),
                     CONFIRMATION_STATE_SUBMITTED,
                     order_id,
                     token,
+                    reconcile_lease_id,
                     CONFIRMATION_STATE_READY,
                     CONFIRMATION_STATE_READY,
                     CONFIRMATION_STATE_SUBMITTING,
                     CONFIRMATION_STATE_INDETERMINATE,
+                    reconcile_lease_id,
                     CONFIRMATION_STATE_RECONCILING,
+                    reconcile_lease_id,
                 ),
             )
             if cursor.rowcount != 1:
@@ -309,12 +337,17 @@ class AuditStore:
                     reserved_order_id = COALESCE(reserved_order_id, ?),
                     claimed_at = COALESCE(claimed_at, ?)
                 WHERE token = ? AND submitted_at IS NULL
+                  AND COALESCE(submission_state, ?) IN (?, ?, ?)
                 """,
                 (
                     CONFIRMATION_STATE_INDETERMINATE,
                     reserved_order_id,
                     utc_now().isoformat(),
                     token,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_SUBMITTING,
+                    CONFIRMATION_STATE_INDETERMINATE,
                 ),
             )
             if cursor.rowcount != 1:
@@ -322,14 +355,15 @@ class AuditStore:
 
     def claim_reconciliation_confirmation(
         self, token: str
-    ) -> tuple[OrderIntent, dict[str, Any] | None, str | None]:
+    ) -> tuple[OrderIntent, dict[str, Any] | None, str | None, str]:
         now = utc_now()
         stale_before = now - timedelta(seconds=STALE_CLAIM_SECONDS)
+        lease_id = secrets.token_hex(16)
         with self.connect() as db:
             cursor = db.execute(
                 """
                 UPDATE confirmations
-                SET submission_state = ?, claimed_at = ?
+                SET submission_state = ?, claimed_at = ?, reconcile_lease_id = ?
                 WHERE token = ?
                 AND submitted_at IS NULL
                 AND (
@@ -343,6 +377,7 @@ class AuditStore:
                 (
                     CONFIRMATION_STATE_RECONCILING,
                     now.isoformat(),
+                    lease_id,
                     token,
                     CONFIRMATION_STATE_INDETERMINATE,
                     CONFIRMATION_STATE_SUBMITTING,
@@ -366,6 +401,7 @@ class AuditStore:
                     OrderIntent.model_validate_json(row["intent_json"]),
                     preview,
                     row["reserved_order_id"],
+                    lease_id,
                 )
             state = _coalesce_state(row["submission_state"])
             if state == CONFIRMATION_STATE_RECONCILING and row["claimed_at"]:
@@ -380,22 +416,23 @@ class AuditStore:
 
     def load_indeterminate_confirmation(
         self, token: str
-    ) -> tuple[OrderIntent, dict[str, Any] | None, str | None]:
+    ) -> tuple[OrderIntent, dict[str, Any] | None, str | None, str]:
         return self.claim_reconciliation_confirmation(token)
 
-    def mark_submission_ready_for_retry(self, token: str) -> None:
+    def mark_submission_ready_for_retry(self, token: str, reconcile_lease_id: str) -> None:
         with self.connect() as db:
             cursor = db.execute(
                 """
                 UPDATE confirmations
-                SET claimed_at = NULL, submission_state = ?
+                SET claimed_at = NULL, submission_state = ?, reconcile_lease_id = NULL
                 WHERE token = ? AND submitted_at IS NULL
-                AND submission_state = ?
+                AND submission_state = ? AND reconcile_lease_id = ?
                 """,
                 (
                     CONFIRMATION_STATE_READY,
                     token,
                     CONFIRMATION_STATE_RECONCILING,
+                    reconcile_lease_id,
                 ),
             )
             if cursor.rowcount != 1:
@@ -403,8 +440,27 @@ class AuditStore:
 
     # Backward-compatible helper retained for existing imports/tests. Retry/reconcile now
     # goes through claim_reconciliation_confirmation for atomic transitions.
-    def mark_reconciliation_retry_allowed(self, token: str) -> None:
-        self.mark_submission_ready_for_retry(token)
+    def mark_reconciliation_retry_allowed(self, token: str, reconcile_lease_id: str) -> None:
+        self.mark_submission_ready_for_retry(token, reconcile_lease_id)
+
+    def abandon_reconciliation(self, token: str, reconcile_lease_id: str) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?, reconcile_lease_id = NULL
+                WHERE token = ? AND submitted_at IS NULL
+                  AND submission_state = ? AND reconcile_lease_id = ?
+                """,
+                (
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    token,
+                    CONFIRMATION_STATE_RECONCILING,
+                    reconcile_lease_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("reconciliation lease is no longer current")
 
     def get_submission_state(self, token: str) -> str | None:
         with self.connect() as db:

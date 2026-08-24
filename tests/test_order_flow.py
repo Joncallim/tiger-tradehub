@@ -90,6 +90,10 @@ class FakeGateway:
             return order.get("order_id") or order.get("id")
         return str(order.order_id)
 
+    def get_global_order_id(self, order):
+        value = order.get("id") if isinstance(order, dict) else None
+        return str(value) if value is not None else None
+
     def cancel_order(self, order_id):
         self.cancel_order_id = order_id
         return {"cancelled": True}
@@ -278,6 +282,50 @@ def test_reconcile_with_existing_broker_order_prevents_duplicate_submit(tmp_path
     ]
 
 
+def test_reconcile_persists_global_id_and_keeps_reserved_id_for_lookup(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    gateway.accept_and_fail = True
+    install(settings, store, gateway)
+
+    try:
+        client = TestClient(app)
+        token = client.post("/orders/preview", json=preview_payload(), headers=headers()).json()[
+            "confirmation_token"
+        ]
+        client.post("/orders/submit", json={"confirmation_token": token}, headers=headers())
+        gateway.broker_orders["reserved-1"] = {
+            "id": "global-123",
+            "order_id": "reserved-456",
+        }
+        reconciled = client.post(
+            "/orders/submit/reconcile",
+            json={"confirmation_token": token},
+            headers=headers(),
+        )
+        cancelled = client.post(
+            "/orders/cancel", json={"order_id": "global-123"}, headers=headers()
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    with sqlite3.connect(db_path) as db:
+        identifiers = db.execute(
+            "SELECT order_id, reserved_order_id FROM confirmations WHERE token = ?", (token,)
+        ).fetchone()
+    assert reconciled.status_code == 200
+    assert reconciled.json()["order_id"] == "global-123"
+    assert identifiers == ("global-123", "reserved-1")
+    assert cancelled.status_code == 200
+    assert gateway.cancel_order_id == "global-123"
+
+
 def test_reconcile_failure_stays_indeterminate(tmp_path):
     db_path = tmp_path / "tradehub.db"
     settings = Settings(
@@ -442,7 +490,7 @@ def test_submit_crash_point_2_reconcile_recovers_submit_before_finalize(tmp_path
 
     assert reconciled.status_code == 200
     assert reconciled.json()["status"] == "resolved"
-    assert reconciled.json()["order_id"] == "reserved-1"
+    assert reconciled.json()["order_id"] == "global-reserved-1"
 
 
 def test_reconcile_retry_uses_bounded_retry_lookup(tmp_path):
@@ -475,7 +523,7 @@ def test_reconcile_retry_uses_bounded_retry_lookup(tmp_path):
 
     assert reconciled.status_code == 200
     assert reconciled.json()["status"] == "resolved"
-    assert reconciled.json()["order_id"] == "reserved-1"
+    assert reconciled.json()["order_id"] == "global-reserved-1"
 
 
 def test_reconcile_fallback_scan_is_used_before_retryable(tmp_path):

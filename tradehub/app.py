@@ -300,8 +300,8 @@ def reconcile_order(
     gateway: TigerGateway = Depends(get_gateway),
 ):
     try:
-        intent, tiger_preview, reserved_order_id = store.claim_reconciliation_confirmation(
-            request.confirmation_token
+        intent, tiger_preview, reserved_order_id, reconcile_lease_id = (
+            store.claim_reconciliation_confirmation(request.confirmation_token)
         )
     except (KeyError, ValueError) as exc:
         store.record_event("reconcile_block", {"reason": str(exc)})
@@ -311,6 +311,10 @@ def reconcile_order(
         ) from exc
 
     if not reserved_order_id:
+        try:
+            store.abandon_reconciliation(request.confirmation_token, reconcile_lease_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         store.record_event(
             "reconcile_block",
             {
@@ -338,14 +342,30 @@ def reconcile_order(
             exc,
             detail,
         )
+        try:
+            store.abandon_reconciliation(request.confirmation_token, reconcile_lease_id)
+        except ValueError as lease_exc:
+            store.record_event("reconcile_block", {"reason": str(lease_exc)})
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(lease_exc)
+            ) from lease_exc
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
     if order is not None:
-        resolved_order_id = str(
-            gateway.get_order_id(order) or order.get("order_id") or order.get("id")
-        )
+        resolved_order_id = gateway.get_global_order_id(order)
+        if resolved_order_id is None:
+            try:
+                store.abandon_reconciliation(request.confirmation_token, reconcile_lease_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={"message": "upstream broker response missing global order id"},
+            )
         try:
-            store.finalize_confirmation(request.confirmation_token, resolved_order_id)
+            store.finalize_confirmation(
+                request.confirmation_token, resolved_order_id, reconcile_lease_id
+            )
         except ValueError as exc:
             store.record_event("reconcile_block", {"reason": str(exc)})
             raise HTTPException(
@@ -365,7 +385,7 @@ def reconcile_order(
         )
 
     try:
-        store.mark_reconciliation_retry_allowed(request.confirmation_token)
+        store.mark_reconciliation_retry_allowed(request.confirmation_token, reconcile_lease_id)
     except ValueError as exc:
         store.record_event("reconcile_block", {"reason": str(exc)})
         raise HTTPException(
