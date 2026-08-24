@@ -257,3 +257,112 @@ class ScreenStore:
                 "WHERE run_id=?",
                 (canonical_json(failure), utc_now(), run_id),
             )
+
+    # ------------------------------------------------------------------
+    # I2: funnel-facing reads and candidate persistence
+    # ------------------------------------------------------------------
+
+    def logical_material(self, run_id: str) -> str:
+        """as_of || universe_hash || screen_manifest_hash || funnel_config_hash
+        || input_view_hash — the exact material hashed into run_id (design 5.4)."""
+        with self.database.connect(read_only=True) as db:
+            row = db.execute(
+                "SELECT as_of,universe_hash,screen_manifest_hash,funnel_config_hash,"
+                "input_view_hash FROM pipeline_run WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown pipeline run: {run_id}")
+        return "".join(row)
+
+    def load_results_for_funnel(self, run_id: str) -> list[dict[str, Any]]:
+        """All results for the run joined to their screen family (bounded: one
+        query, not per-security)."""
+        with self.database.connect(read_only=True) as db:
+            rows = db.execute(
+                "SELECT r.security_id,d.family,r.screen_result_id,r.sufficient_data,"
+                "r.passed,r.confidence,r.data_quality,r.evidence_ids_json "
+                "FROM screen_result r JOIN screen_definition d "
+                "ON d.config_hash=r.config_hash WHERE r.run_id=? "
+                "ORDER BY r.security_id,d.family",
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def cluster_ids_by_evidence(self) -> dict[str, set[str]]:
+        """One bounded scan resolving every evidence cluster membership.
+
+        Maps evidence_id -> set(cluster_id).  Cluster ids are resolved at rank
+        time only and are never copied into screen_result rows (design 3).
+        """
+        with self.database.connect(read_only=True) as db:
+            rows = db.execute(
+                "SELECT evidence_id,cluster_id FROM evidence_cluster_member "
+                "ORDER BY evidence_id,cluster_id",
+            ).fetchall()
+        lookup: dict[str, set[str]] = {}
+        for row in rows:
+            lookup.setdefault(row["evidence_id"], set()).add(row["cluster_id"])
+        return lookup
+
+    def persist_candidates(self, run_id: str, candidates: Iterable[Any]) -> None:
+        """Insert-or-verify candidate rows in one transaction (design 6: the
+        funnel runs in a separate transaction after COMPLETE; retry verifies)."""
+        rows = list(candidates)
+        try:
+            with self.database.connect() as db:
+                run = db.execute(
+                    "SELECT status FROM pipeline_run WHERE run_id=?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    raise KeyError(f"unknown pipeline run: {run_id}")
+                if run[0] != "COMPLETE":
+                    raise RunStateError("funnel requires a COMPLETE pipeline run")
+                for candidate in rows:
+                    values = (
+                        candidate.candidate_id,
+                        run_id,
+                        candidate.security_id,
+                        candidate.ordinal,
+                        canonical_json(candidate.inclusion_reasons),
+                        canonical_json(candidate.screen_result_ids),
+                        canonical_json(candidate.rank_telemetry),
+                        int(candidate.is_control),
+                        candidate.control_algorithm,
+                        candidate.control_key,
+                        candidate.control_rank,
+                    )
+                    stored = db.execute(
+                        "SELECT candidate_id,run_id,security_id,ordinal,inclusion_reasons_json,"
+                        "screen_result_ids_json,rank_telemetry_json,is_control,"
+                        "control_algorithm,control_key,control_rank FROM candidate "
+                        "WHERE run_id=? AND security_id=?",
+                        (run_id, candidate.security_id),
+                    ).fetchone()
+                    if stored is not None:
+                        if tuple(stored) != values:
+                            raise DeterminismError(
+                                "stored candidate differs from deterministic retry"
+                            )
+                        continue
+                    db.execute(
+                        "INSERT INTO candidate(candidate_id,run_id,security_id,ordinal,"
+                        "inclusion_reasons_json,screen_result_ids_json,rank_telemetry_json,"
+                        "is_control,control_algorithm,control_key,control_rank,included_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (*values, utc_now()),
+                    )
+        except DeterminismError as exc:
+            self.fail_run(run_id, str(exc))
+            raise
+        except sqlite3.IntegrityError as exc:
+            error = DeterminismError(f"candidate integrity conflict: {exc}")
+            self.fail_run(run_id, str(error))
+            raise error from exc
+
+    def load_candidates(self, run_id: str) -> list[dict[str, Any]]:
+        with self.database.connect(read_only=True) as db:
+            rows = db.execute(
+                "SELECT * FROM candidate WHERE run_id=? ORDER BY ordinal", (run_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]

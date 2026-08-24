@@ -781,11 +781,12 @@ def test_ra00_is_deterministic_pass_with_required_shape():
     assert all(a["status"] in {s.value for s in Status} for a in payload["assertions"])
 
 
-def test_research_acceptance_registry_is_an_explicit_ra00_whitelist():
-    from tradehub_research.acceptance.packs.ra00 import ASSERTIONS
+def test_research_acceptance_registry_is_an_explicit_whitelist():
+    from tradehub_research.acceptance.packs.ra00 import ASSERTIONS as RA00_ASSERTIONS
+    from tradehub_research.acceptance.packs.ra01 import ASSERTIONS as RA01_ASSERTIONS
     from tradehub_research.acceptance.runner import PACK_REGISTRY
 
-    assert PACK_REGISTRY == {"RA-00": ASSERTIONS}
+    assert PACK_REGISTRY == {"RA-00": RA00_ASSERTIONS, "RA-01": RA01_ASSERTIONS}
     assert [assertion_id for assertion_id, _ in PACK_REGISTRY["RA-00"]] == [
         "schema.version",
         "db.fresh_init",
