@@ -4,7 +4,7 @@ import json
 import uuid
 from typing import Any
 
-from tradehub_research.db import ResearchDB, utc_now
+from tradehub_research.db import ResearchDB, normalize_ts, utc_now
 
 
 class ExperimentRegistry:
@@ -34,8 +34,8 @@ class ExperimentRegistry:
                     scoring_version,
                     input_snapshot_id,
                     input_hash,
-                    evaluation_window_start,
-                    evaluation_window_end,
+                    normalize_ts(evaluation_window_start) if evaluation_window_start else None,
+                    normalize_ts(evaluation_window_end) if evaluation_window_end else None,
                     status,
                     None,
                     utc_now(),

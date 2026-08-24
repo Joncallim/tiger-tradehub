@@ -10,7 +10,25 @@ from tradehub_research.schema import MIGRATIONS, PHASE_0_SCHEMA_VERSION
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def normalize_ts(value: str) -> str:
+    """Return an RFC 3339 UTC timestamp at second precision.
+
+    All Phase-0 write APIs use this boundary so SQLite's lexical comparisons are
+    chronological comparisons, including when callers supply mixed offsets.
+    """
+    candidate = value.strip()
+    if candidate.endswith("Z"):
+        candidate = f"{candidate[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(f"invalid timestamp: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 class ResearchDB:
@@ -55,11 +73,24 @@ class ResearchDB:
             for version, description, sql in MIGRATIONS:
                 if version not in applied:
                     values = (description.replace("'", "''"), utc_now().replace("'", "''"))
-                    db.executescript(
-                        f"BEGIN IMMEDIATE;\n{sql}\n"
-                        f"INSERT INTO schema_version VALUES ({version}, '{values[1]}', "
-                        f"'{values[0]}');\nCOMMIT;"
-                    )
+                    # Table replacement must preserve dependent rows while names move.
+                    # Re-enable enforcement only after checking the replacement graph.
+                    db.execute("PRAGMA foreign_keys=OFF")
+                    try:
+                        db.executescript(
+                            f"BEGIN IMMEDIATE;\n{sql}\n"
+                            f"INSERT INTO schema_version VALUES ({version}, '{values[1]}', "
+                            f"'{values[0]}');"
+                        )
+                        violations = db.execute("PRAGMA foreign_key_check").fetchall()
+                        if violations:
+                            raise sqlite3.IntegrityError("migration introduced foreign key errors")
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        raise
+                    finally:
+                        db.execute("PRAGMA foreign_keys=ON")
         return self.schema_version()
 
     init = migrate

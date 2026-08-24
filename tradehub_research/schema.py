@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PHASE_0_SCHEMA_VERSION = 1
+PHASE_0_SCHEMA_VERSION = 2
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -70,7 +70,6 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
                 'source_reported','derived_from_index','observed_at_ingest','unknown'
             )),
             ingested_time TEXT NOT NULL,
-            UNIQUE (source_id, security_id, content_hash),
             CHECK (public_available_time IS NOT NULL OR pat_provenance IN (
                 'unknown','observed_at_ingest'
             )),
@@ -121,6 +120,127 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             SELECT RAISE(ABORT, 'experiment_run is append-only'); END;
         CREATE TRIGGER experiment_no_delete BEFORE DELETE ON experiment_run BEGIN
             SELECT RAISE(ABORT, 'experiment_run is append-only'); END;
+        """,
+    ),
+    (
+        2,
+        "Phase 0 independent-review PIT and recovery invariants",
+        """
+        DROP TRIGGER evidence_no_update;
+        DROP TRIGGER evidence_no_delete;
+        ALTER TABLE evidence_event RENAME TO evidence_event_v1;
+        CREATE TABLE evidence_event (
+            evidence_id TEXT PRIMARY KEY,
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            source_id TEXT NOT NULL REFERENCES evidence_source(source_id),
+            structured_fields TEXT NOT NULL CHECK (json_valid(structured_fields)),
+            extraction_confidence REAL NOT NULL CHECK (
+                extraction_confidence >= 0 AND extraction_confidence <= 1
+            ),
+            supersedes_evidence_id TEXT REFERENCES evidence_event(evidence_id),
+            withdrawn INTEGER NOT NULL DEFAULT 0 CHECK (withdrawn IN (0,1)),
+            content_hash TEXT NOT NULL, source_record_id TEXT,
+            event_time TEXT NOT NULL, public_available_time TEXT,
+            pat_provenance TEXT NOT NULL CHECK (pat_provenance IN (
+                'source_reported','derived_from_index','observed_at_ingest','unknown'
+            )),
+            ingested_time TEXT NOT NULL,
+            CHECK (public_available_time IS NOT NULL OR pat_provenance IN (
+                'unknown','observed_at_ingest'
+            )),
+            CHECK (withdrawn = 0 OR structured_fields = '{}')
+        );
+        INSERT INTO evidence_event(
+            evidence_id,security_id,source_id,structured_fields,extraction_confidence,
+            supersedes_evidence_id,withdrawn,content_hash,event_time,
+            public_available_time,pat_provenance,ingested_time
+        ) SELECT evidence_id,security_id,source_id,structured_fields,extraction_confidence,
+            supersedes_evidence_id,withdrawn,content_hash,event_time,
+            public_available_time,pat_provenance,ingested_time FROM evidence_event_v1;
+        DROP TABLE evidence_event_v1;
+        ALTER TABLE evidence_cluster_member RENAME TO evidence_cluster_member_v1;
+        CREATE TABLE evidence_cluster_member (
+            evidence_id TEXT NOT NULL REFERENCES evidence_event(evidence_id),
+            cluster_id TEXT NOT NULL REFERENCES evidence_cluster(cluster_id),
+            PRIMARY KEY (evidence_id, cluster_id)
+        );
+        INSERT INTO evidence_cluster_member SELECT * FROM evidence_cluster_member_v1;
+        DROP TABLE evidence_cluster_member_v1;
+        CREATE INDEX evidence_pit_idx ON evidence_event(
+            security_id, public_available_time, pat_provenance
+        );
+        CREATE TRIGGER evidence_no_update BEFORE UPDATE ON evidence_event BEGIN
+            SELECT RAISE(ABORT, 'evidence_event is append-only'); END;
+        CREATE TRIGGER evidence_no_delete BEFORE DELETE ON evidence_event BEGIN
+            SELECT RAISE(ABORT, 'evidence_event is append-only'); END;
+        ALTER TABLE universe_membership ADD COLUMN knowledge_time TEXT;
+        ALTER TABLE universe_membership ADD COLUMN pat_provenance TEXT CHECK (
+            pat_provenance IN (
+                'source_reported','derived_from_index','observed_at_ingest','unknown'
+            )
+        );
+        ALTER TABLE universe_membership ADD COLUMN supersedes_id INTEGER
+            REFERENCES universe_membership(id);
+
+        UPDATE universe_membership SET knowledge_time=valid_from,
+            pat_provenance='derived_from_index';
+
+        CREATE UNIQUE INDEX evidence_source_record_uq
+            ON evidence_event(source_id, security_id, source_record_id)
+            WHERE source_record_id IS NOT NULL;
+        CREATE UNIQUE INDEX evidence_fallback_identity_uq
+            ON evidence_event(source_id, security_id, event_time, content_hash)
+            WHERE source_record_id IS NULL;
+        CREATE UNIQUE INDEX evidence_single_successor_uq
+            ON evidence_event(supersedes_evidence_id)
+            WHERE supersedes_evidence_id IS NOT NULL;
+        CREATE INDEX evidence_supersedes_idx
+            ON evidence_event(supersedes_evidence_id, public_available_time);
+        CREATE INDEX evidence_cluster_member_idx
+            ON evidence_cluster_member(cluster_id, evidence_id);
+        CREATE INDEX security_identity_event_idx ON security_identity_event(security_id);
+        CREATE INDEX evidence_pat_idx ON evidence_event(public_available_time, pat_provenance);
+
+        CREATE TRIGGER evidence_supersession_valid BEFORE INSERT ON evidence_event
+        WHEN NEW.supersedes_evidence_id IS NOT NULL BEGIN
+            SELECT CASE WHEN NEW.supersedes_evidence_id = NEW.evidence_id
+                THEN RAISE(ABORT, 'evidence cannot supersede itself') END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM evidence_event p WHERE p.evidence_id=NEW.supersedes_evidence_id
+                    AND p.security_id=NEW.security_id AND p.source_id=NEW.source_id
+            ) THEN RAISE(ABORT, 'supersession requires same security and source') END;
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM evidence_event p WHERE p.evidence_id=NEW.supersedes_evidence_id
+                    AND p.public_available_time IS NOT NULL
+                    AND (NEW.public_available_time IS NULL
+                         OR NEW.public_available_time < p.public_available_time)
+            ) THEN RAISE(ABORT, 'supersession cannot backdate public availability') END;
+        END;
+        CREATE TRIGGER evidence_pat_before_ingest BEFORE INSERT ON evidence_event
+        WHEN NEW.public_available_time IS NOT NULL
+             AND NEW.public_available_time > NEW.ingested_time BEGIN
+            SELECT RAISE(ABORT, 'public availability cannot follow ingestion');
+        END;
+        CREATE TRIGGER universe_no_update BEFORE UPDATE ON universe_membership BEGIN
+            SELECT RAISE(ABORT, 'universe_membership is append-only'); END;
+        CREATE TRIGGER universe_no_delete BEFORE DELETE ON universe_membership BEGIN
+            SELECT RAISE(ABORT, 'universe_membership is append-only'); END;
+        CREATE TRIGGER universe_required_pit_fields BEFORE INSERT ON universe_membership
+        WHEN NEW.knowledge_time IS NULL OR NEW.pat_provenance IS NULL BEGIN
+            SELECT RAISE(ABORT, 'membership knowledge time and provenance are required');
+        END;
+        CREATE TRIGGER universe_supersession_valid BEFORE INSERT ON universe_membership
+        WHEN NEW.supersedes_id IS NOT NULL BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM universe_membership p WHERE p.id=NEW.supersedes_id
+                    AND p.security_id=NEW.security_id
+            ) THEN RAISE(ABORT, 'membership supersession requires same security') END;
+        END;
+
+        CREATE TABLE snapshot_manifest (
+            snapshot_id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+            source_db TEXT NOT NULL, content_hash TEXT NOT NULL
+        );
         """,
     ),
 )
