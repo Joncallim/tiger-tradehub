@@ -8,6 +8,7 @@ from pathlib import Path
 from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
 from tradehub_research.schema import PHASE_0_SCHEMA_VERSION
+from tradehub_research.universe import UniverseMembershipStore
 
 
 def seed(database: ResearchDB) -> EvidenceStore:
@@ -105,6 +106,21 @@ def supersession(tmp: Path) -> None:
     )
     assert store.historical("2025-01-06")[0]["evidence_id"] == original
     assert store.historical("2025-01-09")[0]["evidence_id"] == correction
+    try:
+        store.insert(
+            security_id="sec",
+            source_id="src",
+            structured_fields={"v": 3},
+            extraction_confidence=1,
+            event_time="2025-01-01",
+            public_available_time="2025-01-04",
+            pat_provenance="source_reported",
+            supersedes_evidence_id=correction,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("backdated correction was accepted")
     with store.database.connect() as db:
         try:
             db.execute(
@@ -140,20 +156,24 @@ def identity_membership(tmp: Path) -> None:
             "public_available_time,pat_provenance) VALUES (?,?,?,?,?,?,?)",
             ("sec", "ticker_change", "OLD", "ABC", "2025-02-01", "2025-02-01", "source_reported"),
         )
-        db.execute(
-            "INSERT INTO universe_membership("
-            "security_id,price,market_cap,avg_dollar_volume,price_eligible,"
-            "market_cap_eligible,liquidity_eligible,eligible,valid_from,valid_to) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            ("sec", 10, 1e9, 1e7, 1, 1, 1, 1, "2025-01-01", "2025-04-01"),
-        )
-    with database.connect(read_only=True) as db:
-        query = (
-            "SELECT COUNT(*) FROM universe_membership WHERE valid_from <= ? "
-            "AND (valid_to IS NULL OR valid_to > ?)"
-        )
-        assert db.execute(query, ("2025-02-01", "2025-02-01")).fetchone()[0] == 1
-        assert db.execute(query, ("2025-05-01", "2025-05-01")).fetchone()[0] == 0
+    memberships = UniverseMembershipStore(database)
+    memberships.insert(
+        security_id="sec",
+        price=10,
+        market_cap=1e9,
+        avg_dollar_volume=1e7,
+        price_eligible=True,
+        market_cap_eligible=True,
+        liquidity_eligible=True,
+        eligible=True,
+        valid_from="2020-01-01",
+        valid_to="2025-04-01",
+        knowledge_time="2025-01-01",
+        pat_provenance="source_reported",
+    )
+    assert not memberships.pit_valid("sec", "2020-02-01")
+    assert len(memberships.pit_valid("sec", "2025-02-01")) == 1
+    assert not memberships.pit_valid("sec", "2025-05-01")
 
 
 def retraction(tmp: Path) -> None:

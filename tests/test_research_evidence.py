@@ -21,6 +21,14 @@ def store(tmp_path):
             "INSERT INTO evidence_source VALUES (?,?,?,?,?)",
             ("filings", "regulatory_filing", 1, "primary", "source_reported"),
         )
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s2", "TWO", "NYSE", "Second", None, None, "SUPPORTED", "2025-01-01", None),
+        )
+        db.execute(
+            "INSERT INTO evidence_source VALUES (?,?,?,?,?)",
+            ("news", "news", 3, "secondary", "source_reported"),
+        )
     return EvidenceStore(database)
 
 
@@ -30,7 +38,7 @@ def add(store, fields, published, **kwargs):
         source_id="filings",
         structured_fields=fields,
         extraction_confidence=0.9,
-        event_time="2025-01-01",
+        event_time=kwargs.pop("event_time", "2025-01-01"),
         public_available_time=published,
         pat_provenance=kwargs.pop("pat_provenance", "source_reported"),
         **kwargs,
@@ -96,3 +104,135 @@ def test_provenance_histogram(store):
         ("source_reported", 1),
         ("unknown", 1),
     ]
+
+
+def test_source_identity_keeps_equal_period_values_and_withdrawals_distinct(store):
+    q1 = add(store, {"revenue": 1}, "2025-01-05", source_record_id="10-Q:2025Q1")
+    q2 = add(
+        store,
+        {"revenue": 1},
+        "2025-04-05",
+        event_time="2025-04-01",
+        source_record_id="10-Q:2025Q2",
+    )
+    withdrawal_1 = add(
+        store, {}, "2025-05-01", event_time="2025-05-01", source_record_id="wd:1", withdrawn=True
+    )
+    withdrawal_2 = add(
+        store, {}, "2025-05-02", event_time="2025-05-02", source_record_id="wd:2", withdrawn=True
+    )
+    assert len({q1, q2, withdrawal_1, withdrawal_2}) == 4
+
+
+def test_same_content_different_publication_records_are_distinct(store):
+    first = add(store, {"same": 1}, "2025-01-05", source_record_id="publication:1")
+    second = add(store, {"same": 1}, "2025-01-06", source_record_id="publication:2")
+    assert first != second
+
+
+def test_identity_retry_rejects_mismatched_metadata(store):
+    add(store, {"value": 1}, "2025-01-05", source_record_id="stable-id")
+    with pytest.raises(ValueError, match="metadata"):
+        add(store, {"value": 2}, "2025-01-05", source_record_id="stable-id")
+
+
+def test_supersession_scope_cardinality_and_ordering(store):
+    original = add(store, {"v": 1}, "2025-01-05", source_record_id="original")
+    with pytest.raises(ValueError, match="same security"):
+        store.insert(
+            security_id="s2",
+            source_id="filings",
+            structured_fields={"v": 2},
+            extraction_confidence=1,
+            event_time="2025-01-06",
+            public_available_time="2025-01-06",
+            pat_provenance="source_reported",
+            ingested_time="2025-01-07",
+            supersedes_evidence_id=original,
+            source_record_id="cross-security",
+        )
+    with pytest.raises(ValueError, match="same security and source"):
+        store.insert(
+            security_id="s1",
+            source_id="news",
+            structured_fields={"v": 2},
+            extraction_confidence=1,
+            event_time="2025-01-06",
+            public_available_time="2025-01-06",
+            pat_provenance="source_reported",
+            ingested_time="2025-01-07",
+            supersedes_evidence_id=original,
+            source_record_id="cross-source",
+        )
+    with pytest.raises(ValueError, match="backdate"):
+        add(
+            store,
+            {"v": 2},
+            "2025-01-04",
+            ingested_time="2025-01-07",
+            supersedes_evidence_id=original,
+            source_record_id="backdated",
+        )
+    successor = add(
+        store,
+        {"v": 2},
+        "2025-01-06",
+        ingested_time="2025-01-07",
+        supersedes_evidence_id=original,
+        source_record_id="successor",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        add(
+            store,
+            {"v": 3},
+            "2025-01-07",
+            ingested_time="2025-01-08",
+            supersedes_evidence_id=original,
+            source_record_id="second-successor",
+        )
+    with pytest.raises(ValueError, match="itself"):
+        add(
+            store,
+            {"v": 4},
+            "2025-01-08",
+            ingested_time="2025-01-09",
+            evidence_id="self",
+            supersedes_evidence_id="self",
+            source_record_id="self",
+        )
+    assert store.historical("2025-01-07", "s1")[0]["evidence_id"] == successor
+
+
+def test_timestamps_normalize_and_pat_cannot_follow_ingestion(store):
+    item = add(
+        store,
+        {"offset": True},
+        "2025-01-05T08:00:00+08:00",
+        event_time="2025-01-05T01:00:00+01:00",
+        ingested_time="2025-01-05T01:00:01Z",
+        source_record_id="offset",
+    )
+    with store.database.connect(read_only=True) as db:
+        row = db.execute("SELECT * FROM evidence_event WHERE evidence_id=?", (item,)).fetchone()
+    assert row["event_time"] == "2025-01-05T00:00:00Z"
+    assert row["public_available_time"] == "2025-01-05T00:00:00Z"
+    assert store.historical("2025-01-05T00:00:00+00:00")[0]["evidence_id"] == item
+    with pytest.raises(ValueError, match="cannot follow"):
+        add(store, {"future": True}, "2025-01-06", ingested_time="2025-01-05")
+
+
+def test_historical_per_security_query_uses_index(store):
+    add(store, {"v": 1}, "2025-01-05")
+    as_of = "2025-01-06T00:00:00Z"
+    sql = """SELECT e.* FROM evidence_event e
+        WHERE e.public_available_time IS NOT NULL
+          AND e.pat_provenance IN ('source_reported','derived_from_index')
+          AND e.public_available_time <= ? AND e.security_id = ? AND e.withdrawn = 0
+          AND NOT EXISTS (SELECT 1 FROM evidence_event successor
+            WHERE successor.supersedes_evidence_id=e.evidence_id
+              AND successor.public_available_time <= ?)"""
+    with store.database.connect(read_only=True) as db:
+        rows = db.execute("EXPLAIN QUERY PLAN " + sql, (as_of, "s1", as_of))
+        plan = " ".join(row["detail"] for row in rows)
+    assert "SEARCH e USING INDEX evidence_pit_idx" in plan
+    assert "SCAN e" not in plan
