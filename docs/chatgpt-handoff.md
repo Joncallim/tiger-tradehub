@@ -21,52 +21,25 @@ CORE FUNCTIONAL ACCEPTANCE NOT YET PASSED — one blocker on FA-05.
 
 Current deployed commit: `3f844ee` (main, pushed). Lineage state in `data/acceptance/state.json`.
 
-## The single blocker (FA-05 / #29)
+## FA-05 status (2026-08-23, updated per program decision)
 
-**Corrected diagnosis (2026-08-23):** the account's only market-data permission is `aStockQuoteLv1`, which is **China A-share L1** — NOT US market data. Tiger's official permission table (docs-en.itigerup.com/docs/quote-common.md) defines the US entitlements as:
-- `usQuoteBasic` — US stock L1 market data access
-- `usStockQuote` — US real-time stock market data access
+**US L1 real-time quotes are NOT required for functional acceptance.** The pack now uses Tiger's freely available **delayed** US quote (`get_stock_delay_briefs`) solely to choose a deterministic conservative paper-test limit (`delayed_price * 0.50`). The delayed quote is explicitly labelled DELAYED and never treated as current executable market data.
 
-`get_quote_permission()` / `grab_quote_permission()` currently return ONLY `[{'name': 'aStockQuoteLv1', 'expire_at': -1}]`. With no `usQuoteBasic`/`usStockQuote`, every US quote call (`get_briefs`, `quote_real_time`, `timeline`, `trade_tick`) correctly fails with `ApiException code=4 msg=4000: permission denied (…US market)`.
+Useful permission reference (kept for diagnosis only):
+- `aStockQuoteLv1` = **China A-share L1** (unrelated to US quotes; it is the only permission this account currently holds)
+- `usQuoteBasic` / `usStockQuote` = US real-time entitlements — **OPTIONAL**, not required for current functional acceptance. Do not purchase/enable these merely to complete FA-05.
 
-Per the acceptance spec, FA-05 must **deterministically prove the test limit is non-marketable from a current quote** before placing the order. Without US L1 quotes that proof is impossible → the runner correctly returns **BLOCKED** and never places an order (verified: no broker write occurred).
+FA-05 verified status so far: `gate.acceptance_write_flag` PASS, `gate.upstream_lineage` PASS, `gate.broker_paper_proof` PASS (broker-reported `accountType=PAPER` via `get_managed_accounts`; $1,000,000 paper balance). The `gate.delayed_reference_limit` and lifecycle now run against delayed quotes.
 
-Note: PAPER is already positively proven ($1,000,000 paper balance, broker-reported accountType=PAPER via get_managed_accounts) — this is NOT an account-type problem. It is purely the missing US quote entitlement.
+Run/rerun:
+```bash
+env TRADEHUB_ACCEPTANCE_PAPER_WRITE=true .venv/bin/tradehub-acceptance run FA-05 --json
+```
+Expected: gates PASS → lifecycle places ONE tiny conservative limit BUY (AAPL, qty 1, limit = delayed_price × 0.50), reads it back, cancels it (or handles an unexpected PAPER fill explicitly), reconciles audit, proves exactly one order.
 
-### Activation route (for Jon)
+If the delayed quote fetch is ever denied (code 4000 US-market), that indicates the device/account lacks even delayed US quote access (unusual — delayed quotes are free); investigate device-access contention first (one reusable `QuoteClient`, `grab_quote_permission()` transfers access and does not purchase permission). Real-time L1 remains optional.
 
-1. **Developer Center:** https://developer.itigerup.com/profile → API market data / quota → **US L1** (yields `usQuoteBasic`); real-time US market data must be purchased/enabled separately (docs: `permission.md`).
-   Or **Tiger Trade app:** Profile → **Market Data Store** → **API** → **US L1**.
-2. **Verify after activation** (one call, reuse a single module-level QuoteClient — `grab_quote_permission()` transfers device access and does NOT purchase permission; only one device can hold access at a time; repeated grabs from fresh clients cause device-access contention):
-   ```bash
-   cd /home/jon/tiger-tradehub
-   .venv/bin/python - <<'EOF'
-   from tigeropen.common.consts import Language
-   from tigeropen.common.util.signature_utils import read_private_key
-   from tigeropen.quote.quote_client import QuoteClient
-   from tigeropen.tiger_open_config import TigerOpenClientConfig
-   from tradehub.config import get_settings
-   s = get_settings()
-   config = TigerOpenClientConfig(sandbox_debug=s.tiger_sandbox)
-   config.tiger_id = s.tiger_id or ""; config.account = s.tiger_account or ""
-   if s.tiger_license: config.license = s.tiger_license
-   config.language = Language.en_US
-   config.private_key = read_private_key(str(s.tiger_private_key_path))
-   client = QuoteClient(config)  # ONE instance, reused
-   print("perms:", client.grab_quote_permission())
-   print("briefs:", client.get_briefs(["AAPL"]))
-   EOF
-   ```
-   Expected now: `perms` includes `usQuoteBasic`/`usStockQuote`, and `briefs` returns AAPL prices.
-   If the US entitlement appears but quote calls STILL return code 4000 → investigate **device-access contention** next (only one device holds real-time quote access; grab transfers it).
-3. Only then rerun:
-   ```bash
-   env TRADEHUB_ACCEPTANCE_PAPER_WRITE=true .venv/bin/tradehub-acceptance run FA-05 --json
-   ```
-   Expected: gates PASS → lifecycle places ONE tiny non-marketable limit BUY (AAPL, qty 1, limit = 50% of market), reads it back, cancels it, reconciles audit, proves exactly one order.
-4. Post result to #29; if PASS, close it and update #23.
-
-**Do not place any broker order until FA-05 independently proves PAPER account + current quote + non-marketable limit.**
+**Do not place any broker order until FA-05 independently proves PAPER account + usable delayed reference + conservative limit.**
 
 ## How to operate the acceptance runner
 
@@ -103,7 +76,7 @@ sudo -u jon git status -sb
 ## Deployed environment notes
 
 - TradeHub prod config lives in `.env` (root-owned): dry_run=true, allowlist `["AAPL","MSFT","VOO"]`, max notional $1000, max qty 100, TTL 300s, license TBSG, Tiger paper creds (tiger_id + 17-digit paper account 2115…, PKCS#8 key at data/tiger_private_key.pk8.pem).
-- FA-05's write run uses `TRADEHUB_DRY_RUN=false` overridden on a dedicated acceptance instance only after the PAPER + non-marketable proofs pass; production `.env` is never modified.
+- FA-05's write run uses `TRADEHUB_DRY_RUN=false` overridden on a dedicated acceptance instance only after the broker PAPER proof + usable delayed reference succeed; production `.env` is never modified.
 - Key files: `tradehub/acceptance/` (runner: runner.py, schema.py, sanitize.py, service.py, mcp_client.py, state.py, packs/fa00..fa05), `docs/functional-acceptance-program.md` (canonical design), `docs/rate-limits.md`.
 - Known rate limits: per tigerId+method — high 120/min, mid 60/min, low 10/min; place_order+modify_order shared 5 req/s per account; repeated 429s → account blacklist.
 

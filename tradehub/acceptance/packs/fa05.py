@@ -11,13 +11,30 @@ Hard gates (each failure => BLOCKED, never a workaround):
   Tiger account information — NOT sandbox_debug, NOT account-number
   shape, NOT filenames or prose);
 - acceptance-only stricter caps (quantity/notional) are respected;
-- USD limit order on an allowlisted symbol only;
-- the test limit is proven non-marketable at submission time from a
-  current quote; if it cannot be proven, BLOCKED.
+- USD limit order on an allowlisted symbol only.
 
-Lifecycle: read state -> preview -> submit (acceptance authority) ->
-broker order id -> read back -> cancel -> read back -> reconcile audit
--> prove exactly one order created.
+Quote semantics (per program decision 2026-08-23):
+- REAL-TIME US L1 quotes are NOT required for functional acceptance.
+- The runner uses Tiger's freely available DELAYED US quote
+  (`get_stock_delay_briefs`) only to choose a deliberately conservative
+  paper-test limit. The delayed quote is NOT treated as current
+  executable market data; results label it explicitly as delayed.
+- Because PAPER is independently proven, an unexpected fill is not a
+  real-money safety failure, but it IS an acceptance event that must be
+  handled explicitly (recorded, reconciled, flattened if possible).
+
+Acceptance limit rule (deterministic, runner-owned):
+    acceptance_limit = delayed_price * 0.50 (rounded for the instrument)
+The percentage may be adjusted only if the broker rejects an obviously
+unreasonable limit due to price-band rules; the adjustment is documented,
+the order stays intentionally far from the delayed reference, and the
+runner never switches to MARKET nor increases quantity/notional to make
+the test work.
+
+Lifecycle: prove PAPER -> fetch delayed quote -> derive conservative
+limit -> preview -> submit (acceptance authority) -> broker order id ->
+read back -> cancel (or handle fill) -> read back -> reconcile audit ->
+prove exactly one order created.
 """
 
 from __future__ import annotations
@@ -25,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -33,6 +51,7 @@ from tradehub.acceptance.runner import (
     REPO_ROOT,
     AssertionBlocked,
     AssertionError_,
+    AssertionEscalate,
     AssertionSpec,
     PackDefinition,
     RunContext,
@@ -43,7 +62,11 @@ ACCEPTANCE_WRITE_FLAG = "TRADEHUB_ACCEPTANCE_PAPER_WRITE"
 ACCEPTANCE_SYMBOL = "AAPL"
 ACCEPTANCE_MAX_QUANTITY = 1.0
 ACCEPTANCE_MAX_NOTIONAL_USD = 100.0
+ACCEPTANCE_LIMIT_FRACTION = 0.50  # deterministic conservative limit rule
 STATE_FILE = REPO_ROOT / "data" / "acceptance" / "state.json"
+
+# Order statuses that indicate the paper order filled before cancellation.
+FILLED_STATUSES = {"FILLED", "PARTIALLY_FILLED"}
 
 
 def _flag_enabled() -> bool:
@@ -66,16 +89,73 @@ def _upstream_packs_pass() -> list[str]:
     return missing
 
 
-def _quote_last_price(ctx: RunContext) -> float | None:
-    """Fetch current market price via the Tiger quote API (read-only).
+def derive_acceptance_limit(
+    delayed_price: float,
+    quantity: float = ACCEPTANCE_MAX_QUANTITY,
+    max_notional_usd: float = ACCEPTANCE_MAX_NOTIONAL_USD,
+    fraction: float = ACCEPTANCE_LIMIT_FRACTION,
+) -> float:
+    """Deterministic conservative limit from a delayed reference price.
 
-    Raises:
-        AssertionBlocked if the broker denies market-data permission
-        (deterministic prerequisite: US market data must be enabled for
-        the OpenAPI account/device in the Developer Center).
-        AssertionEscalate for anything unexpected.
+    rule: limit = delayed_price * fraction, rounded to cents, strictly
+    positive, and within the acceptance notional cap. Raises
+    AssertionBlocked when the derived order violates acceptance caps.
+    """
+    if delayed_price is None or delayed_price <= 0:
+        raise AssertionBlocked("delayed reference price is not positive")
+    limit = round(delayed_price * fraction, 2)
+    if limit <= 0:
+        raise AssertionBlocked("derived limit price is not positive")
+    notional = limit * quantity
+    if notional > max_notional_usd:
+        raise AssertionBlocked(
+            f"derived notional {notional:.2f} exceeds acceptance cap {max_notional_usd:.2f}"
+        )
+    return limit
+
+
+def _delayed_quote_record(
+    ctx: RunContext, delayed_price: float, quote_time_ms: int | None
+) -> dict[str, object]:
+    """Build the artifact record for the delayed quote reference.
+
+    Labels the quote as DELAYED (never real-time), records retrieval
+    timestamp and a staleness classification based on the quote's own
+    timestamp when available.
+    """
+    retrieved_at = datetime.now(tz=timezone.utc)
+    staleness = "unknown"
+    if quote_time_ms:
+        quote_time = datetime.fromtimestamp(quote_time_ms / 1000, tz=timezone.utc)
+        age_seconds = max(0, int((retrieved_at - quote_time).total_seconds()))
+        if age_seconds < 3600:
+            staleness = f"delayed_under_1h({age_seconds}s)"
+        elif age_seconds < 86400:
+            staleness = f"delayed_1h_to_24h({age_seconds}s)"
+        else:
+            staleness = f"delayed_over_24h({age_seconds}s)"
+    record: dict[str, object] = {
+        "symbol": ACCEPTANCE_SYMBOL,
+        "source": "tiger_delayed_quote",
+        "classification": "DELAYED",
+        "delayed_price": delayed_price,
+        "quote_time_ms": quote_time_ms,
+        "retrieved_at": retrieved_at.isoformat(),
+        "staleness": staleness,
+        "is_real_time": False,
+    }
+    return record
+
+
+def _delayed_quote(ctx: RunContext) -> tuple[float, int | None]:
+    """Fetch Tiger's freshest freely available DELAYED US quote.
+
+    Uses get_stock_delay_briefs via a single reusable QuoteClient. A
+    missing/denied delayed quote => BLOCKED (deterministic prerequisite);
+    anything unexpected => ESCALATE. Never treats the result as real-time.
     """
     from tigeropen.common.consts import Language
+    from tigeropen.common.util.signature_utils import read_private_key
     from tigeropen.quote.quote_client import QuoteClient
     from tigeropen.tiger_open_config import TigerOpenClientConfig
 
@@ -87,39 +167,38 @@ def _quote_last_price(ctx: RunContext) -> float | None:
         config.license = settings.tiger_license
     config.language = Language.en_US
     if settings.tiger_private_key_path:
-        from tigeropen.common.util.signature_utils import read_private_key
-
         config.private_key = read_private_key(str(settings.tiger_private_key_path))
-    client = QuoteClient(config)
+
+    # ONE reusable client per run: grab_quote_permission() transfers device
+    # access and does NOT purchase permission — repeated grabs from fresh
+    # clients cause device-access contention (per Tiger docs).
+    client = getattr(ctx, "_quote_client", None)
+    if client is None:
+        client = QuoteClient(config)
+        ctx._quote_client = client
+        try:
+            client.grab_quote_permission()
+        except AssertionBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionEscalate(f"grab_quote_permission failed: {exc}") from exc
+
     try:
-        client.grab_quote_permission()
-        quotes = client.get_briefs([ACCEPTANCE_SYMBOL])
+        df = client.get_stock_delay_briefs([ACCEPTANCE_SYMBOL])
     except AssertionBlocked:
         raise
     except Exception as exc:  # noqa: BLE001
-        message = str(exc)
-        if "permission" in message.lower() and "4000" in message:
-            raise AssertionBlocked(
-                "Tiger OpenAPI US market-data permission is not enabled for this "
-                "account/device (code 4000). Enable US stock L1 market data for "
-                "the OpenAPI account in the Developer Center "
-                "(developer.itigerup.com/profile) before FA-05 can prove a "
-                "non-marketable limit."
-            ) from exc
-        from tradehub.acceptance.runner import AssertionEscalate
+        raise AssertionEscalate(f"delayed quote fetch failed: {exc}") from exc
 
-        raise AssertionEscalate(f"quote fetch failed unexpectedly: {message}") from exc
-    if not quotes:
-        return None
-    quote = quotes[0]
-    for attr in ("latest_price", "close", "last", "current"):
-        value = getattr(quote, attr, None)
-        if value not in (None, "-"):
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-    return None
+    if df is None or df.empty:
+        raise AssertionBlocked("delayed quote returned no rows")
+    row = df.iloc[0]
+    price = row.get("close", row.get("pre_close"))
+    if price is None or str(price) in ("", "-") or float(price) <= 0:
+        raise AssertionBlocked("delayed quote returned no usable price")
+    quote_time = row.get("time")
+    quote_time_ms = int(quote_time) if quote_time is not None else None
+    return float(price), quote_time_ms
 
 
 def build_fa05_pack() -> PackDefinition:
@@ -141,45 +220,36 @@ def build_fa05_pack() -> PackDefinition:
         ctx.register_secret(str(account))
         ctx.artifacts.append(f"paper_account_proven={account}")
 
-    def gate_marketable_limit_proof(ctx: RunContext) -> None:
-        last = _quote_last_price(ctx)
-        if last is None:
-            raise AssertionBlocked("cannot fetch current quote to prove non-marketable limit")
-        # Non-marketable: a BUY limit strictly below the current market.
-        limit = round(last * 0.5, 2)
-        if limit <= 0:
-            raise AssertionBlocked("derived limit price is not positive")
-        if (
-            ACCEPTANCE_MAX_NOTIONAL_USD
-            and limit * ACCEPTANCE_MAX_QUANTITY > ACCEPTANCE_MAX_NOTIONAL_USD
-        ):
-            raise AssertionBlocked("test limit violates acceptance notional cap")
-        ctx.artifacts.append(ctx.write_artifact("fa05-quote", {"last": last, "limit": limit}))
+    def gate_delayed_reference(ctx: RunContext) -> None:
+        price, quote_time_ms = _delayed_quote(ctx)
+        limit = derive_acceptance_limit(price)
+        record = _delayed_quote_record(ctx, price, quote_time_ms)
+        record["acceptance_limit"] = limit
+        record["limit_rule"] = (
+            f"delayed_price * {ACCEPTANCE_LIMIT_FRACTION} "
+            f"= {price} * {ACCEPTANCE_LIMIT_FRACTION} = {limit}"
+        )
+        ctx.artifacts.append(ctx.write_artifact("fa05-delayed-quote", record))
 
     def lifecycle(ctx: RunContext) -> None:
         # Re-verify safety gates immediately before any write authority:
-        # broker-reported PAPER plus a deterministically non-marketable
-        # limit. The write-capable service (dry_run=false) starts only
-        # after both proofs succeed. No allowlist/notional/quantity policy
-        # is loosened: AAPL must already be in the production allowlist and
-        # acceptance caps are stricter.
+        # broker-reported PAPER plus a fresh delayed reference. The
+        # write-capable service (dry_run=false) starts only after both
+        # succeed. No allowlist/notional/quantity policy is loosened.
         proof = TigerAccountProof(ctx)
         paper_account = proof.prove_paper()
         ctx.register_secret(str(paper_account))
 
-        last = _quote_last_price(ctx)
-        if last is None:
-            raise AssertionBlocked(
-                "cannot prove non-marketable limit at submission time (no quote)"
-            )
-        limit_price = round(last * 0.5, 2)
-        if limit_price <= 0:
-            raise AssertionBlocked("derived limit price is not positive")
-        if (
-            ACCEPTANCE_MAX_NOTIONAL_USD
-            and limit_price * ACCEPTANCE_MAX_QUANTITY > ACCEPTANCE_MAX_NOTIONAL_USD
-        ):
-            raise AssertionBlocked("test limit violates acceptance notional cap")
+        delayed_price, quote_time_ms = _delayed_quote(ctx)
+        limit_price = derive_acceptance_limit(delayed_price)
+        quote_record = _delayed_quote_record(ctx, delayed_price, quote_time_ms)
+        quote_record["acceptance_limit"] = limit_price
+        quote_record["limit_rule"] = (
+            f"delayed_price * {ACCEPTANCE_LIMIT_FRACTION} "
+            f"= {delayed_price} * {ACCEPTANCE_LIMIT_FRACTION} = {limit_price}"
+        )
+        ctx.register_secret(str(paper_account))
+
         if ACCEPTANCE_SYMBOL not in ctx.settings.symbol_allowlist:
             raise AssertionBlocked(
                 f"acceptance symbol {ACCEPTANCE_SYMBOL} not in production allowlist"
@@ -202,7 +272,7 @@ def build_fa05_pack() -> PackDefinition:
             raise AssertionError_(f"pre-read account orders failed: HTTP {before.status_code}")
         before_ids = {o.get("id") for o in before.json().get("orders", [])}
 
-        # 2. preview through the normal guarded path (non-marketable limit)
+        # 2. preview through the normal guarded path (conservative limit)
         preview_payload = {
             "symbol": ACCEPTANCE_SYMBOL,
             "side": "BUY",
@@ -254,22 +324,32 @@ def build_fa05_pack() -> PackDefinition:
             manager.stop()
             raise AssertionError_(f"broker order {order_id} not found in account orders")
 
-        # 5. cancel it
-        cancel = httpx.post(
-            f"{base}/orders/cancel",
-            headers=headers,
-            json={"order_id": str(order_id)},
-            timeout=30,
+        order_status = str(found[0].get("status", ""))
+        filled_qty = float(found[0].get("filled") or 0)
+        unexpected_fill = order_status in FILLED_STATUSES or (
+            filled_qty > 0 and order_status not in ("CANCELLED", "EXPIRED", "REJECTED")
         )
-        manager.stop()
-        if cancel.status_code != 200:
-            raise AssertionError_(
-                "cancel failed: HTTP "
-                f"{cancel.status_code}: {cancel.text[:500]} — paper order "
-                f"{order_id} state must be checked"
+
+        # 5a. cancel it (normal path) — if not unexpectedly filled
+        if unexpected_fill:
+            cancel_result: dict[str, object] | None = None
+        else:
+            cancel = httpx.post(
+                f"{base}/orders/cancel",
+                headers=headers,
+                json={"order_id": str(order_id)},
+                timeout=30,
             )
-        if cancel.json().get("cancelled") is not True:
-            raise AssertionError_(f"cancel not confirmed: {cancel.json()}")
+            manager.stop()
+            if cancel.status_code != 200:
+                raise AssertionError_(
+                    "cancel failed: HTTP "
+                    f"{cancel.status_code}: {cancel.text[:500]} — paper order "
+                    f"{order_id} state must be checked"
+                )
+            cancel_result = {"cancelled": cancel.json().get("cancelled")}
+            if cancel.json().get("cancelled") is not True:
+                raise AssertionError_(f"cancel not confirmed: {cancel.json()}")
 
         # 6. read back final state
         manager.start()
@@ -290,7 +370,9 @@ def build_fa05_pack() -> PackDefinition:
         cancels = [e for e in audit if e["event_type"] == "cancel"]
         if not any(str(e.get("payload", {}).get("order_id")) == str(order_id) for e in live_subs):
             raise AssertionError_(f"no live_submit audit event for order {order_id}")
-        if not any(str(e.get("payload", {}).get("order_id")) == str(order_id) for e in cancels):
+        if not unexpected_fill and not any(
+            str(e.get("payload", {}).get("order_id")) == str(order_id) for e in cancels
+        ):
             raise AssertionError_(f"no cancel audit event for order {order_id}")
 
         # 8. exactly one intended broker order created by this run
@@ -302,8 +384,35 @@ def build_fa05_pack() -> PackDefinition:
             )
         if order_id not in new_ids:
             raise AssertionError_("reconciled order id not among new orders")
-
-        ctx.artifacts.append(ctx.write_artifact("fa05-lifecycle", {"order_id": str(order_id)}))
+        if unexpected_fill:
+            lifecycle_record: dict[str, object] = {
+                "order_id": str(order_id),
+                "unexpected_paper_fill": True,
+                "order_status": order_status,
+                "filled_quantity": filled_qty,
+                "quote": quote_record,
+                "note": (
+                    "PAPER order filled before cancellation; cancellation path "
+                    "was not exercised this run. Fill belongs to the intended "
+                    "acceptance order and is fully reconciled; exactly one new "
+                    "order was created. Because the account is broker-proven "
+                    "PAPER, this is not a real-money safety event. Residual "
+                    "paper position is surfaced here and NOT flattened "
+                    "automatically: no market order and no live-account "
+                    "interaction; a follow-up acceptance action (guarded paper "
+                    "SELL) would be required to flatten."
+                ),
+            }
+        else:
+            lifecycle_record = {
+                "order_id": str(order_id),
+                "unexpected_paper_fill": False,
+                "order_status": order_status,
+                "cancel": cancel_result,
+                "quote": quote_record,
+                "note": "PAPER order placed and cancelled normally; no fill.",
+            }
+        ctx.artifacts.append(ctx.write_artifact("fa05-lifecycle", lifecycle_record))
 
     return PackDefinition(
         pack_id="FA-05",
@@ -313,13 +422,13 @@ def build_fa05_pack() -> PackDefinition:
             AssertionSpec("gate.acceptance_write_flag", gate_write_flag),
             AssertionSpec("gate.upstream_lineage", gate_upstream_lineage),
             AssertionSpec("gate.broker_paper_proof", gate_paper_proof),
-            AssertionSpec("gate.non_marketable_proof", gate_marketable_limit_proof),
+            AssertionSpec("gate.delayed_reference_limit", gate_delayed_reference),
             AssertionSpec("lifecycle.place_read_cancel_reconcile", lifecycle),
         ],
         safe_summary=(
-            "Tiger paper-account broker lifecycle passed: one small "
-            "non-marketable limit order placed, read back, cancelled, and "
-            "reconciled in audit."
+            "Tiger paper-account broker lifecycle passed: broker-proven PAPER, "
+            "delayed-quote conservative limit, one small limit order placed, "
+            "read back, cancelled (or fill handled), and reconciled in audit."
         ),
     )
 
