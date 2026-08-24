@@ -32,8 +32,11 @@ class TigerGateway:
     def cancel_order(self, order_id: str) -> dict[str, Any] | None:
         if not self.is_configured():
             raise RuntimeError("Tiger credentials are not configured")
+        # tigeropen's cancel_order takes two distinct params: `id` (global order id,
+        # what place_order returns and what we record) and `order_id` (account-specific
+        # id). Passing the global id into `order_id` is rejected by Tiger's API.
         response = self.trade_client.cancel_order(
-            account=self.settings.tiger_account, order_id=order_id
+            account=self.settings.tiger_account, id=int(order_id)
         )
         return normalize(response)
 
