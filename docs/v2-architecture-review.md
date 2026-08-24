@@ -56,6 +56,12 @@ because every stage is idempotent and transactional (§18 of the architecture do
 separate ops/alerting layer. Telegram-based failure notification is a plausible cheap addition later
 (the bot infrastructure already exists) but is explicitly **OPEN**, not required for V1.
 
+> **Superseded in part (Independent adversarial review, 2026-08-24 — see §M):** the claim that
+> "every stage is idempotent and transactional" is false for the execution path — `tradehub/app.py`
+> releases a confirmation token on any upstream exception even when the broker may have accepted the
+> order, and `tradehub/audit.py` re-claims crash-abandoned tokens after 120s with no reconciliation,
+> so a retry can duplicate a live order.
+
 ## D — Security: Compromised Model/Source/Hermes Session Causing an Unintended Trade
 
 **For treating this as a hard, maybe unsolved problem:** LLMs are manipulable by adversarial text
@@ -74,6 +80,14 @@ to type "yes, submit this exact order" — nothing about V2 weakens that.
 code, not detection. Documented as the load-bearing invariant in §15 of the architecture doc and
 carried into the threat-model update as new threats T8–T14, explicitly stated as *not* weakening
 T1–T7.
+
+> **Superseded (Independent adversarial review, 2026-08-24 — see §M):** the invariant was verified
+> against V2's own code but never against the existing MCP surface — `tradehub/mcp_server.py`
+> exposes `submit_order`, §21 wires Hermes to that MCP server, and §14 put raw confirmation tokens
+> into the (evidence-text-exposed) Hermes briefing. A compromised Hermes session can therefore reach
+> `submit_order`. The corrected invariant (committee/execution session separation, opaque token
+> references, out-of-band retrieval, Telegram-only confirmation with re-rendered order, daily
+> aggregate budget) is in architecture doc §15 and threat-model T16.
 
 ## E — Low-Tier Agent Operability (DeepSeek Flash-class routine ops)
 
@@ -104,6 +118,13 @@ that make "using future data" a query bug, not a policy-discipline problem. No e
 **Resolved:** the mitigations in §6/§7/§18 of the architecture doc are sufficient for V1. Revisit
 only if a specific integrity failure is observed in practice.
 
+> **Superseded (Independent adversarial review, 2026-08-24 — see §M):** the mitigations address
+> duplicates and corrections but not timestamp provenance — `public_available_time` had no "unknown"
+> representation, so sources that do not report a publication time silently corrupt the PIT ledger
+> in either direction (lookahead or backfill lag), undetectable by the Epic 6 look-ahead check
+> (which validates the predicate, not the timestamp's truthfulness). Fix: nullable
+> `public_available_time` + mandatory `pat_provenance` enum, folded into architecture §6/§7.
+
 ## G — Quant / Overfitting (baking in today's beliefs)
 
 **For trusting hand-tuned family weights sooner:** the canonical spec's priors (30/30/15/20/5-style)
@@ -119,6 +140,13 @@ their first backtest's winning weights as "the" weights.
 are the concrete mechanisms preventing this. No family-weight change ships without beating an
 equal-weight baseline out of sample, and every version is preserved for comparison, never silently
 replaced.
+
+> **Partially superseded (Independent adversarial review, 2026-08-24 — see §M):** `scoring_version`
+> prevents silent overwriting; it does nothing about multiple testing — with cheap deterministic
+> replayability, the N-th scoring version to beat the same frozen OOS window at p<0.05 is expected,
+> and this section asserted otherwise. Fix: an `oos_evaluation_log` recording every attempt
+> (including failures) per `(scoring_version, oos_window, baseline_set)`, and a second holdout
+> window sealed at Phase 0, unsealed exactly once at the Phase 5 gate.
 
 ## H — Portfolio (giant hidden sector/factor bet)
 
@@ -321,3 +349,65 @@ auto-confirmed" rule; threat-model update is reviewed and confirmed not to weake
 logic to exist yet) but should track Epics 2–5 for tool surface completeness.
 **Non-goals:** any change to `.claude/skills/tiger-tradehub/SKILL.md` (not edited, per the brief) —
 this is a **new**, separate companion skill.
+
+## M — Independent Adversarial Review (2026-08-24)
+
+Model: Claude Opus (no prior context, Read-only tools), orchestrated by Hermes cron, 2026-08-24.
+Every citation was verified against the real `tradehub/*.py` (mcp_server.py, app.py, audit.py,
+policy.py, tiger_gateway.py, config.py, models.py, telegram_bot.py, acceptance/service.py,
+acceptance/packs/fa05.py, tests/test_audit.py) before folding — the review's code claims all
+checked out.
+
+**Verdict: MATERIAL REVISION FIRST.** Attacks A–L all run; A, E, I, J, K yielded nothing material
+— the design is not over-built, the acceptance-runner-shaped ops story genuinely fits a low-tier
+operator, and the vendor-deferral discipline in §8 is correct. The plane split, Hunter contract, PIT
+schema shape, `scoring_version` registry, and backtest write-separation all held. Findings and where
+the fixes landed (architecture doc = `docs/v2-architecture.md`):
+
+1. **BLOCKER (D, A, L)** — A compromised Hermes session can reach `submit_order`
+   (`tradehub/mcp_server.py:66`). §21 wires Hermes to that MCP server, and §14 put the raw
+   confirmation token into the briefing — the context that just ingested adversarial evidence text.
+   The invariant's "does not hold the confirmation token issuance authority" claim is false: preview
+   *is* issuance, and §4/§14 grant the bearer token. → architecture §14 (opaque refs, out-of-band
+   retrieval, `/confirm` re-render), §15 (corrected invariant), §21 (session separation),
+   threat-model T16.
+2. **BLOCKER (C)** — Submit non-idempotency: token released on any upstream exception
+   (`app.py:230`) even when the broker may have accepted; crash-abandoned claims re-claimable after
+   120s (`audit.py` `STALE_CLAIM_SECONDS`, asserted by `tests/test_audit.py:65`); `client_request_id`
+   exists but is never sent to Tiger → a retry after a submit timeout can place a duplicate live
+   order. → architecture §18 + Epic 5 gate: INDETERMINATE token state + reconciliation against
+   `/account/orders` before reuse + broker idempotency key, as an independent core fix.
+3. **BLOCKER (F, G)** — `public_available_time` had no "unknown" state: sources that don't report a
+   publication time silently corrupt the PIT ledger in either direction, and the Epic 6 look-ahead
+   check validates the predicate, not the timestamp's truthfulness. → §6/§7/§16 (`pat_provenance`
+   enum, nullable field, backtest default filter, per-source histogram, `withdrawn` retraction).
+4. **BLOCKER/MATERIAL (D, H)** — `accepted=True` hardcoded (`app.py:167`) regardless of Tiger's
+   preview; `policy.py` side-blind while §13 emits SELLs (TRIM/EXIT); symbol allowlist fails open
+   when empty (`policy.py:14`). → §13 (SELLs restricted to existing paper-account holdings; daily
+   aggregate notional + order-count budget), §15.
+5. **MATERIAL (L)** — "Zero changes to `tradehub/*.py`" falsified: no market-data endpoint exists
+   (only `TradeClient` in the gateway; the only `QuoteClient` is in `acceptance/packs/fa05.py`);
+   the FA-05 PAPER gate lives in the acceptance runner (`acceptance/service.py`,
+   `TRADEHUB_ACCEPTANCE_PAPER_WRITE`), not on the submit path; `.env` sharing would put Tiger
+   credentials in the research process environment (`config.py` `extra="ignore"` fails silently).
+   → §8 prices fork, §19 RA-05 re-implementation, §21 `.env.research`.
+6. **MATERIAL (G)** — Multiple testing: `scoring_version` records versions, not attempts against
+   the same frozen OOS window; cheap replayability makes beating baselines by iteration inevitable.
+   → `oos_evaluation_log` (attempts incl. failures) + sealed holdout window, Phase 5 requirement.
+7. **MATERIAL (F, G)** — Confluence bonus over "distinct families" sharing one XBRL source = one
+   dataset counted three times. → §12 (distinct `source_id`/cluster rule).
+8. **MATERIAL/MINOR** — `?mode=ro` on a WAL DB still needs writable `-wal`/`-shm`; research DBs sat
+   beside the private key in `data/`; `database is locked` (5s busy_timeout) silently drops paid
+   model calls; `audit.py`'s per-call-connection pattern is not a transaction pattern. → §5/§20
+   (snapshot-only backtest input, `data/research/` split), §18 (locked row, one-transaction-per-stage).
+9. **MINOR (D)** — Telegram `/confirm TOKEN` posts the token without restating the order
+   (`telegram_bot.py:79-89`); with V2 generating tokens in bulk, the operator confirms blind. → §14
+   (re-render symbol/side/qty/limit + second affirmation).
+
+Prior resolutions marked superseded above: **C** (idempotency claim false for the execution path),
+**D** (invariant never checked against `mcp_server.py`), **F** (timestamp provenance not
+considered), **G** (version preservation conflated with multiple-testing control). Everything else
+stands. The four must-change items for adoption: (1) committee/execution session separation + no raw
+tokens in committee context; (2) execution-core submit-idempotency fix before Phase 4;
+(3) `pat_provenance` before Phase 0 lands any adapter; (4) daily aggregate budget + allowlist
+fail-open resolution.

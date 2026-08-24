@@ -9,6 +9,11 @@ to `tradehub/*.py`. V2 is a new, additive service that sits above the existing g
 core and consumes it only as an HTTP client, exactly the way the MCP server and Telegram bot do
 today.
 
+> **Folded finding (Independent adversarial review, 2026-08-24):** the "zero changes" claim has two
+> known exceptions that must be read together with this document — the market-data fork in §8 and
+> the FA-05 PAPER-gate re-implementation in §19. Neither changes the order path; both are
+> load-bearing for Phases 1 and 4 and are called out where they occur. Full record: §24.
+
 ## 1. What V2 Is, In One Paragraph
 
 TradeHub V2 is a low-touch US-equity research and guarded-decision system layered above the
@@ -130,8 +135,8 @@ Three distinct data concerns exist, and they should not be conflated:
 | Concern | Volume/shape | Access pattern | Store |
 |---|---|---|---|
 | Execution audit (existing) | small, append-only | low QPS, transactional | `data/tradehub.db` — **untouched** |
-| Research/decision operational state (candidates, assessments, scores, portfolio states, proposals) | low-to-moderate rows, but relational and needs referential integrity | mixed read/write, mostly single-writer batch jobs | new `data/research.db` (SQLite) |
-| PIT evidence ledger + backtest/experiment history | grows to millions of rows over years across thousands of securities | append-mostly writes, range/point-in-time analytical reads for backtesting | same `data/research.db` for the ledger; **on-demand DuckDB** (embedded library, not a server) for analytical/backtest queries, reading a read-only snapshot |
+| Research/decision operational state (candidates, assessments, scores, portfolio states, proposals) | low-to-moderate rows, but relational and needs referential integrity | mixed read/write, mostly single-writer batch jobs | new `data/research/research.db` (SQLite) |
+| PIT evidence ledger + backtest/experiment history | grows to millions of rows over years across thousands of securities | append-mostly writes, range/point-in-time analytical reads for backtesting | same `data/research/research.db` for the ledger; **on-demand DuckDB** (embedded library, not a server) for analytical/backtest queries over immutable snapshots (see §20) |
 
 **Rejected: PostgreSQL for V1.** Postgres is the "textbook correct" choice for a growing
 multi-writer relational workload, and if concurrent write contention becomes real, it is the
@@ -154,6 +159,15 @@ experiment code path**, as an embedded library (no persistent process), reading 
 connection to `research.db` (SQLite URI `?mode=ro`) or periodic immutable Parquet snapshots. This
 gives OLAP-quality analytical performance for walk-forward backtests without adding an operated
 service, and structurally prevents a backtest bug from ever mutating live portfolio state (§18).
+
+Research databases live under `data/research/` — **not** directly in `data/`, which also holds
+`data/tiger_private_key.pk8.pem`; the directory split keeps T14's separate-OS-user recommendation
+viable without resharing the execution user's key directory. Folded finding (2026-08-24): a
+`?mode=ro` connection to a WAL-mode database still requires writable `-wal`/`-shm` sibling files —
+under T14's separate-OS-user deployment it fails to open, and under same-user it is weaker
+isolation than "enforced by the SQLite connection mode" implies. Backtest input is therefore
+**immutable snapshots only** (`VACUUM INTO` copies or Parquet snapshots, §20), never a live
+connection.
 
 **Migration escape hatch (K-Scalability):** the schema (§6) is fully relational and normalized
 enough that a SQLite → Postgres migration, if ever needed, is mechanical (schema translation +
@@ -195,7 +209,7 @@ erDiagram
 | `security_identity_event` | `security_id`, event type (ticker_change, share_class_change, corporate_action, delisting), old/new values | `event_time`, `public_available_time` | Required for PIT replay correctness (§7). |
 | `universe_membership` | `security_id`, price/mcap/ADV at evaluation time, eligibility flags | `valid_from`, `valid_to` | Row per membership interval, not a boolean flag — enables PIT universe reconstruction. |
 | `evidence_source` | `source_id`, source type, hierarchy tier (§3.5 of canonical spec), reliability notes | — | SEC filing, transcript, price feed, Form 4, congressional feed, 13F, etc. |
-| `evidence_event` | `evidence_id`, `security_id`, `source_id`, structured extracted fields (JSON), extraction confidence, `supersedes_evidence_id?`, content hash (dedupe key) | `event_time`, `public_available_time`, `ingested_time` | Append-only. Corrections are new rows linked via `supersedes_evidence_id`, never in-place edits. |
+| `evidence_event` | `evidence_id`, `security_id`, `source_id`, structured extracted fields (JSON), extraction confidence, `supersedes_evidence_id?`, `withdrawn` flag, content hash (dedupe key) | `event_time`, `public_available_time?` (nullable), `pat_provenance` (see §7), `ingested_time` | Append-only. Corrections are new rows linked via `supersedes_evidence_id`, never in-place edits. Retraction (a filed document pulled with no replacement) is also a new row: `supersedes_evidence_id` points at the withdrawn row and the superseding row carries the `withdrawn` flag with empty content — without this, the §12 no-new-evidence rule would hold a score up on evidence that no longer exists. |
 | `evidence_cluster` | `cluster_id`, representative summary, member evidence_ids | `formed_at` | Prevents five articles about one earnings release from being counted as five confirmations. |
 | `strategy_screen_result` | `security_id`, `family` (5 families + momentum/options modifier), `screen_id`, raw features (JSON), evidence_ids, reason_codes, `confidence`, `data_quality`, `passed` | `as_of`, `computed_at` | Output of a Hunter (§9). Deterministic, replayable given the same `as_of` and evidence state. |
 | `candidate` | `candidate_id`, `security_id`, `run_id`, inclusion reason (screened / holding / event-triggered / rejected-control-sample), screen_result_ids | `included_at` | One row per security per pipeline run that reaches the funnel. |
@@ -227,6 +241,20 @@ able to see `event_time <= as_of` data whose `public_available_time` is in the f
 same-day availability that wasn't actually available same-day), and it is enforced by a query
 predicate, not by trusting the caller.
 
+Folded finding (2026-08-24): the predicate is only as good as the field's population rule. Several
+V1 sources (company IR releases, congressional-disclosure feeds, derived XBRL fundamentals) do not
+report a publication timestamp. `public_available_time` is therefore **nullable**, and every
+`evidence_event` carries a mandatory `pat_provenance` enum:
+`source_reported | derived_from_index | observed_at_ingest | unknown`. The backtest engine's default
+filter admits only `source_reported` and `derived_from_index`; anything else must be opted into
+explicitly and appears in the run summary. Ingestion adapters that cannot determine when a fact
+became knowable write `unknown` — never `event_time` (systematic lookahead) or `ingested_time`
+(systematic backfill lag, silently killing signal) — and `unknown` rows are excluded from
+backtests and counted in data quality. A per-source `pat_provenance` histogram is exposed via
+`research_status` (§16) so drift toward `observed_at_ingest` is visible. The Epic 6 look-ahead
+acceptance check validates the predicate; it does not validate the timestamp's truthfulness, which
+is exactly what `pat_provenance` is for.
+
 Corrections and restatements are new `evidence_event` rows with `supersedes_evidence_id` set; the
 original row is never mutated or deleted, so a backtest run "as of" a date before the correction
 still sees exactly what was knowable then.
@@ -242,7 +270,7 @@ No paid vendor is contracted before a specific Hunter needs a specific field.
 | Category | V1 requirement | Source candidate | Note |
 |---|---|---|---|
 | SEC filings (10-K/10-Q/8-K/Form 4) | **Required** | SEC EDGAR full-text + XBRL (free) | Primary-source tier 1 evidence. |
-| Prices/volume | **Required** | Tiger market data (already integrated) or a low-cost price API | Needed for universe floors, momentum modifier, liquidity checks. |
+| Prices/volume | **Required** | **FORK — resolved decision (folded finding 2026-08-24):** the existing core exposes no market-data endpoint (`tradehub/tiger_gateway.py` constructs only a `TradeClient`; the repo's only `QuoteClient` lives inside `tradehub/acceptance/packs/fa05.py`, reachable only by the acceptance CLI). V1 must choose: (a) a non-Tiger price source consumed by `tradehub-research` directly, or (b) an additive, read-only `/market/quote` endpoint on the execution core as its own separately-reviewed epic — which downgrades the "zero changes" claim to "zero changes to the order path". Decide in Phase 1 before the momentum/liquidity Hunter is built. | Needed for universe floors, momentum modifier, liquidity checks. |
 | Fundamentals | **Required** | Derived from XBRL where possible; vendor only if XBRL coverage is insufficient | Defer vendor decision to Phase 1 when Quality/Durability Hunter is built. |
 | Earnings transcripts | **Required** | Company IR releases / EDGAR exhibits first; transcript vendor later if needed | |
 | Analyst estimates/revisions | **Desirable-later** | Vendor decision deferred | Genuinely-difficult-PIT: as-reported historical estimates are expensive; do not buy before Phase 1 Inflection Hunter needs it. |
@@ -250,7 +278,7 @@ No paid vendor is contracted before a specific Hunter needs a specific field.
 | Congressional disclosures | **Desirable, cheap** | Public disclosure datasets (e.g., House/Senate stock-watcher style feeds) | Low weight per canonical spec §15; free sources adequate for V1. |
 | 13F | **Desirable-later** | SEC EDGAR 13F (free) | Slow-confirmation only; simple to ingest from EDGAR directly, no vendor needed. |
 | Corporate actions/events calendar | **Required** | Tiger + EDGAR 8-K | Needed for Event/Catalyst family and identity-event tracking. |
-| Options info | **Optional, V1-deferred** | Tiger quote API (already integrated, delayed-quote pattern reusable) | Sensor only; not required to ship Phase 1. |
+| Options info | **Optional, V1-deferred** | Deferred with the prices fork above (no Tiger quote endpoint exists in the current core) | Sensor only; not required to ship Phase 1. |
 
 Genuinely-difficult PIT fields (flagged, not solved): as-reported historical consensus estimates,
 full historical fundamentals for delisted issuers, and restated financials tracked at the field
@@ -359,6 +387,14 @@ raw_opportunity  = base_evidence + confluence_bonus − penalties
 conviction       = calibrated_display_mapping(raw_opportunity)   # 0–100 display, NOT a probability
 ```
 
+Folded finding (2026-08-24): "distinct families" over shared source data is not distinct evidence —
+in V1, valuation, quality/durability, and inflection screens all derive from SEC XBRL, so distinct
+`family` labels over a shared `source_id` are one dataset counted three times, and the scoring
+function pays a bonus for it (the same error §6's `evidence_cluster` prevents at the event level,
+reintroduced one level up). The confluence bonus must be computed over distinct `source_id`s and
+distinct `evidence_cluster`s (both already modeled in §6): **families sharing a source contribute
+at most one confluence unit.**
+
 Every candidate presented for serious consideration carries four separate numbers — `conviction`,
 `data_quality`, `committee_agreement`, `trajectory` — never collapsed into one. `scoring_version` is
 recorded on every `score_snapshot`; changing the formula or weights requires a new version, and old
@@ -406,6 +442,13 @@ expected, unpenalized output.** Exact caps are intentionally left as configurati
 see OPEN items in the review doc — but the interface requires a concentration/correlation check step
 to exist even before its constants are tuned, so the seam isn't retrofitted later.
 
+Folded finding (2026-08-24): the execution core's policy is side-blind (`tradehub/policy.py` checks
+no SELL constraint), and TRIM/EXIT proposals emit SELLs under the same per-order caps as BUYs. V1
+must therefore (a) restrict SELL proposals to existing holdings in the paper account (no naked-short
+proposals), and (b) enforce a **daily aggregate notional + order-count budget** in the research
+plane, because V2's §10 funnel (40–60 candidates, M/W/F) replaces the human-paced premise under
+which threat-model T7 accepted aggregate-exposure risk — tokens are now generated in bulk.
+
 ## 14. Execution Handoff — the only place V2 touches the execution core, and it touches it as a client
 
 `trade_proposal` (§6) is the complete contract from the brief:
@@ -422,10 +465,18 @@ When a proposal is `action != NONE`, `tradehub-research` (or Hermes acting on it
 proposal's `target_weight`/`order_constraints`, and calls the **existing, unmodified**
 `POST /orders/preview` using `tradehub/client.py`'s existing pattern. The response's
 `confirmation_token` is attached to the proposal (`execution_link`) and surfaced to the human in the
-Hermes briefing. **Submission always requires the same explicit human confirmation the execution
-core already requires today** — V2 adds no new authority to submit, no new confirmation bypass, and
-no direct LLM-to-Tiger path. `requires_human_approval` is effectively always `true` for V1 (§ Phase 5
-in the roadmap is the only place this could ever change, and only after extensive paper evidence).
+Hermes briefing — as an **opaque reference only; the raw token is never rendered into the briefing**
+(folded finding 2026-08-24: the briefing session also ingests untrusted evidence text, and a raw
+token in that context leaves a prompt-injected session one tool call from consumption). The operator
+retrieves the token out-of-band — via the Telegram bot or the research MCP surface — and confirms
+there, from a different device and session than the committee run (§15). **Submission always
+requires the same explicit human confirmation the execution core already requires today** — V2 adds
+no new authority to submit, no new confirmation bypass, and no direct LLM-to-Tiger path.
+`requires_human_approval` is effectively always `true` for V1 (§ Phase 5 in the roadmap is the only
+place this could ever change, and only after extensive paper evidence). Telegram-side (no
+execution-core change): `/confirm` must re-render symbol/side/qty/limit from the stored intent and
+demand a second affirmation before posting the token — today `tradehub/telegram_bot.py`'s
+`/confirm TOKEN` posts the token without restating the order.
 
 This is why the migration story (§21) is simple: **every execution-core file listed in the brief's
 constraints remains untouched.** `tradehub-research` is purely a new HTTP client of the existing API
@@ -442,6 +493,20 @@ core invariant, stated once here because it's load-bearing for the rest of this 
 > credentials, and every path to `/orders/submit` still requires the same human confirmation and the
 > same `policy.py` checks (allowlist, notional cap, quantity cap, market-order rejection, USD-only)
 > that exist today, completely independent of anything the research plane claims.**
+>
+> **Corrected 2026-08-24 by independent adversarial review:** the research plane *can* obtain a
+> confirmation token — preview *is* token issuance, and §4/§14 grant it the bearer token — so the
+> "does not hold the confirmation token issuance authority" claim was false. The invariant holds
+> only under three deployment requirements: (1) the committee session is **never** attached to
+> `tradehub-mcp` (the MCP server that exposes `submit_order` — `tradehub/mcp_server.py`); it
+> attaches only to `tradehub-research-mcp`; (2) raw confirmation tokens never enter any Hermes
+> session context that has touched evidence text — briefings carry only opaque references, tokens
+> are retrieved out-of-band by the operator; (3) the human confirming principal is a different
+> device and session than the committee run. Tiger credentials remain absent from the research
+> plane, and token consumption still passes the same `policy.py` checks as today. A **daily
+> aggregate notional + order-count budget** enforced by the research plane is required because V2
+> replaces the human-paced premise under which threat-model T7 accepted aggregate-exposure risk.
+> See threat-model T16.
 
 New V2-specific threats requiring new controls (detailed in the threat-model update): prompt
 injection via evidence text (filings/news as adversarial instructions), source poisoning skewing
@@ -455,7 +520,11 @@ separation) — see the threat model doc for the full table.
 
 Minimal, read-oriented, mirroring the brief's list:
 
-- `research_status` — pipeline health, last run per stage, data freshness.
+- `research_status` — pipeline health, last run per stage, data freshness, per-source
+  PAT-provenance histogram (§7), and explicit `STALE` / `UNAVAILABLE` markers. Folded finding
+  (2026-08-24): a failed nightly ingestion must not be indistinguishable from a normal no-trade day
+  — a system whose valid output is often "no candidates" must lead every briefing with freshness,
+  and "cannot reach research service" must be rendered as an error, never as an empty list.
 - `list_candidates` — current bounded candidate pool with screen summaries.
 - `get_security_thesis` — full evidence/claims/score history for one security.
 - `list_portfolio_states` — current states across the universe.
@@ -498,10 +567,10 @@ runner already established for the execution core.
 | Conflicting sources | Routed to red team/arbiter (§11); no state transition until resolved or explicitly timed out to `ESCALATE`-equivalent (no proposal generated). |
 | One model unavailable | Committee run for that candidate marked incomplete; **no proposal is generated from a partial committee** — never silently fall back to a one-analyst decision. |
 | Malformed structured output | Rejected at the validation boundary (§11 step 3); logged, not auto-repaired or guessed. |
-| DB unavailable | Pipeline stage aborts inside its transaction; no partial writes (mirrors `tradehub/audit.py`'s connect/commit pattern). |
+| DB unavailable / locked | Pipeline stage aborts inside its transaction; one pipeline stage = one transaction for its whole unit of work. Folded finding (2026-08-24): do **not** mirror `tradehub/audit.py`'s connect/commit pattern — it opens one connection per public method (a `create_confirmation` + `record_event` pair is two commits), which reproduces the very partial-write behavior this row denies. Under SQLite's 5s `busy_timeout`, an EDGAR bulk ingest overlapping a Hermes assessment POST fails with `database is locked` — classify and retry with backoff, and surface it; a silently discarded paid model call is a cost leak. |
 | Tiger unavailable | Unchanged — existing execution-core 502 handling applies; V2 never bypasses it. |
 | Scoring-version mismatch | Snapshots from different versions are never compared directly; each is interpreted under its own recorded version. |
-| Partial/interrupted job | All pipeline stages are idempotent and safe to rerun (dedupe via evidence content-hash / unique source keys); no manual DB surgery required. |
+| Partial/interrupted job | Deterministic research stages (ingest, screen, score) are idempotent and safe to rerun (dedupe via evidence content-hash / unique source keys); no manual DB surgery required. Folded finding (2026-08-24): the execution-handoff path is **not** idempotent — `tradehub/app.py` releases a confirmation token on *any* upstream exception even when the broker may already have accepted the order, and `tradehub/audit.py` makes a crash-abandoned claim re-claimable after 120s with no reconciliation; `OrderIntent.client_request_id` exists but is never sent to Tiger, so there is no broker-side dedupe. A retry after a submit timeout can therefore place a duplicate live order. Phase 4 (Epic 5) must be gated on a fix to the execution core — INDETERMINATE token state + reconciliation against `/account/orders` before any reuse + `client_request_id` threaded to Tiger — reviewed as an independent core change, since "zero changes to `tradehub/*.py`" protects Release 1 from V2 work, not from its own safety fixes. |
 | Duplicate event ingestion | Unique constraint on `(source_id, content_hash)`; second insert is a no-op, not an error. |
 | Model/provider drift | Tracked in `model_track_record`; surfaced diagnostically, never auto-adjusts live weights (§17 of canonical spec — learning is later-stage and tightly governed). |
 
@@ -522,13 +591,24 @@ already proven for the execution core (`tradehub/acceptance/`) extends naturally
 Concretely proposed in the epics (§22 / Epic 7): an `RA-00` qualification pack for the research
 runner itself, and per-phase packs as each phase lands.
 
+**Corrected 2026-08-24 (independent adversarial review):** the FA-05 gate does **not** extend
+unchanged. It lives in the acceptance runner (`tradehub/acceptance/service.py` — broker-reported
+`account_type == "PAPER"`, gated by `TRADEHUB_ACCEPTANCE_PAPER_WRITE`) and is not invoked by
+`/orders/preview` or `/orders/submit`; the only account-safety control on the live path is the
+process-level `TRADEHUB_DRY_RUN` env flag. The new `RA-05`-equivalent pack must therefore
+**re-implement** the PAPER proof on the research plane's own preview path — it must not assume the
+execution core's acceptance lineage carried over.
+
 ## 20. Backtest / Research Separation
 
 `experiment_run`/`backtest_run` (§6) is the only entity a backtest writes to. Structural
-enforcement, not just convention: the backtest engine opens `research.db` **read-only**
-(`?mode=ro`) for input and writes exclusively to a separate `experiment.db`. A backtest bug
-therefore cannot mutate `portfolio_state` or `trade_proposal` even if it tries — this is enforced by
-the SQLite connection mode, not by code review discipline alone.
+enforcement, not just convention: the backtest engine reads **immutable snapshots only** —
+`VACUUM INTO` copies or periodic Parquet snapshots of `research.db` (§5) — and writes exclusively to
+`data/research/experiment.db`. Folded finding (2026-08-24): a `?mode=ro` connection to a WAL-mode
+database still requires writable `-wal`/`-shm` sibling files, so under T14's separate-OS-user
+deployment it fails to open, and under same-user it is weaker than "enforced by the connection
+mode" implies. Snapshot input makes the read-only guarantee structural regardless of deployment; a
+backtest bug cannot mutate `portfolio_state` or `trade_proposal` even if it tries.
 
 Required before any backtest result is trusted (canonical spec §17, unchanged): PIT universe/data
 only, publication-time controls, delisted-security handling, realistic slippage/fees, walk-forward
@@ -549,8 +629,8 @@ flowchart TB
         end
         subgraph P2["tradehub-research — new"]
             APP2[FastAPI :8788 loopback]
-            DB2[(data/research.db)]
-            DB3[(data/experiment.db, backtest-only)]
+            DB2[(data/research/research.db)]
+            DB3[(data/research/experiment.db, backtest-only)]
         end
         MCP1[tradehub-mcp]
         MCP2[tradehub-research-mcp]
@@ -578,8 +658,12 @@ survives restart, MCP reconnects, repeatable upgrade/rollback) apply symmetrical
 
 **Migration plan — V2 introduced without destabilizing R1:**
 
-1. `tradehub-research` is a new package, new process, new port, new DB file, new systemd unit. Zero
-   lines change in `tradehub/*.py`, `tests/`, `pyproject.toml`, or `.env`.
+1. `tradehub-research` is a new package, new process, new port, new DB file, new systemd unit, and a
+   new environment file `.env.research` holding only its own two bearer tokens (the research API
+   token + the execution-core `TRADEHUB_API_TOKEN`). Zero lines change in `tradehub/*.py`, `tests/`,
+   `pyproject.toml`, or `.env` — folded finding (2026-08-24): `tradehub/config.py` is
+   `extra="ignore"`, so an accidentally-shared `.env` fails silently and permissively, and the
+   execution `.env` also contains `TIGEROPEN_PRIVATE_KEY`; the research process must never inherit it.
 2. It is developed and deployed independently; the execution core's FA-00..FA-05 lineage and green
    test suite are never touched by V2 work.
 3. Rollback is trivial by construction: stop the `tradehub-research` systemd unit. The execution core
@@ -588,6 +672,13 @@ survives restart, MCP reconnects, repeatable upgrade/rollback) apply symmetrical
    from a second authenticated client — already a supported pattern (any bearer-token holder can
    preview), and previewing has no side effect beyond issuing a confirmation token that still
    requires human action to consume.
+
+**Deployment requirements (folded finding 2026-08-24):** the Hermes committee session and the
+execution surface must be different principals — committee sessions attach `tradehub-research-mcp`
+only, never `tradehub-mcp` (which exposes `submit_order`); raw confirmation tokens are never placed
+in committee-session context (out-of-band retrieval via Telegram, §14); research DBs live under
+`data/research/` so T14's separate-OS-user split does not reshare the directory holding
+`data/tiger_private_key.pk8.pem`.
 
 ## 22. Phased Implementation Plan
 
@@ -636,3 +727,23 @@ for Phase N to be useful and correct.
 
 See `docs/v2-architecture-review.md` for the orthogonal hostile review this plan was checked
 against, and the closing summary in that document for the titled epic list Hermes should file.
+
+## 24. Independent Adversarial Review (2026-08-24) — Folded Findings
+
+An independent adversarial architecture review (Claude Opus, no prior context, Read-only tools)
+attacked A–L plus the loaded invariants ("zero changes", "preview-only", "SQLite sufficient",
+"Hermes-driven committee", "no submit path"), verified every claim against `tradehub/*.py`, and
+returned verdict **MATERIAL REVISION FIRST** — the plane split, Hunter contract, PIT schema shape,
+`scoring_version` registry, and backtest write-separation all held; the fixes below are what
+changed. Full record: `docs/v2-architecture-review.md` §M.
+
+| # | Severity | Finding | Fix landed |
+|---|----------|---------|------------|
+| 1 | BLOCKER | A compromised Hermes session can reach `submit_order` — `tradehub/mcp_server.py` exposes it, and §21 wires Hermes to that MCP server while §14 put raw tokens in the briefing. The invariant "does not hold confirmation token issuance authority" was false: preview *is* issuance, and §4/§14 grant the research plane the bearer token. | §14 (opaque token refs, out-of-band retrieval, `/confirm` re-render), §15 (corrected invariant), §21 (session separation), threat-model T16. |
+| 2 | BLOCKER | Submit non-idempotency: token released on any upstream exception (`app.py`) + stale-claim reuse after 120s (`audit.py`) ⇒ duplicate live order on retry; `client_request_id` never sent to Tiger. | §18 (Partial/interrupted job row — execution path is not idempotent), §19 (RA-05 gate), Epic 5 gate: independent core fix (INDETERMINATE state + reconciliation + idempotency key). |
+| 3 | BLOCKER | `public_available_time` had no "unknown" state; the Epic 6 look-ahead check validates the predicate, not the timestamp's truthfulness — years of silently wrong PIT evidence. | §6 (nullable + `pat_provenance` + `withdrawn`), §7 (default filter), §16 (histogram + freshness surfacing). |
+| 4 | BLOCKER/MATERIAL | `accepted=True` hardcoded regardless of Tiger preview; `policy.py` side-blind while §13 emits SELLs; symbol allowlist fails open when empty. | §13 (paper-account-only SELLs, daily aggregate budget), §15 (same), §8. |
+| 5 | MATERIAL | "Zero changes to `tradehub/*.py`" falsified: no market-data endpoint exists (only `TradeClient` in the gateway; `QuoteClient` only in the acceptance pack); FA-05 PAPER gate is not on the submit path; `.env` sharing would put Tiger credentials in the research process environment. | §8 (prices fork resolved), §19 (RA-05 re-implements the gate), §21 (`.env.research`), §5/§21 (DBs under `data/research/`). |
+| 6 | MATERIAL | Multiple testing: `scoring_version` records versions, not attempts against the same frozen OOS window — cheap replayability makes beating baselines by iteration inevitable. | §12/§20 note; review-record §G superseded; `oos_evaluation_log` (attempts incl. failures) required at Phase 5. |
+| 7 | MATERIAL | Confluence bonus over "distinct families" sharing one XBRL source = one dataset counted three times. | §12 (distinct `source_id`/cluster rule). |
+| 8 | MATERIAL/MINOR | `?mode=ro` on WAL DB needs writable `-wal`/`-shm`; DB files beside the private key; `database is locked` drops paid model calls; audit.py per-call-connection pattern is not a transaction pattern. | §5/§20 (snapshot-only backtest input), §5 (directory split), §18 (locked row + one-transaction-per-stage). |
