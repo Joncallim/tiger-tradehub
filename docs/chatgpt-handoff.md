@@ -21,25 +21,20 @@ CORE FUNCTIONAL ACCEPTANCE NOT YET PASSED — one blocker on FA-05.
 
 Current deployed commit: `3f844ee` (main, pushed). Lineage state in `data/acceptance/state.json`.
 
-## FA-05 status (2026-08-23, updated per program decision)
+## FA-05 status (PASS 2026-08-24, core acceptance complete)
 
-**US L1 real-time quotes are NOT required for functional acceptance.** The pack now uses Tiger's freely available **delayed** US quote (`get_stock_delay_briefs`) solely to choose a deterministic conservative paper-test limit (`delayed_price * 0.50`). The delayed quote is explicitly labelled DELAYED and never treated as current executable market data.
+**CORE FUNCTIONAL ACCEPTANCE PASSED.** FA-05 uses Tiger's freely available **delayed** US quote (`get_stock_delay_briefs`) to derive a deterministic conservative paper-test limit (`delayed_price * 0.50`, shrunk by the runner-owned notional-cap rule when needed). The delayed quote is explicitly labelled DELAYED and never treated as current executable market data. Real-time US L1 is NOT required.
 
-Useful permission reference (kept for diagnosis only):
-- `aStockQuoteLv1` = **China A-share L1** (unrelated to US quotes; it is the only permission this account currently holds)
-- `usQuoteBasic` / `usStockQuote` = US real-time entitlements — **OPTIONAL**, not required for current functional acceptance. Do not purchase/enable these merely to complete FA-05.
+Verified FA-05 run: broker-reported `accountType=PAPER` (via `get_managed_accounts`) → delayed quote 309.35 → limit 80.00 (fraction shrunk to fit $100 cap) → one paper order placed (BUY 1 AAPL @ 80.00), read back (HELD), cancelled (`cancelled=true`), final CANCELLED filled=0, audit reconciled, exactly one new order, no fill, no duplicates.
 
-FA-05 verified status so far: `gate.acceptance_write_flag` PASS, `gate.upstream_lineage` PASS, `gate.broker_paper_proof` PASS (broker-reported `accountType=PAPER` via `get_managed_accounts`; $1,000,000 paper balance). The `gate.delayed_reference_limit` and lifecycle now run against delayed quotes.
+Permission reference (kept for diagnosis only):
+- `aStockQuoteLv1` = **China A-share L1** (unrelated to US quotes; the only permission this account holds)
+- `usQuoteBasic` / `usStockQuote` = US real-time entitlements — **OPTIONAL**, not required for acceptance. Do not purchase merely for acceptance.
 
-Run/rerun:
+Rerun anytime:
 ```bash
 env TRADEHUB_ACCEPTANCE_PAPER_WRITE=true .venv/bin/tradehub-acceptance run FA-05 --json
 ```
-Expected: gates PASS → lifecycle places ONE tiny conservative limit BUY (AAPL, qty 1, limit = delayed_price × 0.50), reads it back, cancels it (or handles an unexpected PAPER fill explicitly), reconciles audit, proves exactly one order.
-
-If the delayed quote fetch is ever denied (code 4000 US-market), that indicates the device/account lacks even delayed US quote access (unusual — delayed quotes are free); investigate device-access contention first (one reusable `QuoteClient`, `grab_quote_permission()` transfers access and does not purchase permission). Real-time L1 remains optional.
-
-**Do not place any broker order until FA-05 independently proves PAPER account + usable delayed reference + conservative limit.**
 
 ## How to operate the acceptance runner
 
