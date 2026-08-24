@@ -278,7 +278,7 @@ def test_stolen_submit_lease_fences_old_worker_and_only_new_worker_finalizes(tmp
     assert row[2] is not None
 
 
-def test_stolen_submitting_without_order_stays_submitting_for_later_reconciliation(tmp_path):
+def test_stolen_submitting_without_order_stays_indeterminate_for_resolution(tmp_path):
     db_path = tmp_path / "tradehub.db"
     store = AuditStore(db_path)
     token, _ = store.create_confirmation(intent(), None, ttl_seconds=300)
@@ -294,11 +294,33 @@ def test_stolen_submitting_without_order_stays_submitting_for_later_reconciliati
     assert source_state == CONFIRMATION_STATE_SUBMITTING
     store.preserve_stolen_submission(token, reconcile_lease)
 
-    assert store.get_submission_state(token) == CONFIRMATION_STATE_SUBMITTING
+    assert store.get_submission_state(token) == CONFIRMATION_STATE_INDETERMINATE
     with pytest.raises(ValueError, match="indeterminate"):
         store.claim_confirmation(token)
-    with pytest.raises(ValueError, match="indeterminate"):
-        store.claim_reconciliation_confirmation(token)
+
+
+def test_reconciliation_reclaims_preserve_original_submitting_lineage(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    store = AuditStore(db_path)
+    token, _ = store.create_confirmation(intent(), None, ttl_seconds=300)
+    *_, submit_lease = store.claim_confirmation(token)
+    store.mark_submission_in_progress(token, "reserved-42", submit_lease)
+
+    def expire_claim():
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE confirmations SET claimed_at = ? WHERE token = ?",
+                ((utc_now() - timedelta(seconds=STALE_CLAIM_SECONDS + 1)).isoformat(), token),
+            )
+
+    expire_claim()
+    *_, first_reconcile_lease, first_source_state = store.claim_reconciliation_confirmation(token)
+    expire_claim()
+    *_, second_reconcile_lease, second_source_state = store.claim_reconciliation_confirmation(token)
+
+    assert first_reconcile_lease != second_reconcile_lease
+    assert first_source_state == CONFIRMATION_STATE_SUBMITTING
+    assert second_source_state == CONFIRMATION_STATE_SUBMITTING
 
 
 def test_manual_resolution_supports_verified_submission_and_no_submission(tmp_path):

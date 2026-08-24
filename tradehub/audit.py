@@ -389,7 +389,9 @@ class AuditStore:
                 """
                 UPDATE confirmations
                 SET submission_state = ?, claimed_at = ?, submit_lease_id = NULL,
-                    reconcile_lease_id = ?, reconcile_source_state = submission_state
+                    reconcile_lease_id = ?, reconcile_source_state =
+                        CASE WHEN submission_state = ? THEN reconcile_source_state
+                             ELSE submission_state END
                 WHERE token = ?
                 AND submitted_at IS NULL
                 AND (
@@ -404,6 +406,7 @@ class AuditStore:
                     CONFIRMATION_STATE_RECONCILING,
                     now.isoformat(),
                     lease_id,
+                    CONFIRMATION_STATE_RECONCILING,
                     token,
                     CONFIRMATION_STATE_INDETERMINATE,
                     CONFIRMATION_STATE_SUBMITTING,
@@ -544,7 +547,7 @@ class AuditStore:
                   AND submission_state = ? AND reconcile_lease_id = ?
                 """,
                 (
-                    CONFIRMATION_STATE_SUBMITTING,
+                    CONFIRMATION_STATE_INDETERMINATE,
                     token,
                     CONFIRMATION_STATE_RECONCILING,
                     reconcile_lease_id,
