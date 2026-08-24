@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -192,10 +193,20 @@ def test_ra00_is_deterministic_pass_with_required_shape():
 
 def test_package_has_no_tradehub_imports():
     root = os.path.dirname(os.path.dirname(__file__))
-    result = subprocess.run(
-        ["rg", r"(?:from|import) tradehub(?:\.|\s|$)", "tradehub_research"],
-        cwd=root,
-        capture_output=True,
-        check=False,
-    )
-    assert result.returncode == 1, result.stdout.decode()
+    package = os.path.join(root, "tradehub_research")
+    pattern = re.compile(r"(?:from|import) tradehub(?:\.|\s|$)")
+    assert pattern.search("import tradehub_research") is None
+
+    matches = []
+    for directory, subdirectories, filenames in os.walk(package):
+        subdirectories[:] = [name for name in subdirectories if name != "__pycache__"]
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = os.path.join(directory, filename)
+            with open(path, encoding="utf-8") as source:
+                for line_number, line in enumerate(source, start=1):
+                    if pattern.search(line):
+                        matches.append(f"{path}:{line_number}:{line.rstrip()}")
+
+    assert not matches, "\n".join(matches)
