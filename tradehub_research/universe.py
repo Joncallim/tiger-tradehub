@@ -125,7 +125,7 @@ class UniverseMembershipStore:
 
 
 class SecurityIdentityStore:
-    """Authoritative identity history; columns on security are convenience state only."""
+    """Authoritative identity history; baseline/ticker_change share one supersession domain."""
 
     def __init__(self, database: ResearchDB):
         self.database = database
@@ -164,7 +164,7 @@ class SecurityIdentityStore:
         with self.database.connect() as db:
             if supersedes_id is not None:
                 predecessor = db.execute(
-                    "SELECT security_id,public_available_time "
+                    "SELECT security_id,event_type,public_available_time "
                     "FROM security_identity_event WHERE id=?",
                     (supersedes_id,),
                 ).fetchone()
@@ -172,6 +172,12 @@ class SecurityIdentityStore:
                     raise ValueError("superseded identity event does not exist")
                 if predecessor["security_id"] != security_id:
                     raise ValueError("identity supersession requires the same security")
+                ticker_domain = {"baseline", "ticker_change"}
+                predecessor_type = predecessor["event_type"]
+                if predecessor_type != event_type and not (
+                    predecessor_type in ticker_domain and event_type in ticker_domain
+                ):
+                    raise ValueError("identity supersession requires a compatible event domain")
                 if public_available_time is None or (
                     predecessor["public_available_time"] is not None
                     and public_available_time < predecessor["public_available_time"]
@@ -193,11 +199,13 @@ class SecurityIdentityStore:
                 """WITH RECURSIVE visible_chain(root_id,descendant_id) AS (
                     SELECT candidate.id,candidate.id FROM security_identity_event candidate
                     WHERE candidate.public_available_time IS NOT NULL
+                      AND candidate.event_type IN ('baseline','ticker_change')
                       AND candidate.public_available_time <= ?
                       AND candidate.event_time <= ?
                       AND NOT EXISTS (
                         SELECT 1 FROM security_identity_event predecessor
                         WHERE predecessor.id=candidate.supersedes_id
+                          AND predecessor.event_type IN ('baseline','ticker_change')
                           AND predecessor.public_available_time IS NOT NULL
                           AND predecessor.public_available_time <= ?
                           AND predecessor.event_time <= ?)
@@ -205,6 +213,7 @@ class SecurityIdentityStore:
                     SELECT chain.root_id,successor.id FROM visible_chain chain
                     JOIN security_identity_event successor
                       ON successor.supersedes_id=chain.descendant_id
+                     AND successor.event_type IN ('baseline','ticker_change')
                     WHERE successor.public_available_time IS NOT NULL
                       AND successor.public_available_time <= ?
                       AND successor.event_time <= ?
@@ -214,6 +223,7 @@ class SecurityIdentityStore:
                         SELECT 1 FROM visible_chain child
                         JOIN security_identity_event item ON item.id=child.descendant_id
                         WHERE child.root_id=chain.root_id
+                          AND item.event_type IN ('baseline','ticker_change')
                           AND item.supersedes_id=chain.descendant_id)
                 )
                 SELECT identity.new_value FROM security_identity_event identity
