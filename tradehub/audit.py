@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from collections.abc import Iterator
@@ -11,7 +12,18 @@ from typing import Any
 
 from tradehub.models import OrderIntent
 
+logger = logging.getLogger(__name__)
+
 STALE_CLAIM_SECONDS = 120
+CONFIRMATION_STATE_READY = "READY"
+CONFIRMATION_STATE_SUBMITTING = "SUBMITTING"
+CONFIRMATION_STATE_INDETERMINATE = "INDETERMINATE"
+CONFIRMATION_STATE_RECONCILING = "RECONCILING"
+CONFIRMATION_STATE_SUBMITTED = "SUBMITTED"
+
+
+def _coalesce_state(value: str | None) -> str:
+    return value or CONFIRMATION_STATE_READY
 
 
 class AuditStore:
@@ -44,11 +56,56 @@ class AuditStore:
                     expires_at TEXT NOT NULL,
                     claimed_at TEXT,
                     submitted_at TEXT,
-                    order_id TEXT
+                    order_id TEXT,
+                    submission_state TEXT,
+                    reserved_order_id TEXT,
+                    submit_lease_id TEXT,
+                    reconcile_lease_id TEXT,
+                    reconcile_source_state TEXT
                 )
                 """
             )
             self._add_column_if_missing(db, "confirmations", "claimed_at", "TEXT")
+            self._add_column_if_missing(db, "confirmations", "submission_state", "TEXT")
+            self._add_column_if_missing(db, "confirmations", "reserved_order_id", "TEXT")
+            self._add_column_if_missing(db, "confirmations", "submit_lease_id", "TEXT")
+            self._add_column_if_missing(db, "confirmations", "reconcile_lease_id", "TEXT")
+            self._add_column_if_missing(db, "confirmations", "reconcile_source_state", "TEXT")
+            indeterminate_backfilled = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?
+                WHERE submitted_at IS NULL
+                  AND submission_state IS NULL
+                  AND claimed_at IS NOT NULL
+                """,
+                (CONFIRMATION_STATE_INDETERMINATE,),
+            ).rowcount
+            ready_backfilled = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?
+                WHERE submitted_at IS NULL
+                  AND submission_state IS NULL
+                  AND claimed_at IS NULL
+                """,
+                (CONFIRMATION_STATE_READY,),
+            ).rowcount
+            submitted_backfilled = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?
+                WHERE submitted_at IS NOT NULL AND submission_state IS NULL
+                """,
+                (CONFIRMATION_STATE_SUBMITTED,),
+            ).rowcount
+            if ready_backfilled or indeterminate_backfilled or submitted_backfilled:
+                logger.info(
+                    "migrated confirmation states: %d ready, %d indeterminate, %d submitted",
+                    ready_backfilled,
+                    indeterminate_backfilled,
+                    submitted_backfilled,
+                )
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_events (
@@ -86,9 +143,9 @@ class AuditStore:
             db.execute(
                 """
                 INSERT INTO confirmations(
-                    token, intent_json, tiger_preview_json, created_at, expires_at
+                    token, intent_json, tiger_preview_json, created_at, expires_at, submission_state
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token,
@@ -96,6 +153,7 @@ class AuditStore:
                     json.dumps(tiger_preview, default=str) if tiger_preview else None,
                     utc_now().isoformat(),
                     expires_at.isoformat(),
+                    CONFIRMATION_STATE_READY,
                 ),
             )
         self.record_event(
@@ -104,23 +162,48 @@ class AuditStore:
         )
         return token, expires_at
 
-    def consume_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None]:
+    def consume_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None, str]:
         return self.claim_confirmation(token)
 
-    def claim_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None]:
+    def get_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None, str | None]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM confirmations WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown confirmation token")
+            preview = json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
+            return (
+                OrderIntent.model_validate_json(row["intent_json"]),
+                preview,
+                row["reserved_order_id"],
+            )
+
+    def claim_confirmation(self, token: str) -> tuple[OrderIntent, dict[str, Any] | None, str]:
         now = utc_now()
         stale_before = now - timedelta(seconds=STALE_CLAIM_SECONDS)
+        submit_lease_id = secrets.token_hex(16)
         with self.connect() as db:
             cursor = db.execute(
                 """
                 UPDATE confirmations
-                SET claimed_at = ?
+                SET claimed_at = ?, submit_lease_id = ?
                 WHERE token = ?
                   AND submitted_at IS NULL
+                  AND COALESCE(submission_state, ?) = ?
                   AND (claimed_at IS NULL OR claimed_at < ?)
                   AND expires_at >= ?
                 """,
-                (now.isoformat(), token, stale_before.isoformat(), now.isoformat()),
+                (
+                    now.isoformat(),
+                    submit_lease_id,
+                    token,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_READY,
+                    stale_before.isoformat(),
+                    now.isoformat(),
+                ),
             )
             row = db.execute(
                 "SELECT * FROM confirmations WHERE token = ?",
@@ -132,42 +215,356 @@ class AuditStore:
                 preview = (
                     json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
                 )
-                return OrderIntent.model_validate_json(row["intent_json"]), preview
+                return OrderIntent.model_validate_json(row["intent_json"]), preview, submit_lease_id
+            state = _coalesce_state(row["submission_state"])
             if row["submitted_at"]:
                 raise ValueError("confirmation token has already been submitted")
+            if state in {
+                CONFIRMATION_STATE_INDETERMINATE,
+                CONFIRMATION_STATE_SUBMITTING,
+                CONFIRMATION_STATE_RECONCILING,
+            }:
+                raise ValueError(
+                    "confirmation token is in indeterminate state and must be reconciled"
+                )
             if row["claimed_at"]:
                 raise ValueError("confirmation token is already being submitted")
             if datetime.fromisoformat(row["expires_at"]) < now:
                 raise ValueError("confirmation token has expired")
             raise ValueError("confirmation token could not be claimed")
 
-    def finalize_confirmation(self, token: str, order_id: str | None = None) -> None:
+    def finalize_confirmation(
+        self,
+        token: str,
+        order_id: str | None = None,
+        submit_lease_id: str | None = None,
+        reconcile_lease_id: str | None = None,
+    ) -> None:
         with self.connect() as db:
             cursor = db.execute(
                 """
                 UPDATE confirmations
-                SET submitted_at = ?, claimed_at = NULL, order_id = ?
-                WHERE token = ? AND claimed_at IS NOT NULL AND submitted_at IS NULL
+                SET
+                    submitted_at = ?,
+                    claimed_at = NULL,
+                    submission_state = ?,
+                    order_id = ?,
+                    submit_lease_id = NULL,
+                    reconcile_lease_id = NULL,
+                    reconcile_source_state = NULL
+                WHERE token = ?
+                  AND submitted_at IS NULL
+                  AND claimed_at IS NOT NULL
+                  AND (
+                    (? IS NOT NULL AND reconcile_lease_id IS NULL
+                     AND submit_lease_id = ?
+                     AND COALESCE(submission_state, ?) IN (?, ?, ?))
+                    OR
+                    (? IS NOT NULL AND submission_state = ? AND reconcile_lease_id = ?)
+                  )
                 """,
-                (utc_now().isoformat(), order_id, token),
+                (
+                    utc_now().isoformat(),
+                    CONFIRMATION_STATE_SUBMITTED,
+                    order_id,
+                    token,
+                    submit_lease_id,
+                    submit_lease_id,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_SUBMITTING,
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    reconcile_lease_id,
+                    CONFIRMATION_STATE_RECONCILING,
+                    reconcile_lease_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("confirmation token is not claimed")
 
-    def release_confirmation(self, token: str) -> None:
+    def release_confirmation(self, token: str, submit_lease_id: str) -> None:
         with self.connect() as db:
-            db.execute(
+            cursor = db.execute(
                 """
                 UPDATE confirmations
-                SET claimed_at = NULL
+                SET claimed_at = NULL, submit_lease_id = NULL
                 WHERE token = ? AND submitted_at IS NULL
+                  AND COALESCE(submission_state, ?) = ?
+                  AND submit_lease_id = ?
                 """,
-                (token,),
+                (token, CONFIRMATION_STATE_READY, CONFIRMATION_STATE_READY, submit_lease_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("submit lease is no longer current")
 
     def mark_order_id(self, token: str, order_id: str | None) -> None:
         with self.connect() as db:
             db.execute("UPDATE confirmations SET order_id = ? WHERE token = ?", (order_id, token))
+
+    def mark_submission_in_progress(
+        self, token: str, reserved_order_id: str | None, submit_lease_id: str
+    ) -> None:
+        if reserved_order_id is None:
+            raise ValueError("reserved order id is required to start submission")
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET
+                    submission_state = ?,
+                    reserved_order_id = COALESCE(reserved_order_id, ?),
+                    claimed_at = COALESCE(claimed_at, ?)
+                WHERE token = ? AND submitted_at IS NULL
+                AND COALESCE(submission_state, ?) = ?
+                AND submit_lease_id = ?
+                """,
+                (
+                    CONFIRMATION_STATE_SUBMITTING,
+                    reserved_order_id,
+                    utc_now().isoformat(),
+                    token,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_READY,
+                    submit_lease_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("confirmation token is not in a submittable state")
+
+    def record_reserved_order_id(
+        self, token: str, order_id: str | None, submit_lease_id: str
+    ) -> None:
+        if order_id is None:
+            return
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET reserved_order_id = COALESCE(reserved_order_id, ?)
+                WHERE token = ? AND submitted_at IS NULL AND submit_lease_id = ?
+                """,
+                (order_id, token, submit_lease_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("submit lease is no longer current")
+
+    def mark_submission_indeterminate(
+        self, token: str, submit_lease_id: str, reserved_order_id: str | None = None
+    ) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET
+                    submission_state = ?,
+                    reserved_order_id = COALESCE(reserved_order_id, ?),
+                    claimed_at = COALESCE(claimed_at, ?)
+                WHERE token = ? AND submitted_at IS NULL
+                  AND COALESCE(submission_state, ?) IN (?, ?, ?)
+                  AND submit_lease_id = ?
+                """,
+                (
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    reserved_order_id,
+                    utc_now().isoformat(),
+                    token,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_READY,
+                    CONFIRMATION_STATE_SUBMITTING,
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    submit_lease_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("confirmation token is not claimed")
+
+    def claim_reconciliation_confirmation(
+        self, token: str
+    ) -> tuple[OrderIntent, dict[str, Any] | None, str | None, str, str]:
+        now = utc_now()
+        stale_before = now - timedelta(seconds=STALE_CLAIM_SECONDS)
+        lease_id = secrets.token_hex(16)
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?, claimed_at = ?, submit_lease_id = NULL,
+                    reconcile_lease_id = ?, reconcile_source_state =
+                        CASE WHEN submission_state = ? THEN reconcile_source_state
+                             ELSE submission_state END
+                WHERE token = ?
+                AND submitted_at IS NULL
+                AND (
+                    submission_state = ?
+                    OR (
+                        submission_state IN (?, ?)
+                        AND (claimed_at IS NULL OR claimed_at < ?)
+                    )
+                )
+                """,
+                (
+                    CONFIRMATION_STATE_RECONCILING,
+                    now.isoformat(),
+                    lease_id,
+                    CONFIRMATION_STATE_RECONCILING,
+                    token,
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    CONFIRMATION_STATE_SUBMITTING,
+                    CONFIRMATION_STATE_RECONCILING,
+                    stale_before.isoformat(),
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM confirmations WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown confirmation token")
+            if row["submitted_at"]:
+                raise ValueError("confirmation token has already been submitted")
+            if cursor.rowcount == 1:
+                prior_state = _coalesce_state(row["reconcile_source_state"])
+                preview = (
+                    json.loads(row["tiger_preview_json"]) if row["tiger_preview_json"] else None
+                )
+                return (
+                    OrderIntent.model_validate_json(row["intent_json"]),
+                    preview,
+                    row["reserved_order_id"],
+                    lease_id,
+                    prior_state,
+                )
+            state = _coalesce_state(row["submission_state"])
+            if state == CONFIRMATION_STATE_RECONCILING and row["claimed_at"]:
+                raise ValueError("confirmation token is already being reconciled")
+            if state in {CONFIRMATION_STATE_INDETERMINATE, CONFIRMATION_STATE_SUBMITTING}:
+                raise ValueError(
+                    "confirmation token is in indeterminate state and must be reconciled"
+                )
+            if row["claimed_at"]:
+                raise ValueError("confirmation token is already being reconciled")
+            raise ValueError("confirmation token is not in reconciliation-required state")
+
+    def load_indeterminate_confirmation(
+        self, token: str
+    ) -> tuple[OrderIntent, dict[str, Any] | None, str | None, str, str]:
+        return self.claim_reconciliation_confirmation(token)
+
+    def resolve_indeterminate_confirmation(
+        self,
+        token: str,
+        resolver: str,
+        global_order_id: str | None = None,
+        no_submission_occurred: bool = False,
+    ) -> str:
+        if (global_order_id is None) == (not no_submission_occurred):
+            raise ValueError("provide exactly one resolution outcome")
+        target_state = CONFIRMATION_STATE_SUBMITTED if global_order_id else CONFIRMATION_STATE_READY
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?, submitted_at = ?, order_id = ?, claimed_at = NULL,
+                    submit_lease_id = NULL, reconcile_lease_id = NULL,
+                    reconcile_source_state = NULL
+                WHERE token = ? AND submitted_at IS NULL AND submission_state = ?
+                """,
+                (
+                    target_state,
+                    now if global_order_id else None,
+                    global_order_id,
+                    token,
+                    CONFIRMATION_STATE_INDETERMINATE,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("confirmation token is not awaiting manual resolution")
+        self.record_event(
+            "submit_manual_resolution",
+            {
+                "confirmation_token": token,
+                "resolver": resolver,
+                "outcome": "submitted" if global_order_id else "no_submission_occurred",
+                "order_id": global_order_id,
+            },
+        )
+        return target_state
+
+    def mark_submission_ready_for_retry(self, token: str, reconcile_lease_id: str) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET claimed_at = NULL, submission_state = ?, reconcile_lease_id = NULL,
+                    reconcile_source_state = NULL
+                WHERE token = ? AND submitted_at IS NULL
+                AND submission_state = ? AND reconcile_lease_id = ?
+                """,
+                (
+                    CONFIRMATION_STATE_READY,
+                    token,
+                    CONFIRMATION_STATE_RECONCILING,
+                    reconcile_lease_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("confirmation token is not in reconciliation-required state")
+
+    # Backward-compatible helper retained for existing imports/tests. Retry/reconcile now
+    # goes through claim_reconciliation_confirmation for atomic transitions.
+    def mark_reconciliation_retry_allowed(self, token: str, reconcile_lease_id: str) -> None:
+        self.mark_submission_ready_for_retry(token, reconcile_lease_id)
+
+    def abandon_reconciliation(self, token: str, reconcile_lease_id: str) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?, reconcile_lease_id = NULL,
+                    reconcile_source_state = NULL
+                WHERE token = ? AND submitted_at IS NULL
+                  AND submission_state = ? AND reconcile_lease_id = ?
+                """,
+                (
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    token,
+                    CONFIRMATION_STATE_RECONCILING,
+                    reconcile_lease_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("reconciliation lease is no longer current")
+
+    def preserve_stolen_submission(self, token: str, reconcile_lease_id: str) -> None:
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE confirmations
+                SET submission_state = ?, reconcile_lease_id = NULL,
+                    reconcile_source_state = NULL
+                WHERE token = ? AND submitted_at IS NULL
+                  AND submission_state = ? AND reconcile_lease_id = ?
+                """,
+                (
+                    CONFIRMATION_STATE_INDETERMINATE,
+                    token,
+                    CONFIRMATION_STATE_RECONCILING,
+                    reconcile_lease_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("reconciliation lease is no longer current")
+
+    def get_submission_state(self, token: str) -> str | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT submission_state FROM confirmations WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown confirmation token")
+            return row["submission_state"]
 
 
 def utc_now() -> datetime:

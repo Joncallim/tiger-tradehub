@@ -88,6 +88,26 @@ def main() -> None:
             return
         await update.message.reply_text(format_response(response), parse_mode="HTML")
 
+    async def reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await reject_if_needed(update):
+            return
+        try:
+            if len(context.args) != 1:
+                raise ValueError("Usage: /reconcile TOKEN")
+            response = await client.post(
+                "/orders/submit/reconcile",
+                {"confirmation_token": context.args[0]},
+            )
+            status = response.get("status")
+            order_id = response.get("order_id") or "N/A"
+            status_text = (
+                f"reconcile: {status}\norder_id: {order_id}" if status else "reconcile: complete"
+            )
+            await update.message.reply_text(status_text, parse_mode="HTML")
+        except Exception as exc:
+            await update.message.reply_text(f"Reconcile failed: {exc}")
+            return
+
     async def assets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await reject_if_needed(update):
             return
@@ -118,6 +138,7 @@ def main() -> None:
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("sell", sell))
     app.add_handler(CommandHandler("confirm", confirm))
+    app.add_handler(CommandHandler("reconcile", reconcile))
     app.add_handler(CommandHandler("assets", assets))
     app.add_handler(CommandHandler("positions", positions))
     app.add_handler(CommandHandler("orders", orders))
