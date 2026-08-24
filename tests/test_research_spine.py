@@ -31,7 +31,7 @@ def test_schema_and_migration_are_idempotent(tmp_path):
     assert database.migrate() == PHASE_0_SCHEMA_VERSION
     assert database.check()["ok"]
     with database.connect(read_only=True) as db:
-        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 3
 
 
 def test_settings_use_only_research_prefix(monkeypatch, tmp_path):
@@ -158,6 +158,74 @@ def test_universe_knowledge_gate_corrections_and_identity_events(tmp_path):
     assert identities.ticker_at("s1", "2025-03-01") == "NEW"
 
 
+def test_universe_rejects_backdated_and_forked_corrections(tmp_path):
+    database = initialized(tmp_path)
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s1", "ONE", "NYSE", "One", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s2", "TWO", "NYSE", "Two", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+    memberships = UniverseMembershipStore(database)
+    args = dict(
+        security_id="s1",
+        valid_from="2020-01-01",
+        pat_provenance="source_reported",
+        price_eligible=True,
+        market_cap_eligible=True,
+        liquidity_eligible=True,
+        eligible=True,
+    )
+    original = memberships.insert(knowledge_time="2025-02-01", **args)
+    with pytest.raises(ValueError, match="cannot backdate"):
+        memberships.insert(knowledge_time="2020-01-01", supersedes_id=original, **args)
+    correction = memberships.insert(knowledge_time="2025-03-01", supersedes_id=original, **args)
+    assert [row["id"] for row in memberships.pit_valid("s1", "2025-02-15")] == [original]
+    assert [row["id"] for row in memberships.pit_valid("s1", "2025-03-01")] == [correction]
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        memberships.insert(knowledge_time="2025-04-01", supersedes_id=original, **args)
+    with pytest.raises(ValueError, match="same security"):
+        memberships.insert(
+            **{**args, "security_id": "s2"},
+            knowledge_time="2025-04-01",
+            supersedes_id=correction,
+        )
+    with database.connect() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="cannot backdate"):
+            db.execute(
+                """INSERT INTO universe_membership(
+                security_id,price_eligible,market_cap_eligible,liquidity_eligible,eligible,
+                valid_from,knowledge_time,pat_provenance,supersedes_id
+                ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                ("s1", 1, 1, 1, 1, "2020-01-01", "2024-01-01", "source_reported", correction),
+            )
+
+
+def test_universe_historical_provenance_gate(tmp_path):
+    database = initialized(tmp_path)
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s1", "ONE", "NYSE", "One", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+    memberships = UniverseMembershipStore(database)
+    membership = memberships.insert(
+        security_id="s1",
+        valid_from="2020-01-01",
+        knowledge_time="2020-01-01",
+        pat_provenance="unknown",
+        price_eligible=True,
+        market_cap_eligible=True,
+        liquidity_eligible=True,
+        eligible=True,
+    )
+    assert memberships.pit_valid("s1", "2020-01-02") == []
+    assert [row["id"] for row in memberships.current("s1")] == [membership]
+
+
 def test_experiment_reruns_and_attempts_append(tmp_path):
     database = initialized(tmp_path)
     registry = ExperimentRegistry(database)
@@ -264,6 +332,19 @@ def test_snapshot_rejects_live_path_overwrite_and_failed_publication(tmp_path, m
         assert db.execute("SELECT COUNT(*) FROM snapshot_version").fetchone()[0] == 0
 
 
+def test_snapshot_handle_rejects_replaced_file(tmp_path):
+    first = initialized(tmp_path / "first")
+    second = initialized(tmp_path / "second")
+    first_path = tmp_path / "first.db"
+    replacement_path = tmp_path / "replacement.db"
+    create_snapshot(first, first_path)
+    handle = open_snapshot_read_only(first_path)
+    create_snapshot(second, replacement_path)
+    os.replace(replacement_path, first_path)
+    with pytest.raises(sqlite3.DatabaseError, match="identity does not match"):
+        handle.connection()
+
+
 def test_cli_init_and_check(tmp_path):
     path = tmp_path / "cli.db"
     init = subprocess.run(
@@ -288,6 +369,32 @@ def test_ra00_is_deterministic_pass_with_required_shape():
     assert result.status == Status.PASS
     assert {"run_id", "status", "assertions", "commit_sha"} <= payload.keys()
     assert all(a["status"] in {s.value for s in Status} for a in payload["assertions"])
+
+
+def test_installed_ra00_command_runs_outside_repository(tmp_path):
+    executable = os.path.join(sys.prefix, "bin", "tradehub-research-acceptance")
+    result = subprocess.run(
+        [executable, "RA-00"], cwd=tmp_path, text=True, capture_output=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "PASS"
+    assert payload["commit_sha"] != "unavailable"
+    assert [(item["id"], item["status"]) for item in payload["assertions"]] == [
+        (assertion_id, "PASS")
+        for assertion_id in (
+            "schema.version",
+            "db.fresh_init",
+            "config.research_only",
+            "pit.fixture_timing",
+            "pat.unknown_behavior",
+            "evidence.append_only_supersession",
+            "evidence.idempotent_ingestion",
+            "pit.identity_membership",
+            "pit.retraction",
+            "cli.init",
+        )
+    ]
 
 
 def test_package_has_no_tradehub_imports():

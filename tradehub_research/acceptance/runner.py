@@ -13,8 +13,13 @@ from tradehub_research.acceptance.schema import AssertionResult, RunResult, Stat
 
 
 def commit_sha() -> str:
+    repository_root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], text=True, capture_output=True, check=False
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository_root,
+        text=True,
+        capture_output=True,
+        check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else "unavailable"
 
@@ -51,6 +56,7 @@ def run_pack(pack_id: str) -> RunResult:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run RA-00, e.g. ``tradehub-research-acceptance RA-00`` from any directory."""
     parser = argparse.ArgumentParser()
     parser.add_argument("pack", nargs="?", default="RA-00")
     args = parser.parse_args(argv)

@@ -174,6 +174,21 @@ def identity_membership(tmp: Path) -> None:
     assert not memberships.pit_valid("sec", "2020-02-01")
     assert len(memberships.pit_valid("sec", "2025-02-01")) == 1
     assert not memberships.pit_valid("sec", "2025-05-01")
+    memberships.insert(
+        security_id="sec",
+        price=None,
+        market_cap=None,
+        avg_dollar_volume=None,
+        price_eligible=False,
+        market_cap_eligible=False,
+        liquidity_eligible=False,
+        eligible=False,
+        valid_from="2025-05-01",
+        knowledge_time="2025-05-01",
+        pat_provenance="unknown",
+    )
+    assert not memberships.pit_valid("sec", "2025-06-01")
+    assert memberships.current("sec")[0]["pat_provenance"] == "unknown"
 
 
 def retraction(tmp: Path) -> None:

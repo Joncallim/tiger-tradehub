@@ -33,6 +33,20 @@ class UniverseMembershipStore:
         valid_to = normalize_ts(valid_to) if valid_to is not None else None
         knowledge_time = normalize_ts(knowledge_time)
         with self.database.connect() as db:
+            if supersedes_id is not None:
+                predecessor = db.execute(
+                    "SELECT security_id,knowledge_time FROM universe_membership WHERE id=?",
+                    (supersedes_id,),
+                ).fetchone()
+                if predecessor is None:
+                    raise ValueError("superseded membership does not exist")
+                if predecessor["security_id"] != security_id:
+                    raise ValueError("membership supersession requires the same security")
+                if (
+                    predecessor["knowledge_time"] is not None
+                    and knowledge_time < predecessor["knowledge_time"]
+                ):
+                    raise ValueError("membership supersession cannot backdate knowledge time")
             cursor = db.execute(
                 """INSERT INTO universe_membership(
                     security_id,price,market_cap,avg_dollar_volume,price_eligible,
@@ -66,12 +80,31 @@ class UniverseMembershipStore:
                     WHERE membership.security_id=? AND membership.valid_from <= ?
                       AND (membership.valid_to IS NULL OR membership.valid_to > ?)
                       AND membership.knowledge_time <= ?
+                      AND membership.pat_provenance IN (
+                        'source_reported','derived_from_index')
                       AND NOT EXISTS (
                         SELECT 1 FROM universe_membership correction
                         WHERE correction.supersedes_id=membership.id
-                          AND correction.knowledge_time <= ?)
+                          AND correction.knowledge_time <= ?
+                          AND correction.pat_provenance IN (
+                            'source_reported','derived_from_index'))
                     ORDER BY membership.knowledge_time, membership.id""",
                     (security_id, as_of, as_of, as_of, as_of),
+                )
+            )
+
+    def current(self, security_id: str) -> list[sqlite3.Row]:
+        """Return current-research facts, including historically unapproved provenance."""
+        with self.database.connect(read_only=True) as db:
+            return list(
+                db.execute(
+                    """SELECT membership.* FROM universe_membership membership
+                    WHERE membership.security_id=? AND membership.valid_to IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM universe_membership correction
+                        WHERE correction.supersedes_id=membership.id)
+                    ORDER BY membership.knowledge_time, membership.id""",
+                    (security_id,),
                 )
             )
 
