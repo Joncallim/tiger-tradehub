@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -65,7 +66,7 @@ def test_form4_raw_xml_and_amendment_supersession(tmp_path):
     assert row.structured_fields["acquired_disposed"] == "A"
     assert row.structured_fields["direct_indirect"] == "D"
     assert row.structured_fields["amendment"] is True
-    assert row.envelope.supersedes_source_record_id.startswith("0000001001-25-000001:tx:")
+    assert row.envelope.supersedes_source_record_id is None
     assert row.structured_fields["shares"] == 100
     assert row.structured_fields["price_per_share"] == 12.5
     assert row.structured_fields["owner_id"] == "2001"
@@ -115,22 +116,22 @@ def test_tiingo_raw_bars_actions_pat_and_adjusted_audit_only(tmp_path):
 def test_network_timeout_retry_after_and_cache(tmp_path):
     calls, sleeps = [], []
 
-    class Fake:
-        def get(self, url, **kwargs):
-            calls.append(kwargs)
-            if len(calls) == 1:
-                return httpx.Response(
-                    429, headers={"Retry-After": "2"}, request=httpx.Request("GET", url)
-                )
-            return httpx.Response(200, content=b"ok", request=httpx.Request("GET", url))
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "2"})
+        return httpx.Response(200, content=b"ok")
 
     client = NetworkClient(
-        user_agent="descriptive", cache_dir=tmp_path, transport=Fake(), sleep=sleeps.append
+        user_agent="descriptive",
+        cache_dir=tmp_path,
+        transport=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=sleeps.append,
     )
     result = client.fetch("https://example.test/data")
     assert result.cache_path.read_bytes() == b"ok" and sleeps == [2.0]
-    timeout = calls[0]["timeout"]
-    assert timeout.connect == 10 and timeout.read == 30
+    assert calls[0].extensions["timeout"]["connect"] == 10
+    assert calls[0].extensions["timeout"]["read"] == 30
 
 
 def test_token_bucket_and_tiingo_reserve():
@@ -228,21 +229,121 @@ def test_form4_parser_to_hunter_can_pass(tmp_path):
     assert informed_activity.evaluate(ctx, "S").passed
 
 
+def test_form4_amendment_reorder_change_remove_and_add_ingests(tmp_path):
+    def filing(document_type, transactions):
+        rows = "".join(
+            f"""
+            <nonDerivativeTransaction>
+              <securityTitle><value>{title}</value></securityTitle>
+              <transactionDate><value>{day}</value></transactionDate>
+              <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+              <transactionAmounts>
+                <transactionShares><value>{shares}</value></transactionShares>
+                <transactionPricePerShare><value>{price}</value></transactionPricePerShare>
+                <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+              </transactionAmounts>
+              <ownershipNature><directOrIndirectOwnership><value>D</value></directOrIndirectOwnership></ownershipNature>
+            </nonDerivativeTransaction>
+            """
+            for title, day, shares, price in transactions
+        )
+        return f"""
+        <ownershipDocument>
+          <documentType>{document_type}</documentType>
+          <periodOfReport>2025-01-04</periodOfReport>
+          <issuer><issuerCik>1001</issuerCik><issuerTradingSymbol>EXM</issuerTradingSymbol></issuer>
+          <reportingOwner>
+            <reportingOwnerId><rptOwnerCik>2001</rptOwnerCik></reportingOwnerId>
+            <reportingOwnerRelationship><isDirector>1</isDirector></reportingOwnerRelationship>
+          </reportingOwner>
+          <nonDerivativeTable>{rows}</nonDerivativeTable>
+        </ownershipDocument>
+        """.encode()
+
+    database = ResearchDB(tmp_path / "research.db")
+    database.init()
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s1", "EXM", "NYSE", "Example", None, None, "SUPPORTED", "2025-01-01", None),
+        )
+    adapter = sec(tmp_path)
+    original_transactions = [
+        ("Reordered", "2025-01-01", 10, 1),
+        ("Changed", "2025-01-02", 20, 2),
+        ("Removed", "2025-01-03", 30, 3),
+    ]
+    original = adapter.with_security(
+        adapter.parse_form4(
+            filing("4", original_transactions),
+            fetched("sec_form4.xml"),
+            accession="original",
+            filed="2025-01-04",
+        ),
+        "s1",
+    )
+    original_keys = {row.envelope.source_record_id.rsplit(":tx:", 1)[1] for row in original}
+    amendment = adapter.with_security(
+        adapter.parse_form4(
+            filing(
+                "4/A",
+                [
+                    ("Changed", "2025-01-02", 200, 2.5),
+                    ("Added", "2025-01-04", 40, 4),
+                    ("Reordered", "2025-01-01", 10, 1),
+                ],
+            ),
+            fetched("sec_form4.xml"),
+            accession="amendment",
+            filed="2025-01-05",
+            supersedes_accession="original",
+            supersedes_transaction_keys=original_keys,
+        ),
+        "s1",
+    )
+
+    store = EvidenceStore(database)
+    ingest_records(original, store)
+    ingest_records(amendment, store)
+
+    transaction_rows = [row for row in amendment if not row.envelope.withdrawn]
+    assert len(transaction_rows) == 3
+    superseding = [
+        row for row in transaction_rows if row.envelope.supersedes_source_record_id is not None
+    ]
+    assert len(superseding) == 2
+    added = next(
+        row for row in transaction_rows if row.structured_fields["security_title"] == "Added"
+    )
+    assert added.envelope.supersedes_source_record_id is None
+    withdrawals = [row for row in amendment if row.envelope.withdrawn]
+    assert len(withdrawals) == 1
+    assert withdrawals[0].envelope.supersedes_source_record_id.startswith("original:tx:")
+    current = [json.loads(row["structured_fields"]) for row in store.current("s1")]
+    assert {row["security_title"] for row in current} == {
+        "Reordered",
+        "Changed",
+        "Added",
+    }
+    changed = next(row for row in current if row["security_title"] == "Changed")
+    assert changed["shares"] == 200
+    assert changed["price_per_share"] == 2.5
+
+
 def test_tiingo_quota_retries_persist_and_bootstrap_boundary(tmp_path):
     calls = []
 
-    class Fake:
-        def get(self, url, **kwargs):
-            calls.append(url)
-            status = 500 if len(calls) < 3 else 200
-            return httpx.Response(status, content=b"[]", request=httpx.Request("GET", url))
+    def handler(request):
+        calls.append(str(request.url))
+        status = 500 if len(calls) < 3 else 200
+        return httpx.Response(status, content=b"[]")
 
     adapter = TiingoEodAdapter(
         token="x",
         license_confirmed=True,
         user_agent="ua",
         cache_dir=tmp_path,
-        transport=Fake(),
+        transport=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep=lambda _x: None,
     )
     adapter.fetch_prices("AAA", "2025-01-01", "2025-01-02")
@@ -256,26 +357,49 @@ def test_tiingo_quota_retries_persist_and_bootstrap_boundary(tmp_path):
 
 
 def test_network_response_byte_ceiling_declared_and_chunked(tmp_path):
-    class Fake:
-        def __init__(self, response):
-            self.response = response
+    class GuardedStream(httpx.SyncByteStream):
+        def __init__(self, chunks):
+            self.chunks = chunks
+            self.consumed = 0
+            self.closed = False
 
-        def get(self, *_args, **_kwargs):
-            return self.response
+        def __iter__(self):
+            for chunk in self.chunks:
+                self.consumed += 1
+                if self.consumed > 3:
+                    raise AssertionError("response was consumed beyond the byte ceiling")
+                yield chunk
 
-    request = httpx.Request("GET", "https://example.test")
-    declared = httpx.Response(
-        200, headers={"Content-Length": "9"}, content=b"123456789", request=request
+        def close(self):
+            self.closed = True
+
+    declared_stream = GuardedStream([b"must not be read"])
+    declared_transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200, headers={"Content-Length": "9"}, stream=declared_stream
+        )
     )
     with pytest.raises(ValueError, match="byte ceiling"):
         NetworkClient(
-            user_agent="ua", cache_dir=tmp_path, transport=Fake(declared), max_response_bytes=8
-        ).fetch(str(request.url))
-    chunked = httpx.Response(200, content=b"123456789", request=request)
+            user_agent="ua",
+            cache_dir=tmp_path,
+            transport=httpx.Client(transport=declared_transport),
+            max_response_bytes=8,
+        ).fetch("https://example.test")
+    assert declared_stream.consumed == 0 and declared_stream.closed
+
+    chunked_stream = GuardedStream([b"1234", b"5678", b"9", b"must not be read"])
+    chunked_transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, stream=chunked_stream)
+    )
     with pytest.raises(ValueError, match="byte ceiling"):
         NetworkClient(
-            user_agent="ua", cache_dir=tmp_path, transport=Fake(chunked), max_response_bytes=8
-        ).fetch(str(request.url))
+            user_agent="ua",
+            cache_dir=tmp_path,
+            transport=httpx.Client(transport=chunked_transport),
+            max_response_bytes=8,
+        ).fetch("https://example.test")
+    assert chunked_stream.consumed == 3 and chunked_stream.closed
     assert not [
         p for p in tmp_path.rglob("*") if p.is_file() and p.name != "tiingo-operational.sqlite"
     ]

@@ -70,7 +70,9 @@ class ParsedRecord:
 
 
 class HttpTransport(Protocol):
-    def get(self, url: str, **kwargs: Any) -> httpx.Response: ...
+    def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request: ...
+
+    def send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response: ...
 
 
 class TokenBucket:
@@ -133,9 +135,10 @@ class NetworkClient:
             if self.bucket:
                 self.bucket.acquire()
             try:
-                response = self.transport.get(
-                    url, headers=request_headers, timeout=httpx.Timeout(30, connect=10)
+                request = self.transport.build_request(
+                    "GET", url, headers=request_headers, timeout=httpx.Timeout(30, connect=10)
                 )
+                response = self.transport.send(request, stream=True)
             except (httpx.TimeoutException, httpx.TransportError):
                 if attempt == self.max_attempts - 1:
                     raise
@@ -144,26 +147,33 @@ class NetworkClient:
             if response.status_code not in {403, 429} and response.status_code < 500:
                 break
             if attempt == self.max_attempts - 1:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                finally:
+                    response.close()
             retry_after = response.headers.get("Retry-After")
             delay = (
                 min(60.0, float(retry_after))
                 if retry_after and retry_after.isdigit()
                 else min(60.0, self.random_value() * (2**attempt))
             )
+            response.close()
             self.sleep(delay)
         assert response is not None
-        response.raise_for_status()
-        declared = response.headers.get("Content-Length")
-        if declared and int(declared) > self.max_response_bytes:
-            raise ValueError("provider response exceeds configured byte ceiling")
-        chunks: list[bytes] = []
-        size = 0
-        for chunk in response.iter_bytes():
-            size += len(chunk)
-            if size > self.max_response_bytes:
+        try:
+            response.raise_for_status()
+            declared = response.headers.get("Content-Length")
+            if declared and int(declared) > self.max_response_bytes:
                 raise ValueError("provider response exceeds configured byte ceiling")
-            chunks.append(chunk)
+            chunks: list[bytes] = []
+            size = 0
+            for chunk in response.iter_bytes():
+                size += len(chunk)
+                if size > self.max_response_bytes:
+                    raise ValueError("provider response exceeds configured byte ceiling")
+                chunks.append(chunk)
+        finally:
+            response.close()
         raw = b"".join(chunks)
         digest = hashlib.sha256(raw).hexdigest()
         path = self.cache_dir / digest[:2] / digest

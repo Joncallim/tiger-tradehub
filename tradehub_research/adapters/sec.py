@@ -397,7 +397,11 @@ class SecAdapter(NetworkClient):
                 )
                 source_id = f"{accession}:tx:{transaction_key}"
                 predecessor = None
-                if supersedes_accession:
+                if (
+                    supersedes_accession
+                    and supersedes_transaction_keys
+                    and transaction_key in supersedes_transaction_keys
+                ):
                     predecessor = f"{supersedes_accession}:tx:{transaction_key}"
                 envelope = envelope_from_fetch(
                     metadata,
