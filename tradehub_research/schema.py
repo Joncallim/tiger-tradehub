@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PHASE_0_SCHEMA_VERSION = 5
+PHASE_0_SCHEMA_VERSION = 7
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -350,6 +350,148 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
                     AND NEW.public_available_time < p.public_available_time
             ) THEN RAISE(ABORT, 'identity supersession cannot backdate knowledge time') END;
         END;
+        """,
+    ),
+    (
+        6,
+        "Phase 1 screening operational ledger",
+        """
+        CREATE TABLE screen_definition (
+            config_hash TEXT PRIMARY KEY,
+            family TEXT NOT NULL CHECK (family IN (
+                'valuation','inflection','quality','informed_activity','event',
+                'momentum_confirmation'
+            )),
+            screen_id TEXT NOT NULL,
+            screen_version INTEGER NOT NULL CHECK (screen_version > 0),
+            spec_json TEXT NOT NULL CHECK (json_valid(spec_json)),
+            created_at TEXT NOT NULL,
+            UNIQUE (family, screen_id, screen_version)
+        );
+
+        CREATE TABLE pipeline_run (
+            run_id TEXT PRIMARY KEY,
+            as_of TEXT NOT NULL,
+            universe_hash TEXT NOT NULL,
+            screen_manifest_json TEXT NOT NULL CHECK (json_valid(screen_manifest_json)),
+            screen_manifest_hash TEXT NOT NULL,
+            funnel_config_json TEXT NOT NULL CHECK (json_valid(funnel_config_json)),
+            funnel_config_hash TEXT NOT NULL,
+            input_snapshot_id TEXT REFERENCES snapshot_version(snapshot_id),
+            input_view_hash TEXT NOT NULL,
+            expected_security_count INTEGER NOT NULL CHECK (expected_security_count >= 0),
+            status TEXT NOT NULL CHECK (status IN ('RUNNING','COMPLETE','FAILED')),
+            failure_json TEXT CHECK (failure_json IS NULL OR json_valid(failure_json)),
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            CHECK ((status='RUNNING' AND finished_at IS NULL) OR
+                   (status IN ('COMPLETE','FAILED') AND finished_at IS NOT NULL))
+        );
+
+        CREATE TABLE screen_result (
+            screen_result_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES pipeline_run(run_id),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            config_hash TEXT NOT NULL REFERENCES screen_definition(config_hash),
+            raw_features_json TEXT NOT NULL CHECK (json_valid(raw_features_json)),
+            evidence_ids_json TEXT NOT NULL CHECK (json_valid(evidence_ids_json)),
+            reason_codes_json TEXT NOT NULL CHECK (json_valid(reason_codes_json)),
+            sufficient_data INTEGER NOT NULL CHECK (sufficient_data IN (0,1)),
+            passed INTEGER NOT NULL CHECK (passed IN (0,1)),
+            confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+            data_quality REAL NOT NULL CHECK (data_quality BETWEEN 0 AND 1),
+            result_hash TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            CHECK (passed=0 OR sufficient_data=1),
+            UNIQUE (run_id, security_id, config_hash)
+        );
+
+        CREATE TABLE candidate (
+            candidate_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES pipeline_run(run_id),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+            inclusion_reasons_json TEXT NOT NULL CHECK (json_valid(inclusion_reasons_json)),
+            screen_result_ids_json TEXT NOT NULL CHECK (json_valid(screen_result_ids_json)),
+            rank_telemetry_json TEXT NOT NULL CHECK (json_valid(rank_telemetry_json)),
+            is_control INTEGER NOT NULL CHECK (is_control IN (0,1)),
+            control_algorithm TEXT,
+            control_key TEXT,
+            control_rank INTEGER CHECK (control_rank IS NULL OR control_rank > 0),
+            included_at TEXT NOT NULL,
+            UNIQUE (run_id, security_id),
+            UNIQUE (run_id, ordinal),
+            CHECK ((is_control=1 AND control_algorithm IS NOT NULL AND control_key IS NOT NULL
+                    AND control_rank IS NOT NULL) OR
+                   (is_control=0 AND control_algorithm IS NULL AND control_key IS NULL
+                    AND control_rank IS NULL))
+        );
+
+        CREATE INDEX pipeline_run_status_idx ON pipeline_run(status, as_of);
+        CREATE INDEX screen_result_population_idx
+            ON screen_result(run_id, config_hash, sufficient_data, passed, security_id);
+        CREATE INDEX screen_result_security_idx ON screen_result(security_id, run_id);
+        CREATE INDEX candidate_run_idx ON candidate(run_id, ordinal);
+        CREATE INDEX evidence_kind_pit_idx ON evidence_event(
+            security_id, json_extract(structured_fields,'$.record_type'), public_available_time
+        );
+        CREATE INDEX evidence_form4_pit_idx ON evidence_event(
+            security_id, json_extract(structured_fields,'$.transaction_code'),
+            public_available_time
+        ) WHERE json_extract(structured_fields,'$.record_type')='form4_transaction';
+
+        CREATE TRIGGER pipeline_run_immutable_inputs BEFORE UPDATE ON pipeline_run
+        WHEN OLD.run_id IS NOT NEW.run_id
+          OR OLD.as_of IS NOT NEW.as_of
+          OR OLD.universe_hash IS NOT NEW.universe_hash
+          OR OLD.screen_manifest_json IS NOT NEW.screen_manifest_json
+          OR OLD.screen_manifest_hash IS NOT NEW.screen_manifest_hash
+          OR OLD.funnel_config_json IS NOT NEW.funnel_config_json
+          OR OLD.funnel_config_hash IS NOT NEW.funnel_config_hash
+          OR OLD.input_snapshot_id IS NOT NEW.input_snapshot_id
+          OR OLD.input_view_hash IS NOT NEW.input_view_hash
+          OR OLD.expected_security_count IS NOT NEW.expected_security_count
+        BEGIN SELECT RAISE(ABORT, 'pipeline_run logical inputs are immutable'); END;
+
+        CREATE TRIGGER screen_result_run_complete BEFORE INSERT ON screen_result
+        WHEN (SELECT status FROM pipeline_run WHERE run_id=NEW.run_id)='COMPLETE'
+        BEGIN SELECT RAISE(ABORT, 'completed pipeline_run is immutable'); END;
+        CREATE TRIGGER candidate_run_complete BEFORE INSERT ON candidate
+        WHEN (SELECT status FROM pipeline_run WHERE run_id=NEW.run_id)='COMPLETE'
+        BEGIN SELECT RAISE(ABORT, 'completed pipeline_run is immutable'); END;
+        CREATE TRIGGER screen_result_no_update BEFORE UPDATE ON screen_result BEGIN
+            SELECT RAISE(ABORT, 'screen_result is append-only'); END;
+        CREATE TRIGGER screen_result_no_delete BEFORE DELETE ON screen_result BEGIN
+            SELECT RAISE(ABORT, 'screen_result is append-only'); END;
+        CREATE TRIGGER candidate_no_update BEFORE UPDATE ON candidate BEGIN
+            SELECT RAISE(ABORT, 'candidate is append-only'); END;
+        CREATE TRIGGER candidate_no_delete BEFORE DELETE ON candidate BEGIN
+            SELECT RAISE(ABORT, 'candidate is append-only'); END;
+        """,
+    ),
+    (
+        7,
+        "Phase 1 reviewed recovery flags and provider operational limits",
+        """
+        DROP TRIGGER candidate_run_complete;
+        ALTER TABLE pipeline_run ADD COLUMN flags_json TEXT
+            CHECK (flags_json IS NULL OR json_valid(flags_json));
+        CREATE TABLE provider_request_event (
+            provider TEXT NOT NULL,
+            requested_at REAL NOT NULL
+        );
+        CREATE INDEX provider_request_event_window_idx
+            ON provider_request_event(provider, requested_at);
+        CREATE TABLE provider_bootstrap_symbol (
+            provider TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            first_requested_at REAL NOT NULL,
+            PRIMARY KEY(provider, symbol)
+        );
+        CREATE INDEX provider_bootstrap_symbol_window_idx
+            ON provider_bootstrap_symbol(provider, first_requested_at);
+        DROP INDEX evidence_kind_pit_idx;
+        DROP INDEX evidence_form4_pit_idx;
         """,
     ),
 )
