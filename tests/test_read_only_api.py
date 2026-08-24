@@ -2,8 +2,35 @@ from fastapi.testclient import TestClient
 
 from tradehub.app import app, get_gateway, get_settings, get_store
 from tradehub.config import Settings
+from tradehub.tiger_gateway import normalize_collection
 
 STRONG_TOKEN = "test-token-with-enough-length"
+
+
+class FakeContract:
+    """Mimics tigeropen.trade.domain.contract.Contract: has to_dict() but is not a dict."""
+
+    def __init__(self):
+        self.symbol = "AAPL"
+        self.currency = "USD"
+        self.sec_type = "STK"
+
+    def to_dict(self):
+        return {"symbol": self.symbol, "currency": self.currency, "sec_type": self.sec_type}
+
+
+class FakeOrder:
+    """Mimics tigeropen Order.to_dict(), which embeds a raw Contract object under 'contract'."""
+
+    def to_dict(self):
+        return {"contract": FakeContract(), "order_id": "broker-order-123", "status": "SUBMITTED"}
+
+
+class FakePosition:
+    """Mimics tigeropen Position.to_dict(), which embeds a raw Contract object under 'contract'."""
+
+    def to_dict(self):
+        return {"contract": FakeContract(), "quantity": 10}
 
 
 def settings():
@@ -117,6 +144,40 @@ def test_positions_are_read_only_and_can_filter_symbol():
     assert response.status_code == 200
     assert gateway.positions_symbol == "aapl"
     assert response.json()["positions"] == [{"symbol": "aapl", "quantity": 1}]
+
+
+def test_orders_with_contract_object_serialize_without_500():
+    gateway = ConfiguredGateway()
+    gateway.get_orders = lambda symbol=None, limit=20: normalize_collection([FakeOrder()])
+    install_overrides(gateway)
+    try:
+        response = TestClient(app).get("/account/orders", headers=headers())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["orders"][0]["contract"] == {
+        "symbol": "AAPL",
+        "currency": "USD",
+        "sec_type": "STK",
+    }
+
+
+def test_positions_with_contract_object_serialize_without_500():
+    gateway = ConfiguredGateway()
+    gateway.get_positions = lambda symbol=None: normalize_collection([FakePosition()])
+    install_overrides(gateway)
+    try:
+        response = TestClient(app).get("/account/positions", headers=headers())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["positions"][0]["contract"] == {
+        "symbol": "AAPL",
+        "currency": "USD",
+        "sec_type": "STK",
+    }
 
 
 def test_orders_limit_is_bounded():
