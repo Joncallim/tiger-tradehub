@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<ownershipDocument>
+  <documentType>4/A</documentType><periodOfReport>2025-01-02</periodOfReport><amendmentFlag>1</amendmentFlag>
+  <issuer><issuerCik>1001</issuerCik><issuerName>Example Inc</issuerName><issuerTradingSymbol>EXM</issuerTradingSymbol></issuer>
+  <reportingOwner><reportingOwnerId><rptOwnerCik>2001</rptOwnerCik><rptOwnerName>Jane Doe</rptOwnerName></reportingOwnerId><reportingOwnerRelationship><isDirector>1</isDirector><isOfficer>0</isOfficer><isTenPercentOwner>0</isTenPercentOwner></reportingOwnerRelationship></reportingOwner>
+  <nonDerivativeTable><nonDerivativeTransaction><securityTitle><value>Common Stock</value></securityTitle><transactionDate><value>2025-01-02</value></transactionDate><transactionCoding><transactionCode>P</transactionCode></transactionCoding><transactionAmounts><transactionShares><value>100</value></transactionShares><transactionPricePerShare><value>12.50</value></transactionPricePerShare><transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode></transactionAmounts><postTransactionAmounts><sharesOwnedFollowingTransaction><value>1100</value></sharesOwnedFollowingTransaction></postTransactionAmounts><ownershipNature><directOrIndirectOwnership><value>D</value></directOrIndirectOwnership></ownershipNature></nonDerivativeTransaction></nonDerivativeTable>
+</ownershipDocument>
