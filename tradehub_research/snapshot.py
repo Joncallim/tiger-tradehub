@@ -41,9 +41,24 @@ class SnapshotHandle:
             f"file:{self.path.resolve()}?mode=ro", uri=True, timeout=self.timeout_seconds
         )
         connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
-        connection.execute("PRAGMA query_only=ON")
-        return connection
+        try:
+            connection.execute(f"PRAGMA busy_timeout={int(self.timeout_seconds * 1000)}")
+            connection.execute("PRAGMA query_only=ON")
+            rows = connection.execute("SELECT * FROM snapshot_manifest").fetchall()
+            if len(rows) != 1:
+                raise sqlite3.DatabaseError("snapshot manifest is missing or ambiguous")
+            manifest = dict(rows[0])
+            if (
+                manifest["snapshot_id"] != self.manifest["snapshot_id"]
+                or manifest["content_hash"] != self.manifest["content_hash"]
+            ):
+                raise sqlite3.DatabaseError("snapshot identity does not match verified handle")
+            if _content_hash(connection) != self.manifest["content_hash"]:
+                raise sqlite3.DatabaseError("snapshot content hash does not match manifest")
+            return connection
+        except Exception:
+            connection.close()
+            raise
 
 
 def create_snapshot(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PHASE_0_SCHEMA_VERSION = 2
+PHASE_0_SCHEMA_VERSION = 3
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -241,6 +241,26 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             snapshot_id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
             source_db TEXT NOT NULL, content_hash TEXT NOT NULL
         );
+        """,
+    ),
+    (
+        3,
+        "Enforce universe correction ordering and a single successor",
+        """
+        CREATE UNIQUE INDEX universe_single_successor_uq
+            ON universe_membership(supersedes_id)
+            WHERE supersedes_id IS NOT NULL;
+        CREATE TRIGGER universe_supersession_knowledge_order BEFORE INSERT
+            ON universe_membership
+        WHEN NEW.supersedes_id IS NOT NULL BEGIN
+            SELECT CASE WHEN NEW.supersedes_id = NEW.id
+                THEN RAISE(ABORT, 'membership cannot supersede itself') END;
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM universe_membership p WHERE p.id=NEW.supersedes_id
+                    AND p.knowledge_time IS NOT NULL
+                    AND NEW.knowledge_time < p.knowledge_time
+            ) THEN RAISE(ABORT, 'membership supersession cannot backdate knowledge time') END;
+        END;
         """,
     ),
 )
