@@ -300,7 +300,7 @@ def build_fa05_pack() -> PackDefinition:
         if before.status_code != 200:
             manager.stop()
             raise AssertionError_(f"pre-read account orders failed: HTTP {before.status_code}")
-        before_ids = {o.get("id") for o in before.json().get("orders", [])}
+        before_ids = {str(o.get("id")) for o in before.json().get("orders", [])}
 
         # 2. preview through the normal guarded path (conservative limit)
         preview_payload = {
@@ -406,7 +406,7 @@ def build_fa05_pack() -> PackDefinition:
             raise AssertionError_(f"no cancel audit event for order {order_id}")
 
         # 8. exactly one intended broker order created by this run
-        after_ids = {o.get("id") for o in final.json().get("orders", [])}
+        after_ids = {str(o.get("id")) for o in final.json().get("orders", [])}
         new_ids = after_ids - before_ids
         if len(new_ids) != 1:
             raise AssertionError_(
