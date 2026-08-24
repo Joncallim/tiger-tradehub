@@ -5,6 +5,8 @@ from datetime import timedelta
 import pytest
 
 from tradehub.audit import (
+    CONFIRMATION_STATE_INDETERMINATE,
+    CONFIRMATION_STATE_RECONCILING,
     CONFIRMATION_STATE_SUBMITTING,
     STALE_CLAIM_SECONDS,
     AuditStore,
@@ -157,3 +159,84 @@ def test_mark_submission_in_progress_prevents_reclaim_before_finalize(tmp_path):
         store.claim_confirmation(token)
 
     assert store.get_submission_state(token) == CONFIRMATION_STATE_SUBMITTING
+
+
+def test_stale_reconciliation_reclaim_fences_old_lease_transitions(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    store = AuditStore(db_path)
+    token, _ = store.create_confirmation(intent(), None, ttl_seconds=300)
+    store.claim_confirmation(token)
+    store.mark_submission_indeterminate(token, reserved_order_id="reserved-42")
+
+    *_, first_lease = store.claim_reconciliation_confirmation(token)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE confirmations SET claimed_at = ? WHERE token = ?",
+            ((utc_now() - timedelta(seconds=STALE_CLAIM_SECONDS + 1)).isoformat(), token),
+        )
+    *_, second_lease = store.claim_reconciliation_confirmation(token)
+
+    assert first_lease != second_lease
+    with pytest.raises(ValueError, match="not claimed"):
+        store.finalize_confirmation(token, "global-42", first_lease)
+    with pytest.raises(ValueError, match="reconciliation-required"):
+        store.mark_submission_ready_for_retry(token, first_lease)
+    with pytest.raises(ValueError, match="no longer current"):
+        store.abandon_reconciliation(token, first_lease)
+    with pytest.raises(ValueError, match="not claimed"):
+        store.mark_submission_indeterminate(token, "reserved-42")
+
+    with sqlite3.connect(db_path) as db:
+        row = db.execute(
+            "SELECT submission_state, reconcile_lease_id FROM confirmations WHERE token = ?",
+            (token,),
+        ).fetchone()
+    assert row == (CONFIRMATION_STATE_RECONCILING, second_lease)
+    store.mark_submission_ready_for_retry(token, second_lease)
+
+
+def test_legacy_claimed_row_migrates_to_indeterminate_and_only_reconciles(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    now = utc_now()
+    stale_claimed_at = now - timedelta(seconds=STALE_CLAIM_SECONDS + 1)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            """
+            CREATE TABLE confirmations (
+                token TEXT PRIMARY KEY,
+                intent_json TEXT NOT NULL,
+                tiger_preview_json TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                claimed_at TEXT,
+                submitted_at TEXT,
+                order_id TEXT
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO confirmations(
+                token, intent_json, created_at, expires_at, claimed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-token",
+                intent().model_dump_json(),
+                now.isoformat(),
+                (now + timedelta(seconds=300)).isoformat(),
+                stale_claimed_at.isoformat(),
+            ),
+        )
+
+    store = AuditStore(db_path)
+
+    assert store.get_submission_state("legacy-token") == CONFIRMATION_STATE_INDETERMINATE
+    with pytest.raises(ValueError, match="indeterminate"):
+        store.claim_confirmation("legacy-token")
+    claimed_intent, _, reserved_order_id, lease_id = store.claim_reconciliation_confirmation(
+        "legacy-token"
+    )
+    assert claimed_intent.symbol == "AAPL"
+    assert reserved_order_id is None
+    assert lease_id
