@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PHASE_0_SCHEMA_VERSION = 6
+PHASE_0_SCHEMA_VERSION = 7
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -467,6 +467,31 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             SELECT RAISE(ABORT, 'candidate is append-only'); END;
         CREATE TRIGGER candidate_no_delete BEFORE DELETE ON candidate BEGIN
             SELECT RAISE(ABORT, 'candidate is append-only'); END;
+        """,
+    ),
+    (
+        7,
+        "Phase 1 reviewed recovery flags and provider operational limits",
+        """
+        DROP TRIGGER candidate_run_complete;
+        ALTER TABLE pipeline_run ADD COLUMN flags_json TEXT
+            CHECK (flags_json IS NULL OR json_valid(flags_json));
+        CREATE TABLE provider_request_event (
+            provider TEXT NOT NULL,
+            requested_at REAL NOT NULL
+        );
+        CREATE INDEX provider_request_event_window_idx
+            ON provider_request_event(provider, requested_at);
+        CREATE TABLE provider_bootstrap_symbol (
+            provider TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            first_requested_at REAL NOT NULL,
+            PRIMARY KEY(provider, symbol)
+        );
+        CREATE INDEX provider_bootstrap_symbol_window_idx
+            ON provider_bootstrap_symbol(provider, first_requested_at);
+        DROP INDEX evidence_kind_pit_idx;
+        DROP INDEX evidence_form4_pit_idx;
         """,
     ),
 )

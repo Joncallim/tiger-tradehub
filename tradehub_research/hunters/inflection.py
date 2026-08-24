@@ -15,6 +15,7 @@ from tradehub_research.hunters.common import (
     OPERATING_INCOME_CONCEPTS,
     REVENUE_CONCEPTS,
     active_facts,
+    add_years,
     as_date,
     fact_ref,
     facts_for,
@@ -174,8 +175,7 @@ def evaluate(context: ScreenContext, security_id: SecurityId) -> ScreenResultPay
     prior = fresh_revenue[prior_end]
 
     def year_ago(series: dict[str, dict[str, Any]], end: str) -> dict[str, Any] | None:
-        target = as_date(end)
-        target = target.replace(year=target.year - 1)
+        target = add_years(as_date(end), -1)
         candidates = [
             fact
             for fact_end, fact in series.items()
@@ -200,6 +200,10 @@ def evaluate(context: ScreenContext, security_id: SecurityId) -> ScreenResultPay
         return insufficient(["noncomparable_periods"], features, 0.0)
     if latest_income is None or latest_income_prev is None:
         return insufficient(["missing_operating_income"], features, 0.0)
+    if not filing_age_ok(latest_income, as_of, max_age) or not filing_age_ok(
+        latest_income_prev, as_of, max_age
+    ):
+        return insufficient(["stale_operating_income"], features, 0.0)
     if not _same_basis(latest_income, latest_income_prev, tolerance):
         return insufficient(["noncomparable_periods"], features, 0.0)
 

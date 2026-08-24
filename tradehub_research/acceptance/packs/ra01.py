@@ -8,14 +8,19 @@ import inspect
 from dataclasses import replace
 from pathlib import Path
 
+from tradehub_research.adapters.base import FetchResult
+from tradehub_research.adapters.tiingo import TiingoEodAdapter
+from tradehub_research.db import ResearchDB
+from tradehub_research.evidence import EvidenceStore
 from tradehub_research.funnel import FunnelConfig, FunnelResultRow, control_key, run_funnel
 from tradehub_research.hunters import (
     event,
     inflection,
     informed_activity,
-    momentum,
     valuation,
 )
+from tradehub_research.hunters.common import adjusted_close_series
+from tradehub_research.screening import _load_facts, _load_form4_coverage, _load_identity_feed_state
 from tradehub_research.screens import ScreenContext, canonical_json, registered_screens
 
 
@@ -97,23 +102,85 @@ def raw_feature_lineage(tmp: Path) -> None:
 
 
 def pit_cutoff_and_unknown(tmp: Path) -> None:
-    source = inspect.getsource(
-        __import__("tradehub_research.screening", fromlist=["_load_facts"])._load_facts
-    )
-    assert "public_available_time <= ?" in source
-    assert "source_reported','derived_from_index" in source
+    db = ResearchDB(tmp / "pit-load.db")
+    store = _seed_db(db)
+    for kind, pat, provenance in (
+        ("form4_index_coverage", "2025-03-01", "derived_from_index"),
+        ("form4_index_coverage", "2025-05-01", "derived_from_index"),
+        ("identity_feed_marker", "2025-05-01", "source_reported"),
+        ("identity_feed_marker", None, "unknown"),
+    ):
+        store.insert(
+            security_id="S",
+            source_id="src",
+            structured_fields={"record_type": kind, "index_date": pat and pat[:10]},
+            extraction_confidence=1,
+            event_time="2025-01-01",
+            public_available_time=pat,
+            pat_provenance=provenance,
+            ingested_time="2025-06-01",
+        )
+    with db.connect(read_only=True) as conn:
+        assert _load_form4_coverage(conn, "2025-04-01", ["S"]) == {"S": frozenset({"2025-03-01"})}
+        assert not _load_identity_feed_state(conn, "2025-04-01", ["S"])
 
 
 def restatement_replay(tmp: Path) -> None:
-    source = inspect.getsource(
-        __import__("tradehub_research.screening", fromlist=["_load_facts"])._load_facts
+    db = ResearchDB(tmp / "restatement.db")
+    store = _seed_db(db)
+    original = store.insert(
+        security_id="S",
+        source_id="src",
+        structured_fields={"record_type": "xbrl_fact", "metric": "revenue", "value": 1},
+        extraction_confidence=1,
+        event_time="2025-01-01",
+        public_available_time="2025-01-05",
+        pat_provenance="source_reported",
+        ingested_time="2025-02-01",
     )
-    assert "supersedes_evidence_id" in source and "visible_chain" in source
+    correction = store.insert(
+        security_id="S",
+        source_id="src",
+        structured_fields={"record_type": "xbrl_fact", "metric": "revenue", "value": 2},
+        extraction_confidence=1,
+        event_time="2025-01-01",
+        public_available_time="2025-01-08",
+        pat_provenance="source_reported",
+        ingested_time="2025-02-01",
+        supersedes_evidence_id=original,
+    )
+    with db.connect(read_only=True) as conn:
+        assert _load_facts(conn, "2025-01-06", ["S"])["S"][0]["evidence_id"] == original
+        assert _load_facts(conn, "2025-01-09", ["S"])["S"][0]["evidence_id"] == correction
 
 
 def quarter_comparability(tmp: Path) -> None:
-    source = inspect.getsource(inflection)
-    assert "noncomparable_periods" in source and "duration" in source and "dimensions" in source
+    fact = {
+        "period_start": "2025-01-01",
+        "period_end": "2025-03-31",
+        "value": 10,
+        "concept": "Revenue",
+        "unit": "USD",
+        "dimensions": {},
+        "public_available_time": "x",
+    }
+    assert inflection._standalone_quarters([fact], 10) == {"2025-03-31": fact}
+    mismatch = {
+        **fact,
+        "period_end": "2025-08-31",
+        "period_start": "2025-01-01",
+        "fiscal_year": 2025,
+        "accession": "a",
+        "dimensions": {"segment": "x"},
+    }
+    base = {
+        **fact,
+        "period_end": "2025-05-31",
+        "period_start": "2025-01-01",
+        "fiscal_year": 2025,
+        "accession": "a",
+    }
+    assert inflection._standalone_quarters([base, mismatch], 10) is None
 
 
 def source_completeness(tmp: Path) -> None:
@@ -122,18 +189,59 @@ def source_completeness(tmp: Path) -> None:
 
 
 def price_pat_adjustment(tmp: Path) -> None:
-    common = __import__("tradehub_research.hunters.common", fromlist=["eligible_bars"])
-    source = inspect.getsource(common)
-    assert "20, 15" in source and "public_available_time" in source
-    assert "adjClose" not in inspect.getsource(momentum.evaluate)
+    fixture = Path(__file__).resolve().parents[3] / "tests/fixtures/tiingo_eod.json"
+    raw = fixture.read_bytes()
+    meta = FetchResult("fixture://tiingo", "2025-03-01T00:00:00Z", 200, {}, raw, fixture)
+    rows = TiingoEodAdapter(
+        token="x", license_confirmed=True, user_agent="ra", cache_dir=tmp
+    ).parse(raw, meta, ticker="EXM")
+    bars = [
+        dict(r.structured_fields) for r in rows if r.structured_fields["record_type"] == "price_bar"
+    ]
+    bars.insert(0, {"record_type": "price_bar", "session_date": "2025-01-01", "close": 21.0})
+    actions = [
+        {**r.structured_fields, "action_type": r.structured_fields["record_type"]}
+        for r in rows
+        if r.structured_fields["record_type"] != "price_bar"
+    ]
+    adjusted = adjusted_close_series(bars, actions)
+    assert adjusted != [(b["session_date"], b["close"]) for b in bars]
+    assert all("adjClose" not in b for b in bars)
 
 
 def idempotent_recovery(tmp: Path) -> None:
-    store = inspect.getsource(
-        __import__("tradehub_research.screen_store", fromlist=["ScreenStore"]).ScreenStore
+    db = ResearchDB(tmp / "recovery.db")
+    _seed_db(db)
+    from tradehub_research.screen_store import ScreenStore
+
+    store = ScreenStore(db)
+    spec = valuation.SCREEN_SPEC
+    store.save_screen_definition(spec)
+    run = store.begin_run(
+        as_of="2025-04-01",
+        universe_hash="u",
+        screen_manifest=[{"config_hash": spec.config_hash, "expected_count": 0}],
+        funnel_config={},
+        input_view_hash="v",
+        expected_security_count=0,
     )
-    assert "stored screen result differs from deterministic retry" in store
-    assert "funnel requires a COMPLETE pipeline run" in store
+    store.complete_run(run)
+    store.complete_run(run)
+    assert store.load_candidates(run) == []
+
+
+def _seed_db(database: ResearchDB) -> EvidenceStore:
+    database.init()
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("S", "S", "NYSE", "S", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+        db.execute(
+            "INSERT INTO evidence_source VALUES (?,?,?,?,?)",
+            ("src", "fixture", 1, "", "source_reported"),
+        )
+    return EvidenceStore(database)
 
 
 def candidate_merge_and_overflow(tmp: Path) -> None:
@@ -151,6 +259,25 @@ def candidate_merge_and_overflow(tmp: Path) -> None:
     )
     assert len(candidates) == 51 and flags == ["budget_overflow_mandatory"]
     assert set(candidates[0].inclusion_reasons) == {"event_pass", "holding"}
+    database = ResearchDB(tmp / "overflow.db")
+    _seed_db(database)
+    from tradehub_research.screen_store import ScreenStore
+
+    store = ScreenStore(database)
+    run_id = store.begin_run(
+        as_of="2025-04-01",
+        universe_hash="u",
+        screen_manifest=[],
+        funnel_config={},
+        input_view_hash="v",
+        expected_security_count=0,
+    )
+    store.complete_run(run_id)
+    store.persist_run_flags(run_id, flags)
+    with database.connect(read_only=True) as db:
+        assert db.execute(
+            "SELECT flags_json FROM pipeline_run WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == canonical_json(flags)
 
 
 def sector_round_robin_budget(tmp: Path) -> None:

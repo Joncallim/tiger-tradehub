@@ -70,7 +70,7 @@ def evaluate(context: ScreenContext, security_id: SecurityId) -> ScreenResultPay
             "role": "price_bar",
             "evidence_id": bar.get("evidence_id"),
         }
-        for bar in (bars[-1:] if bars else [])
+        for bar in bars
     ]
     features["eligible_bar_count"] = feature_value(len(bars), "bars", bar_sources)
 
@@ -84,6 +84,17 @@ def evaluate(context: ScreenContext, security_id: SecurityId) -> ScreenResultPay
         return insufficient(["stale_price_bar"], features, 0.0)
 
     actions = eligible_actions(context, security_id, as_of)
+    action_sources = [
+        {
+            "value": action.get("factor", action.get("cash")),
+            "unit": "action",
+            "effective_date": action.get("effective_date"),
+            "role": action.get("action_type"),
+            "evidence_id": action.get("evidence_id"),
+        }
+        for action in actions
+    ]
+    calculation_sources = bar_sources + action_sources
     adjusted = adjusted_close_series(bars, actions)
     if len(adjusted) != len(bars):
         return insufficient(["insufficient_price_history"], features, 0.0)
@@ -111,9 +122,9 @@ def evaluate(context: ScreenContext, security_id: SecurityId) -> ScreenResultPay
     adv_window = bars[-adv_bars:]
     adv = sum(float(b["close"]) * float(b["volume"]) for b in adv_window) / len(adv_window)
 
-    features["return_126d"] = feature_value(round(return_126d, 6), "ratio", bar_sources)
+    features["return_126d"] = feature_value(round(return_126d, 6), "ratio", calculation_sources)
     features["ma_distance_252d"] = feature_value(
-        None if ma_distance is None else round(ma_distance, 6), "ratio", bar_sources
+        None if ma_distance is None else round(ma_distance, 6), "ratio", calculation_sources
     )
     features["adv_20d"] = feature_value(round(adv, 2), "usd", bar_sources)
 

@@ -289,21 +289,47 @@ class ScreenStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def cluster_ids_by_evidence(self) -> dict[str, set[str]]:
+    def cluster_ids_by_evidence(self, as_of: str | None = None) -> dict[str, set[str]]:
         """One bounded scan resolving every evidence cluster membership.
 
         Maps evidence_id -> set(cluster_id).  Cluster ids are resolved at rank
         time only and are never copied into screen_result rows (design 3).
         """
         with self.database.connect(read_only=True) as db:
-            rows = db.execute(
-                "SELECT evidence_id,cluster_id FROM evidence_cluster_member "
-                "ORDER BY evidence_id,cluster_id",
-            ).fetchall()
+            if as_of is None:
+                rows = db.execute(
+                    "SELECT evidence_id,cluster_id FROM evidence_cluster_member "
+                    "ORDER BY evidence_id,cluster_id"
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT m.evidence_id,m.cluster_id FROM evidence_cluster_member m "
+                    "JOIN evidence_event e ON e.evidence_id=m.evidence_id "
+                    "WHERE e.public_available_time IS NOT NULL AND e.public_available_time <= ? "
+                    "AND e.pat_provenance IN ('source_reported','derived_from_index') "
+                    "ORDER BY m.evidence_id,m.cluster_id",
+                    (normalize_ts(as_of),),
+                ).fetchall()
         lookup: dict[str, set[str]] = {}
         for row in rows:
             lookup.setdefault(row["evidence_id"], set()).add(row["cluster_id"])
         return lookup
+
+    def persist_run_flags(self, run_id: str, flags: Iterable[str]) -> None:
+        """Persist deterministic funnel conditions on a completed run."""
+        value = canonical_json(sorted(set(flags)))
+        with self.database.connect() as db:
+            row = db.execute(
+                "SELECT status,flags_json FROM pipeline_run WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown pipeline run: {run_id}")
+            if row[0] != "COMPLETE":
+                raise RunStateError("run flags require a COMPLETE pipeline run")
+            if row[1] is not None and row[1] != value:
+                raise DeterminismError("stored run flags differ from deterministic retry")
+            if row[1] is None:
+                db.execute("UPDATE pipeline_run SET flags_json=? WHERE run_id=?", (value, run_id))
 
     def persist_candidates(self, run_id: str, candidates: Iterable[Any]) -> None:
         """Insert-or-verify candidate rows in one transaction (design 6: the
@@ -352,12 +378,13 @@ class ScreenStore:
                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (*values, utc_now()),
                     )
-        except DeterminismError as exc:
-            self.fail_run(run_id, str(exc))
+        except DeterminismError:
+            # Candidate rows are intentionally written after COMPLETE.  A retry
+            # conflict must retain its useful error instead of trying to fail an
+            # already terminal screen run and masking it with RunStateError.
             raise
         except sqlite3.IntegrityError as exc:
             error = DeterminismError(f"candidate integrity conflict: {exc}")
-            self.fail_run(run_id, str(error))
             raise error from exc
 
     def load_candidates(self, run_id: str) -> list[dict[str, Any]]:

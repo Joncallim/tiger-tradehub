@@ -279,17 +279,16 @@ def adjusted_close_series(
             cash = float(action.get("cash") or 0.0)
             if cash < 0:
                 continue
-            prior = next((close for day, close in series if day < effective), None)
-            if prior is None or prior <= 0:
+            anchor = next((close for day, close in series if day >= effective), None)
+            if anchor is None:
+                anchor = next((close for day, close in reversed(series) if day < effective), None)
+            if anchor is None or anchor <= 0 or cash >= anchor:
                 continue
-            # Apply against each bar individually below; use per-bar cash/prior.
-            adjusted = []
-            for day, close in series:
-                if day < effective and close > 0:
-                    adjusted.append((day, close * max(close - cash, 0.0) / close))
-                else:
-                    adjusted.append((day, close))
-            series = adjusted
+            multiplier = 1.0 - cash / anchor
+            series = [
+                (day, close * multiplier) if day < effective else (day, close)
+                for day, close in series
+            ]
             continue
         else:
             continue

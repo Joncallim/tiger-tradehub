@@ -110,6 +110,9 @@ class NetworkClient:
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
         max_attempts: int = 3,
+        before_attempt: Callable[[], None] | None = None,
+        max_response_bytes: int = 25 * 1024 * 1024,
+        cache_budget_bytes: int = 1024 * 1024 * 1024,
     ):
         if not user_agent.strip():
             raise ValueError("a descriptive User-Agent is required")
@@ -117,11 +120,16 @@ class NetworkClient:
         self.transport = transport or httpx.Client()
         self.bucket, self.sleep, self.random_value = bucket, sleep, random_value
         self.max_attempts = max_attempts
+        self.before_attempt = before_attempt
+        self.max_response_bytes = max_response_bytes
+        self.cache_budget_bytes = cache_budget_bytes
 
     def fetch(self, url: str, *, headers: Mapping[str, str] | None = None) -> FetchResult:
         request_headers = {"User-Agent": self.user_agent, **dict(headers or {})}
         response: httpx.Response | None = None
         for attempt in range(self.max_attempts):
+            if self.before_attempt:
+                self.before_attempt()
             if self.bucket:
                 self.bucket.acquire()
             try:
@@ -146,11 +154,24 @@ class NetworkClient:
             self.sleep(delay)
         assert response is not None
         response.raise_for_status()
-        raw = response.content
+        declared = response.headers.get("Content-Length")
+        if declared and int(declared) > self.max_response_bytes:
+            raise ValueError("provider response exceeds configured byte ceiling")
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_bytes():
+            size += len(chunk)
+            if size > self.max_response_bytes:
+                raise ValueError("provider response exceeds configured byte ceiling")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
         digest = hashlib.sha256(raw).hexdigest()
         path = self.cache_dir / digest[:2] / digest
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
+            used = sum(item.stat().st_size for item in self.cache_dir.rglob("*") if item.is_file())
+            if used + len(raw) > self.cache_budget_bytes:
+                raise RuntimeError("adapter cache budget exceeded")
             path.write_bytes(raw)
         return FetchResult(
             url, normalize_ts(utc_now()), response.status_code, response.headers, raw, path
@@ -228,16 +249,17 @@ def ingest_records(
             if predecessor is None:
                 raise ValueError("superseded source record has not been ingested")
         fields = dict(record.structured_fields)
-        fields["source_envelope"] = {
-            "source_url": envelope.source_url,
-            "retrieved_at": envelope.retrieved_at,
-            "http_status": envelope.http_status,
-            "etag": envelope.etag,
-            "last_modified": envelope.last_modified,
-            "raw_content_hash": envelope.raw_content_hash,
-            "parser_version": envelope.parser_version,
-            "freshness": envelope.freshness.__dict__,
-        }
+        if not envelope.withdrawn:
+            fields["source_envelope"] = {
+                "source_url": envelope.source_url,
+                "retrieved_at": envelope.retrieved_at,
+                "http_status": envelope.http_status,
+                "etag": envelope.etag,
+                "last_modified": envelope.last_modified,
+                "raw_content_hash": envelope.raw_content_hash,
+                "parser_version": envelope.parser_version,
+                "freshness": envelope.freshness.__dict__,
+            }
         evidence_id = store.insert(
             security_id=security_id,
             source_id=envelope.source_id,
