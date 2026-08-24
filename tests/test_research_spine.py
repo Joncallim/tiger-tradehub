@@ -32,7 +32,8 @@ def test_schema_and_migration_are_idempotent(tmp_path):
     assert database.migrate() == PHASE_0_SCHEMA_VERSION
     assert database.check()["ok"]
     with database.connect(read_only=True) as db:
-        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 5
+        migration_count = db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        assert migration_count == PHASE_0_SCHEMA_VERSION
 
 
 def test_settings_use_only_research_prefix(monkeypatch, tmp_path):
