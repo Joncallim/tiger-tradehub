@@ -424,8 +424,8 @@ def reconcile_order(
         )
 
     # A stolen SUBMITTING worker may still be inside place_order. Broker absence at
-    # this instant cannot fence that call, so preserve non-retryable SUBMITTING and
-    # reconcile again; only ordinary indeterminate failures become retryable.
+    # this instant cannot fence that call, so preserve a non-retryable indeterminate
+    # state; only ordinary indeterminate failures become retryable.
     if prior_state == "SUBMITTING":
         try:
             store.preserve_stolen_submission(request.confirmation_token, reconcile_lease_id)

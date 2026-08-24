@@ -604,7 +604,111 @@ def test_stolen_submitting_negative_reconcile_does_not_become_retryable(tmp_path
 
     assert reconciled.status_code == 200
     assert reconciled.json()["status"] == "indeterminate"
-    assert store.get_submission_state(token) == "SUBMITTING"
+    assert store.get_submission_state(token) == "INDETERMINATE"
+
+
+def test_transitive_reconcile_steal_keeps_live_submit_non_retryable(tmp_path):
+    db_path = tmp_path / "tradehub.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_DRY_RUN=False,
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+
+    class TransitiveStealGateway(FakeGateway):
+        def __init__(self):
+            super().__init__()
+            self.first_lookup_blocked = threading.Event()
+            self.first_lookup_release = threading.Event()
+            self.lookup_lock = threading.Lock()
+            self.lookup_calls = 0
+
+        def get_order(self, order_id):
+            with self.lookup_lock:
+                self.lookup_calls += 1
+                call_number = self.lookup_calls
+            if call_number == 1:
+                self.first_lookup_blocked.set()
+                self.first_lookup_release.wait(2)
+            return None
+
+    store = AuditStore(db_path)
+    gateway = TransitiveStealGateway()
+    install(settings, store, gateway)
+
+    def expire_claim():
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE confirmations SET claimed_at = ? WHERE token = ?",
+                ((utc_now() - timedelta(seconds=STALE_CLAIM_SECONDS + 1)).isoformat(), token),
+            )
+
+    try:
+        client = TestClient(app)
+        token = client.post("/orders/preview", json=preview_payload(), headers=headers()).json()[
+            "confirmation_token"
+        ]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            submit_future = executor.submit(
+                client.post,
+                "/orders/submit",
+                json={"confirmation_token": token},
+                headers=headers(),
+            )
+            assert gateway.place_order_blocked.wait(2)
+            expire_claim()
+
+            reconcile_b_future = executor.submit(
+                client.post,
+                "/orders/submit/reconcile",
+                json={"confirmation_token": token},
+                headers=headers(),
+            )
+            assert gateway.first_lookup_blocked.wait(2)
+            expire_claim()
+
+            reconcile_c = client.post(
+                "/orders/submit/reconcile",
+                json={"confirmation_token": token},
+                headers=headers(),
+            )
+            refused_submit = client.post(
+                "/orders/submit", json={"confirmation_token": token}, headers=headers()
+            )
+            resolved = client.post(
+                "/orders/submit/resolve",
+                json={
+                    "confirmation_token": token,
+                    "resolver": "operator@example",
+                    "global_order_id": "global-resolved",
+                },
+                headers=headers(),
+            )
+
+            gateway.first_lookup_release.set()
+            gateway.place_order_release.set()
+            reconcile_b = reconcile_b_future.result(timeout=10)
+            submit_a = submit_future.result(timeout=10)
+    finally:
+        gateway.first_lookup_release.set()
+        gateway.place_order_release.set()
+        app.dependency_overrides.clear()
+
+    assert reconcile_c.status_code == 200
+    assert reconcile_c.json()["status"] == "indeterminate"
+    assert refused_submit.status_code == 422
+    assert "indeterminate" in refused_submit.json()["detail"]
+    assert resolved.status_code == 200
+    assert resolved.json() == {
+        "status": "submitted",
+        "submitted": True,
+        "order_id": "global-resolved",
+    }
+    assert reconcile_b.status_code == 409
+    assert submit_a.status_code == 409
+    assert gateway.placed_orders == ["reserved-1"]
+    assert store.get_submission_state(token) == "SUBMITTED"
 
 
 def test_reconcile_fallback_scan_is_used_before_retryable(tmp_path):
