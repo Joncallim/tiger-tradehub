@@ -10,6 +10,8 @@ import io
 import json
 from pathlib import Path
 
+import pytest
+
 from tradehub.acceptance.packs.fa00 import FIXTURES
 from tradehub.acceptance.runner import (
     AssertionBlocked,
@@ -239,3 +241,119 @@ def test_fa00_artifacts_contain_no_secrets():
         text = Path(path).read_text()
         for secret in ("21155143479478282", "20161327", "AbCdEfGhIjKlMnOpQrStUvWxYz012345"):
             assert secret not in text, f"secret leaked into artifact {path}"
+
+
+# ---------------------------------------------------------------------------
+# FA-05 safety semantics (delayed-quote paper lifecycle)
+# ---------------------------------------------------------------------------
+
+
+class _Profile:
+    def __init__(self, account, account_type):
+        self.account = account
+        self.account_type = account_type
+
+
+def test_fa05_paper_gate_rejects_live_account():
+    from tradehub.acceptance.service import find_paper_account
+
+    with pytest.raises(AssertionBlocked):
+        find_paper_account([_Profile("U12345678", "LIVE")])
+
+
+def test_fa05_paper_gate_rejects_unknown_or_missing_type():
+    from tradehub.acceptance.service import find_paper_account
+
+    with pytest.raises(AssertionBlocked):
+        find_paper_account([_Profile("21155143479478282", None)])
+    with pytest.raises(AssertionBlocked):
+        find_paper_account([_Profile("21155143479478282", "UNKNOWN")])
+    with pytest.raises(AssertionBlocked):
+        find_paper_account([])
+
+
+def test_fa05_paper_gate_accepts_broker_paper_profile():
+    from tradehub.acceptance.service import find_paper_account
+
+    account = find_paper_account(
+        [_Profile("U12345678", "LIVE"), _Profile("21155143479478282", "PAPER")]
+    )
+    assert account == "21155143479478282"
+
+
+def test_fa05_limit_is_deterministically_derived():
+    from tradehub.acceptance.packs.fa05 import (
+        ACCEPTANCE_LIMIT_FRACTION,
+        derive_acceptance_limit,
+    )
+
+    assert derive_acceptance_limit(100.00) == 50.0
+    assert derive_acceptance_limit(180.00) == round(180.00 * ACCEPTANCE_LIMIT_FRACTION, 2)
+    assert derive_acceptance_limit(1.37) == round(1.37 * ACCEPTANCE_LIMIT_FRACTION, 2)
+
+
+def test_fa05_limit_rejects_bad_reference_and_caps():
+    from tradehub.acceptance.packs.fa05 import derive_acceptance_limit
+
+    with pytest.raises(AssertionBlocked):
+        derive_acceptance_limit(0)
+    with pytest.raises(AssertionBlocked):
+        derive_acceptance_limit(-5)
+    with pytest.raises(AssertionBlocked):
+        derive_acceptance_limit(None)
+    # qty 1, notional cap 100: a 250 reference at 0.5 => 125 notional -> blocked
+    with pytest.raises(AssertionBlocked):
+        derive_acceptance_limit(250.00, quantity=1, max_notional_usd=100.0)
+
+
+def test_fa05_delayed_quote_record_is_labeled_delayed():
+    from tradehub.acceptance.packs.fa05 import _delayed_quote_record
+
+    ctx = _ctx()
+    record = _delayed_quote_record(ctx, 309.35, 1787342400000)
+    assert record["classification"] == "DELAYED"
+    assert record["source"] == "tiger_delayed_quote"
+    assert record["is_real_time"] is False
+    assert record["symbol"] == "AAPL"
+    assert "staleness" in record
+    assert record["staleness"].startswith("delayed_")
+
+
+def test_fa05_delayed_quote_record_sanitizes_account_values():
+    from tradehub.acceptance.packs.fa05 import _delayed_quote_record
+
+    ctx = _ctx()
+    ctx.register_secret("21155143479478282")
+    record = _delayed_quote_record(ctx, 309.35, None)
+    cleaned = ctx.sanitizer.sanitize_value(record)
+    assert "21155143479478282" not in json.dumps(cleaned)
+
+
+def test_fa05_pack_defines_no_market_order_path():
+    """The pack must never construct a MARKET order.
+
+    Only the preview payload's explicit LIMIT construction is the write
+    path; no `OrderType.MARKET` usage and no market_order builder call
+    may exist in the pack.
+    """
+    import inspect
+
+    from tradehub.acceptance.packs import fa05
+
+    source = inspect.getsource(fa05)
+    assert '"order_type": "LIMIT"' in source  # write path is LIMIT only
+    assert "OrderType.MARKET" not in source
+    assert "market_order(" not in source
+
+
+def test_fa05_pack_requires_write_flag_and_lineage_gates():
+    """Pack gate assertions exist and BLOCK without the flag/lineage."""
+    from tradehub.acceptance.packs import PACKS
+
+    pack = PACKS["FA-05"]
+    gate_ids = {a.id for a in pack.assertions}
+    assert "gate.acceptance_write_flag" in gate_ids
+    assert "gate.upstream_lineage" in gate_ids
+    assert "gate.broker_paper_proof" in gate_ids
+    assert "gate.delayed_reference_limit" in gate_ids
+    assert "lifecycle.place_read_cancel_reconcile" in gate_ids

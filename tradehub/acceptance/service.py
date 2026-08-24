@@ -258,15 +258,22 @@ class TigerAccountProof:
         return self._profiles
 
     def prove_paper(self) -> str:
-        profiles = self.fetch()
-        for profile in profiles:
-            account = getattr(profile, "account", None)
-            account_type = str(getattr(profile, "account_type", "") or "").upper()
-            if account_type == "PAPER":
-                return str(account)
-        kinds = [
-            f"{getattr(p, 'account', '?')}:{getattr(p, 'account_type', None)}" for p in profiles
-        ]
-        raise AssertionBlocked(
-            f"no broker-reported PAPER account found in profile list ({', '.join(kinds)})"
-        )
+        return find_paper_account(self.fetch())
+
+
+def find_paper_account(profiles: list[Any]) -> str:
+    """Return the account id of the broker-reported PAPER profile.
+
+    Deterministic and unit-testable in isolation: only an exact
+    broker-reported `account_type == PAPER` satisfies the gate. LIVE,
+    unknown, missing, or None account_type never passes.
+    """
+    for profile in profiles:
+        account = getattr(profile, "account", None)
+        account_type = str(getattr(profile, "account_type", "") or "").upper()
+        if account_type == "PAPER":
+            return str(account)
+    kinds = [f"{getattr(p, 'account', '?')}:{getattr(p, 'account_type', None)}" for p in profiles]
+    raise AssertionBlocked(
+        f"no broker-reported PAPER account found in profile list ({', '.join(kinds)})"
+    )

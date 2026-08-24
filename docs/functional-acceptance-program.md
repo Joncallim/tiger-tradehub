@@ -207,24 +207,29 @@ Hard prerequisites:
 
 - FA-00 through FA-04 passed on the same deployment lineage;
 - runner queries Tiger account information and proves `accountType=PAPER` for the configured account;
-- explicit acceptance-paper-write feature flag is enabled locally;
-- acceptance symbol/quantity/notional remain inside stricter test-only caps;
+- explicit acceptance-paper-write feature flag is enabled locally (defaults false);
+- acceptance symbol/quantity/notional remain inside stricter test-only caps (never looser than production policy);
 - order is a USD limit order;
-- runner verifies the intended test limit is non-marketable before submission, or blocks the test if it cannot prove this safely.
+- the runner selects a deliberately conservative limit using Tiger's freshest freely available **delayed** US quote (`get_stock_delay_briefs`) via a deterministic acceptance rule (e.g. `delayed_price * 0.50`). Real-time US L1 market data is **not required** for functional acceptance; the delayed quote is used only to choose the test limit and is explicitly labelled DELAYED — it is not treated as current executable market data. If no delayed reference can be obtained, the pack returns `BLOCKED`.
+
+Quote semantics: `aStockQuoteLv1` is China A-share L1 and unrelated to US quotes; `usQuoteBasic`/`usStockQuote` are the US real-time entitlements (optional for acceptance, not required). One `QuoteClient` instance is reused per run (`grab_quote_permission()` transfers device access, it does not purchase permission).
 
 Acceptance:
 
 1. read paper account state;
-2. preview the small test order;
-3. submit through the normal guarded TradeHub path;
-4. receive a broker order ID;
-5. read the order back through `/account/orders`/MCP;
-6. cancel it;
-7. read back the cancelled/final broker state;
-8. reconcile audit events to the same broker order ID;
-9. verify no unintended additional order was created.
+2. prove broker-reported `accountType=PAPER` from Tiger account information (never inferred from sandbox flags, account-number shape, filenames, or prose);
+3. fetch Tiger delayed US quote and record delayed price, source, staleness classification, retrieval timestamp;
+4. derive the deterministic conservative limit (`delayed_price * 0.50`) and enforce acceptance notional/quantity caps;
+5. preview the small test order;
+6. submit through the normal guarded TradeHub path;
+7. receive a broker order ID;
+8. read the order back through `/account/orders`/MCP;
+9. cancel it; if the paper order filled before cancellation, handle the fill explicitly (record `unexpected_paper_fill=true`, verify the fill belongs to the intended order, reconcile fully, surface residual PAPER position rather than improvising a market order or touching a live account);
+10. read back the cancelled/final broker state;
+11. reconcile audit events to the same broker order ID;
+12. verify no unintended additional order was created.
 
-Any inability to prove `PAPER` or non-marketable safety returns `BLOCKED`. Never fall back to a live account or market order.
+Any inability to prove `PAPER` or to obtain a usable delayed reference returns `BLOCKED`. Never fall back to a live account or market order. Because PAPER is independently proven, an unexpected fill is an acceptance event to be recorded and reconciled — not a real-money safety failure.
 
 ## Deployment Pack
 
@@ -301,7 +306,7 @@ Chosen: DeepSeek V4 Flash runs/reports; source changes escalate to a coding agen
 
 Rejected: reuse `TIGEROPEN_SANDBOX` as evidence of paper trading or weaken the normal confirmation skill.
 
-Chosen: broker-reported `accountType=PAPER`, a separate acceptance authority, stricter test caps, non-marketable limit-order proof, and fail-closed writes.
+Chosen: broker-reported `accountType=PAPER`, a separate acceptance authority, stricter test caps, a deterministic conservative limit from a DELAYED quote reference, and fail-closed writes.
 
 ### Scalability
 
