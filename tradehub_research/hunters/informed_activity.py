@@ -156,7 +156,11 @@ def evaluate(context: ScreenContext, security_id: SecurityId) -> ScreenResultPay
     total_value = sum(float(p["shares"]) * float(p["price_per_share"]) for p in purchases)
     distinct_buyers = len({p.get("owner_id") for p in purchases if p.get("owner_id")})
     ratio = total_value / market_cap
-    features["purchase_value_to_market_cap"] = feature_value(round(ratio, 8), "ratio", [])
+    features["purchase_value_to_market_cap"] = feature_value(
+        round(ratio, 8),
+        "ratio",
+        features["purchase_value_90d"]["sources"] + features["market_cap"]["sources"],
+    )
 
     pats = [p.get("public_available_time") for p in purchases]
     quality = min_freshness(pats, as_of, int(params["lookback_days"]) * 2)

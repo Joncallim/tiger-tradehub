@@ -130,7 +130,9 @@ def _load_facts(db, as_of: str, universe: list[str]) -> dict[str, list[dict[str,
         WITH RECURSIVE visible_chain(root_id, descendant_id) AS (
             SELECT candidate.evidence_id, candidate.evidence_id
             FROM evidence_event candidate
-            WHERE candidate.public_available_time IS NOT NULL
+            WHERE candidate.security_id IN ({placeholders})
+              AND json_extract(candidate.structured_fields,'$.record_type')='xbrl_fact'
+              AND candidate.public_available_time IS NOT NULL
               AND candidate.public_available_time <= ?
               AND NOT EXISTS (
                 SELECT 1 FROM evidence_event predecessor
@@ -143,6 +145,8 @@ def _load_facts(db, as_of: str, universe: list[str]) -> dict[str, list[dict[str,
               ON successor.supersedes_evidence_id=chain.descendant_id
             WHERE successor.public_available_time IS NOT NULL
               AND successor.public_available_time <= ?
+              AND successor.security_id IN ({placeholders})
+              AND json_extract(successor.structured_fields,'$.record_type')='xbrl_fact'
         ), terminal(root_id, descendant_id) AS (
             SELECT chain.root_id, chain.descendant_id FROM visible_chain chain
             WHERE NOT EXISTS (
@@ -164,7 +168,7 @@ def _load_facts(db, as_of: str, universe: list[str]) -> dict[str, list[dict[str,
           AND e.security_id IN ({placeholders})
         ORDER BY e.security_id, e.public_available_time, e.evidence_id
         """,
-        (as_of, as_of, as_of, as_of, *universe),
+        (*universe, as_of, as_of, as_of, *universe, as_of, *universe),
     ).fetchall()
     return _group_fields(rows)
 
@@ -180,7 +184,9 @@ def _load_record_kind(
         WITH RECURSIVE visible_chain(root_id, descendant_id) AS (
             SELECT candidate.evidence_id, candidate.evidence_id
             FROM evidence_event candidate
-            WHERE candidate.public_available_time IS NOT NULL
+            WHERE candidate.security_id IN ({placeholders})
+              AND json_extract(candidate.structured_fields,'$.record_type')=?
+              AND candidate.public_available_time IS NOT NULL
               AND candidate.public_available_time <= ?
               AND NOT EXISTS (
                 SELECT 1 FROM evidence_event predecessor
@@ -193,6 +199,8 @@ def _load_record_kind(
               ON successor.supersedes_evidence_id=chain.descendant_id
             WHERE successor.public_available_time IS NOT NULL
               AND successor.public_available_time <= ?
+              AND successor.security_id IN ({placeholders})
+              AND json_extract(successor.structured_fields,'$.record_type')=?
         ), terminal(root_id, descendant_id) AS (
             SELECT chain.root_id, chain.descendant_id FROM visible_chain chain
             WHERE NOT EXISTS (
@@ -214,7 +222,18 @@ def _load_record_kind(
           AND e.security_id IN ({placeholders})
         ORDER BY e.security_id, e.public_available_time, e.evidence_id
         """,
-        (as_of, as_of, as_of, as_of, record_type, *universe),
+        (
+            *universe,
+            record_type,
+            as_of,
+            as_of,
+            as_of,
+            *universe,
+            record_type,
+            as_of,
+            record_type,
+            *universe,
+        ),
     ).fetchall()
     return _group_fields(rows)
 
@@ -252,21 +271,37 @@ def _load_identity_events(db, as_of: str, universe: list[str]) -> dict[str, list
     return grouped
 
 
-def _load_form4_coverage(db, universe: list[str]) -> dict[str, frozenset[str]]:
+def _load_form4_coverage(db, as_of: str, universe: list[str]) -> dict[str, frozenset[str]]:
     """Settled EDGAR daily-index dates scanned per security (bounded query)."""
     if not universe:
         return {}
     placeholders = ",".join("?" for _ in universe)
     rows = db.execute(
         f"""
-        SELECT security_id, json_extract(structured_fields,'$.index_date') AS index_date
-        FROM evidence_event
-        WHERE json_extract(structured_fields,'$.record_type') = 'form4_index_coverage'
-          AND withdrawn = 0
-          AND security_id IN ({placeholders})
+        WITH RECURSIVE visible_chain(root_id, descendant_id) AS (
+          SELECT e.evidence_id,e.evidence_id FROM evidence_event e
+          WHERE e.security_id IN ({placeholders})
+            AND json_extract(e.structured_fields,'$.record_type')='form4_index_coverage'
+            AND e.public_available_time IS NOT NULL AND e.public_available_time <= ?
+            AND e.pat_provenance IN ('source_reported','derived_from_index')
+            AND NOT EXISTS (SELECT 1 FROM evidence_event p
+              WHERE p.evidence_id=e.supersedes_evidence_id
+                AND p.public_available_time IS NOT NULL AND p.public_available_time <= ?)
+          UNION ALL
+          SELECT c.root_id,s.evidence_id FROM visible_chain c JOIN evidence_event s
+            ON s.supersedes_evidence_id=c.descendant_id
+          WHERE s.public_available_time IS NOT NULL AND s.public_available_time <= ?
+        ), terminal AS (
+          SELECT c.* FROM visible_chain c WHERE NOT EXISTS (
+            SELECT 1 FROM visible_chain x JOIN evidence_event e ON e.evidence_id=x.descendant_id
+            WHERE x.root_id=c.root_id AND e.supersedes_evidence_id=c.descendant_id)
+        )
+        SELECT e.security_id, json_extract(e.structured_fields,'$.index_date') AS index_date
+        FROM evidence_event e JOIN terminal t ON t.descendant_id=e.evidence_id
+        WHERE e.withdrawn = 0
         ORDER BY security_id, index_date
         """,
-        tuple(universe),
+        (*universe, as_of, as_of, as_of),
     ).fetchall()
     coverage: dict[str, set[str]] = {}
     for row in rows:
@@ -275,12 +310,21 @@ def _load_form4_coverage(db, universe: list[str]) -> dict[str, frozenset[str]]:
     return {sid: frozenset(dates) for sid, dates in coverage.items()}
 
 
-def _load_identity_feed_state(db) -> bool:
+def _load_identity_feed_state(db, as_of: str, universe: list[str]) -> bool:
     """The identity feed is complete when a settled feed marker exists."""
+    if not universe:
+        return False
+    placeholders = ",".join("?" for _ in universe)
     row = db.execute(
-        "SELECT COUNT(*) FROM evidence_event "
-        "WHERE json_extract(structured_fields,'$.record_type')='identity_feed_marker' "
-        "AND withdrawn = 0"
+        f"SELECT COUNT(*) FROM evidence_event WHERE security_id IN ({placeholders}) "
+        "AND json_extract(structured_fields,'$.record_type')='identity_feed_marker' "
+        "AND public_available_time IS NOT NULL AND public_available_time <= ? "
+        "AND pat_provenance IN ('source_reported','derived_from_index') AND withdrawn=0 "
+        "AND NOT EXISTS (SELECT 1 FROM evidence_event successor "
+        "WHERE successor.supersedes_evidence_id=evidence_event.evidence_id "
+        "AND successor.public_available_time IS NOT NULL "
+        "AND successor.public_available_time <= ?)",
+        (*universe, as_of, as_of),
     ).fetchone()
     return bool(row and row[0] > 0)
 
@@ -299,6 +343,7 @@ def _input_view_hash(
     corporate_actions: dict[str, list[dict[str, Any]]],
     form4_coverage: dict[str, frozenset[str]],
     identity_feed_complete: bool,
+    cluster_lookup: dict[str, set[str]],
 ) -> str:
     """Canonical hash of the read-only as-of evidence view."""
 
@@ -309,7 +354,9 @@ def _input_view_hash(
         }
 
     view = {
-        "universe": [row["security_id"] for row in universe],
+        "universe": [
+            {"security_id": row["security_id"], "sector": row.get("sector")} for row in universe
+        ],
         "facts": evidence_ids(facts),
         "price_bars": evidence_ids(price_bars),
         "form4": evidence_ids(form4),
@@ -320,6 +367,7 @@ def _input_view_hash(
         "corporate_actions": evidence_ids(corporate_actions),
         "form4_coverage": {sid: sorted(dates) for sid, dates in sorted(form4_coverage.items())},
         "identity_feed_complete": identity_feed_complete,
+        "clusters": {key: sorted(value) for key, value in sorted(cluster_lookup.items())},
     }
     return _hash(canonical_json(view))
 
@@ -349,17 +397,19 @@ def run_screening(
         if snapshot_id is not None and snapshot_id != handle.manifest["snapshot_id"]:
             raise ValueError("snapshot_id does not match the configured snapshot path")
         snapshot_id = handle.manifest["snapshot_id"]
-        universe_rows = _load_universe(db, as_of, config.universe_coverage)
-        universe = [row["security_id"] for row in universe_rows]
-        facts = _load_facts(db, as_of, universe)
-        price_bars = _load_record_kind(db, as_of, universe, "price_bar")
-        form4 = _load_record_kind(db, as_of, universe, "form4_transaction")
-        corporate_actions_split = _load_record_kind(db, as_of, universe, "split")
-        corporate_actions_div = _load_record_kind(db, as_of, universe, "dividend")
-        identity_events = _load_identity_events(db, as_of, universe)
-        form4_coverage = _load_form4_coverage(db, universe)
-        identity_feed_complete = _load_identity_feed_state(db)
-        db.close()
+        try:
+            universe_rows = _load_universe(db, as_of, config.universe_coverage)
+            universe = [row["security_id"] for row in universe_rows]
+            facts = _load_facts(db, as_of, universe)
+            price_bars = _load_record_kind(db, as_of, universe, "price_bar")
+            form4 = _load_record_kind(db, as_of, universe, "form4_transaction")
+            corporate_actions_split = _load_record_kind(db, as_of, universe, "split")
+            corporate_actions_div = _load_record_kind(db, as_of, universe, "dividend")
+            identity_events = _load_identity_events(db, as_of, universe)
+            form4_coverage = _load_form4_coverage(db, as_of, universe)
+            identity_feed_complete = _load_identity_feed_state(db, as_of, universe)
+        finally:
+            db.close()
     else:
         with database.connect(read_only=True) as db:
             universe_rows = _load_universe(db, as_of, config.universe_coverage)
@@ -370,8 +420,8 @@ def run_screening(
             corporate_actions_split = _load_record_kind(db, as_of, universe, "split")
             corporate_actions_div = _load_record_kind(db, as_of, universe, "dividend")
             identity_events = _load_identity_events(db, as_of, universe)
-            form4_coverage = _load_form4_coverage(db, universe)
-            identity_feed_complete = _load_identity_feed_state(db)
+            form4_coverage = _load_form4_coverage(db, as_of, universe)
+            identity_feed_complete = _load_identity_feed_state(db, as_of, universe)
 
     corporate_actions: dict[str, list[dict[str, Any]]] = {}
     for grouped, kind in ((corporate_actions_split, "split"), (corporate_actions_div, "dividend")):
@@ -381,7 +431,15 @@ def run_screening(
             corporate_actions.setdefault(sid, []).extend(items)
 
     sectors = {row["security_id"]: row.get("sector") for row in universe_rows}
-    universe_hash = _hash(canonical_json(universe))
+    universe_hash = _hash(
+        canonical_json(
+            [
+                {"security_id": row["security_id"], "sector": row.get("sector")}
+                for row in universe_rows
+            ]
+        )
+    )
+    cluster_lookup = store.cluster_ids_by_evidence(as_of)
 
     manifest = []
     for spec, _fn in specs:
@@ -397,13 +455,14 @@ def run_screening(
         corporate_actions,
         form4_coverage,
         identity_feed_complete,
+        cluster_lookup,
     )
 
     run_id = store.begin_run(
         as_of=as_of,
         universe_hash=universe_hash,
         screen_manifest=manifest,
-        funnel_config=config.funnel.as_dict(),
+        funnel_config={**config.funnel.as_dict(), "holdings": sorted(config.holdings)},
         input_view_hash=input_view_hash,
         expected_security_count=len(universe),
         input_snapshot_id=snapshot_id,
@@ -423,27 +482,31 @@ def run_screening(
         corporate_actions=corporate_actions,
     )
 
-    for spec, fn in specs:
-        if store.verify_screen_population(run_id, spec.config_hash, universe):
-            continue  # retry: this screen's population is already complete
-        results = []
-        for security_id in universe:
-            payload = fn(context, security_id)
-            results.append(
-                ScreenResult.create(
-                    run_id=run_id,
-                    security_id=security_id,
-                    config_hash=spec.config_hash,
-                    raw_features=payload.raw_features,
-                    evidence_ids=payload.evidence_ids,
-                    reason_codes=payload.reason_codes,
-                    sufficient_data=payload.sufficient_data,
-                    passed=payload.passed,
-                    confidence=payload.confidence,
-                    data_quality=payload.data_quality,
+    try:
+        for spec, fn in specs:
+            if store.verify_screen_population(run_id, spec.config_hash, universe):
+                continue  # retry: this screen's population is already complete
+            results = []
+            for security_id in universe:
+                payload = fn(context, security_id)
+                results.append(
+                    ScreenResult.create(
+                        run_id=run_id,
+                        security_id=security_id,
+                        config_hash=spec.config_hash,
+                        raw_features=payload.raw_features,
+                        evidence_ids=payload.evidence_ids,
+                        reason_codes=payload.reason_codes,
+                        sufficient_data=payload.sufficient_data,
+                        passed=payload.passed,
+                        confidence=payload.confidence,
+                        data_quality=payload.data_quality,
+                    )
                 )
-            )
-        store.persist_screen_population(run_id, spec.config_hash, results)
+            store.persist_screen_population(run_id, spec.config_hash, results)
+    except Exception as exc:
+        store.fail_run(run_id, {"reason": "screen_compute_error", "detail": str(exc)})
+        raise
 
     store.complete_run(run_id)
 
@@ -471,18 +534,12 @@ def run_screening(
         holdings=set(config.holdings),
         results=family_rows,
         sectors=sectors,
-        cluster_lookup=store.cluster_ids_by_evidence(),
+        cluster_lookup=cluster_lookup,
     )
     store.persist_candidates(run_id, candidates)
-    if flags:
-        # Blocking condition for downstream committee launch.  Stored as a
-        # run-note row in pipeline_run.failure_json is forbidden on COMPLETE
-        # (immutable trigger), so surface it through the return value's logs.
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "run %s has blocking flags: %s", run_id, ",".join(flags)
-        )
+    if config.holdings - set(universe):
+        flags.append("holding_not_in_universe")
+    store.persist_run_flags(run_id, flags)
     return run_id
 
 

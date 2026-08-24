@@ -57,6 +57,7 @@ def test_form4_raw_xml_and_amendment_supersession(tmp_path):
         meta.raw_bytes,
         meta,
         accession="0000001001-25-000002",
+        filed="2025-01-03",
         acceptance_time="2025-01-04T18:30:00Z",
         supersedes_accession="0000001001-25-000001",
     )[0]
@@ -64,7 +65,10 @@ def test_form4_raw_xml_and_amendment_supersession(tmp_path):
     assert row.structured_fields["acquired_disposed"] == "A"
     assert row.structured_fields["direct_indirect"] == "D"
     assert row.structured_fields["amendment"] is True
-    assert row.envelope.supersedes_source_record_id.endswith(":tx:n:1")
+    assert row.envelope.supersedes_source_record_id.startswith("0000001001-25-000001:tx:")
+    assert row.structured_fields["shares"] == 100
+    assert row.structured_fields["price_per_share"] == 12.5
+    assert row.structured_fields["owner_id"] == "2001"
 
 
 def test_tiingo_license_and_token_fail_closed_without_network(tmp_path):
@@ -172,3 +176,106 @@ def test_common_ingest_resolves_identity_and_is_idempotent(tmp_path):
     assert first == second and len(store.current("s1")) == 4
     with pytest.raises(ValueError, match="unresolved"):
         ingest_records(adapter.parse(meta.raw_bytes, meta, ticker="MISSING"), store, dry_run=True)
+
+
+def test_form4_parser_to_hunter_can_pass(tmp_path):
+    from tradehub_research.hunters import informed_activity
+    from tradehub_research.screens import ScreenContext
+
+    meta = fetched("sec_form4.xml")
+    parsed = sec(tmp_path).parse_form4(
+        meta.raw_bytes,
+        meta,
+        accession="a",
+        filed="2025-01-03",
+        acceptance_time="2025-01-04T18:30:00Z",
+    )[0]
+    one = {
+        **parsed.structured_fields,
+        "evidence_id": "e1",
+        "public_available_time": parsed.envelope.public_available_time,
+        "shares": 10000,
+        "owner_id": "o1",
+    }
+    two = {**one, "evidence_id": "e2", "owner_id": "o2"}
+    days = informed_activity._window_dates(__import__("datetime").date(2025, 4, 1), 90)
+    shares = {
+        "metric": "shares_outstanding",
+        "concept": "EntityCommonStockSharesOutstanding",
+        "value": 1_000_000,
+        "unit": "shares",
+        "period_end": "2025-03-01",
+        "public_available_time": "2025-03-02T00:00:00Z",
+        "evidence_id": "shares",
+    }
+    bar = {
+        "session_date": "2025-03-31",
+        "close": 10.0,
+        "public_available_time": "2025-03-31T23:15:00Z",
+        "evidence_id": "bar",
+    }
+    ctx = ScreenContext(
+        facts={"S": [shares]},
+        price_bars={"S": [bar]},
+        form4={"S": [one, two]},
+        identity_events={},
+        market_caps={"S": 10_000_000},
+        universe=["S"],
+        as_of="2025-04-01T01:00:00Z",
+        sectors={"S": "Technology"},
+        form4_coverage={"S": frozenset(days)},
+    )
+    assert informed_activity.evaluate(ctx, "S").passed
+
+
+def test_tiingo_quota_retries_persist_and_bootstrap_boundary(tmp_path):
+    calls = []
+
+    class Fake:
+        def get(self, url, **kwargs):
+            calls.append(url)
+            status = 500 if len(calls) < 3 else 200
+            return httpx.Response(status, content=b"[]", request=httpx.Request("GET", url))
+
+    adapter = TiingoEodAdapter(
+        token="x",
+        license_confirmed=True,
+        user_agent="ua",
+        cache_dir=tmp_path,
+        transport=Fake(),
+        sleep=lambda _x: None,
+    )
+    adapter.fetch_prices("AAA", "2025-01-01", "2025-01-02")
+    restarted = TiingoQuota(state_path=tmp_path / "tiingo-operational.sqlite")
+    assert restarted.remaining(__import__("time").time())["daily"] == 897
+    for i in range(1, 450):
+        restarted.reserve_bootstrap_symbol(f"S{i:03}", 1000)
+    with pytest.raises(RuntimeError, match="450-symbol"):
+        restarted.reserve_bootstrap_symbol("OVER", 1000)
+    restarted.reserve_bootstrap_symbol("AAA", 1000)  # refresh is free
+
+
+def test_network_response_byte_ceiling_declared_and_chunked(tmp_path):
+    class Fake:
+        def __init__(self, response):
+            self.response = response
+
+        def get(self, *_args, **_kwargs):
+            return self.response
+
+    request = httpx.Request("GET", "https://example.test")
+    declared = httpx.Response(
+        200, headers={"Content-Length": "9"}, content=b"123456789", request=request
+    )
+    with pytest.raises(ValueError, match="byte ceiling"):
+        NetworkClient(
+            user_agent="ua", cache_dir=tmp_path, transport=Fake(declared), max_response_bytes=8
+        ).fetch(str(request.url))
+    chunked = httpx.Response(200, content=b"123456789", request=request)
+    with pytest.raises(ValueError, match="byte ceiling"):
+        NetworkClient(
+            user_agent="ua", cache_dir=tmp_path, transport=Fake(chunked), max_response_bytes=8
+        ).fetch(str(request.url))
+    assert not [
+        p for p in tmp_path.rglob("*") if p.is_file() and p.name != "tiingo-operational.sqlite"
+    ]

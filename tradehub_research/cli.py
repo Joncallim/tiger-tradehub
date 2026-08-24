@@ -24,6 +24,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ticker", help="canonical ticker for Tiingo fixture")
     parser.add_argument("--security-id", help="canonical security identity for SEC fixture")
     parser.add_argument("--accession", help="SEC Form 4 accession")
+    parser.add_argument("--filed", help="SEC filed date (required for Form 4 fallback PAT)")
+    parser.add_argument("--acceptance-time", help="SEC source-reported acceptanceDateTime")
+    parser.add_argument("--supersedes-accession", help="original accession replaced by Form 4/A")
     args = parser.parse_args(argv)
 
     settings = ResearchSettings()
@@ -58,12 +61,44 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.kind == "index":
                 records = adapter.parse_daily_index(raw, fetched)
+                if args.security_id:
+                    index_dates = sorted({r.structured_fields["filed"] for r in records})
+                    if not index_dates and args.filed:
+                        index_dates = [args.filed]  # settled-empty/non-publication marker
+                    records.extend(
+                        marker
+                        for index_date in index_dates
+                        for marker in adapter.index_completeness_records(
+                            fetched, index_date=index_date, security_ids=[args.security_id]
+                        )
+                    )
             elif args.kind == "companyfacts":
                 records = adapter.parse_companyfacts(raw, fetched)
-            elif args.kind == "form4" and args.accession:
-                records = adapter.parse_form4(raw, fetched, accession=args.accession)
+            elif args.kind == "form4" and args.accession and args.filed:
+                predecessor_keys: set[str] = set()
+                if args.supersedes_accession:
+                    with database.connect(read_only=True) as db:
+                        predecessor_keys = {
+                            str(row[0]).rsplit(":tx:", 1)[1]
+                            for row in db.execute(
+                                "SELECT source_record_id FROM evidence_event "
+                                "WHERE source_id='sec_form4' AND source_record_id LIKE ?",
+                                (f"{args.supersedes_accession}:tx:%",),
+                            )
+                        }
+                records = adapter.parse_form4(
+                    raw,
+                    fetched,
+                    accession=args.accession,
+                    filed=args.filed,
+                    acceptance_time=args.acceptance_time,
+                    supersedes_accession=args.supersedes_accession,
+                    supersedes_transaction_keys=predecessor_keys,
+                )
             else:
-                parser.error("SEC kind must be index/companyfacts or form4 with --accession")
+                parser.error(
+                    "SEC kind must be index/companyfacts or form4 with --accession/--filed"
+                )
             if not args.security_id:
                 parser.error("SEC fixture ingestion requires canonical --security-id")
             records = adapter.with_security(records, args.security_id)

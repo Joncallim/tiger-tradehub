@@ -44,6 +44,13 @@ CONCEPT_ALIASES = {
 _SEC_BUCKET = TokenBucket(2.0)
 
 
+def _number(value: str | None) -> int | float | None:
+    if value is None or not value.strip():
+        return None
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
 def _next_day_pat(filed: str) -> str:
     local = datetime.combine(date.fromisoformat(filed) + timedelta(days=1), datetime.min.time())
     return (
@@ -129,6 +136,48 @@ class SecAdapter(NetworkClient):
             )
             rows.append(ParsedRecord(envelope, cik.zfill(10), "cik", fields))
         return rows
+
+    def index_completeness_records(
+        self,
+        metadata: FetchResult,
+        *,
+        index_date: str,
+        security_ids: list[str],
+        identity_feed_scanned: bool = True,
+    ) -> list[ParsedRecord]:
+        """Emit settled-empty-capable completeness markers for a scanned index.
+
+        The caller supplies the issuer universe covered by the global scan, so
+        issuers with no filing still receive an explicit settled marker.
+        """
+        pat = _next_day_pat(index_date)
+        records: list[ParsedRecord] = []
+        for security_id in sorted(set(security_ids)):
+            kinds = ["form4_index_coverage"]
+            if identity_feed_scanned:
+                kinds.append("identity_feed_marker")
+            for kind in kinds:
+                fields = {
+                    "record_type": kind,
+                    "index_date": index_date,
+                    "settled_empty_allowed": True,
+                }
+                envelope = envelope_from_fetch(
+                    metadata,
+                    source_id="sec_index",
+                    source_record_id=f"{security_id}:{index_date}:{kind}",
+                    parser_version=PARSER_VERSION,
+                    event_time=index_date,
+                    public_available_time=pat,
+                    pat_provenance="derived_from_index",
+                    freshness=Freshness(
+                        last_success_at=metadata.retrieved_at,
+                        max_source_time_seen=index_date,
+                        expected_cadence="settled SEC business day",
+                    ),
+                )
+                records.append(ParsedRecord(envelope, security_id, "security_id", fields))
+        return records
 
     def parse_companyfacts(
         self,
@@ -261,8 +310,10 @@ class SecAdapter(NetworkClient):
         metadata: FetchResult,
         *,
         accession: str,
+        filed: str,
         acceptance_time: str | None = None,
         supersedes_accession: str | None = None,
+        supersedes_transaction_keys: set[str] | None = None,
     ) -> list[ParsedRecord]:
         root = ET.fromstring(raw)
         get = lambda path: root.findtext(path)  # noqa: E731
@@ -290,7 +341,10 @@ class SecAdapter(NetworkClient):
             else None,
         }
         amended = (get("documentType") or "").endswith("/A") or get("amendmentFlag") == "1"
-        pat = acceptance_time or _next_day_pat(get("periodOfReport") or date.today().isoformat())
+        # The filing date is supplied by the index/submissions seam.  Falling
+        # back to periodOfReport would disclose a filing before it was filed;
+        # falling back to today's date would make fixture parsing nondeterministic.
+        pat = acceptance_time or _next_day_pat(filed)
         provenance = "source_reported" if acceptance_time else "derived_from_index"
         records: list[ParsedRecord] = []
         paths = (
@@ -298,7 +352,7 @@ class SecAdapter(NetworkClient):
             ("derivativeTable/derivativeTransaction", True),
         )
         for table_path, derivative in paths:
-            for position, tx in enumerate(root.findall(table_path), 1):
+            for tx in root.findall(table_path):
 
                 def value(path: str, node: ET.Element = tx) -> str | None:
                     return node.findtext(path + "/value")
@@ -315,8 +369,10 @@ class SecAdapter(NetworkClient):
                     "acquired_disposed": value(
                         "transactionAmounts/transactionAcquiredDisposedCode"
                     ),
-                    "shares": value("transactionAmounts/transactionShares"),
-                    "price": value("transactionAmounts/transactionPricePerShare"),
+                    "shares": _number(value("transactionAmounts/transactionShares")),
+                    "price_per_share": _number(
+                        value("transactionAmounts/transactionPricePerShare")
+                    ),
                     "post_transaction_shares": value(
                         "postTransactionAmounts/sharesOwnedFollowingTransaction"
                     ),
@@ -326,12 +382,23 @@ class SecAdapter(NetworkClient):
                     "amendment": amended,
                     "footnote_ids": [x.attrib.get("id") for x in tx.findall(".//footnoteId")],
                 }
-                source_id = f"{accession}:tx:{'d' if derivative else 'n'}:{position}"
+                fields["owner_id"] = fields["reporting_owner_cik"]
+                transaction_key = canonical_hash(
+                    {
+                        "derivative": derivative,
+                        "owner_id": fields["owner_id"],
+                        "security_title": fields["security_title"],
+                        "transaction_date": fields["transaction_date"],
+                        "transaction_code": fields["transaction_code"],
+                        "acquired_disposed": fields["acquired_disposed"],
+                        "direct_indirect": fields["direct_indirect"],
+                        "footnote_ids": fields["footnote_ids"],
+                    }
+                )
+                source_id = f"{accession}:tx:{transaction_key}"
                 predecessor = None
                 if supersedes_accession:
-                    predecessor = (
-                        f"{supersedes_accession}:tx:{'d' if derivative else 'n'}:{position}"
-                    )
+                    predecessor = f"{supersedes_accession}:tx:{transaction_key}"
                 envelope = envelope_from_fetch(
                     metadata,
                     source_id="sec_form4",
@@ -346,6 +413,25 @@ class SecAdapter(NetworkClient):
                     ),
                 )
                 records.append(ParsedRecord(envelope, cik, "cik", fields))
+        if supersedes_accession and supersedes_transaction_keys:
+            current_keys = {r.envelope.source_record_id.rsplit(":tx:", 1)[1] for r in records}
+            for transaction_key in sorted(supersedes_transaction_keys - current_keys):
+                predecessor = f"{supersedes_accession}:tx:{transaction_key}"
+                envelope = envelope_from_fetch(
+                    metadata,
+                    source_id="sec_form4",
+                    source_record_id=f"{accession}:withdraw:{transaction_key}",
+                    parser_version=PARSER_VERSION,
+                    event_time=filed,
+                    public_available_time=pat,
+                    pat_provenance=provenance,
+                    supersedes_source_record_id=predecessor,
+                    withdrawn=True,
+                    freshness=Freshness(
+                        last_success_at=metadata.retrieved_at, max_source_time_seen=filed
+                    ),
+                )
+                records.append(ParsedRecord(envelope, cik, "cik", {}))
         return records
 
     @staticmethod

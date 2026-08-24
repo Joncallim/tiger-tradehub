@@ -69,14 +69,14 @@ def result(run_id, spec, security_id="s1", *, passed=True, computed_at=None):
     )
 
 
-def test_schema_v6_applies_fresh(database):
-    assert database.schema_version() == PHASE_0_SCHEMA_VERSION == 6
+def test_schema_v7_applies_fresh(database):
+    assert database.schema_version() == PHASE_0_SCHEMA_VERSION == 7
     with database.connect(read_only=True) as db:
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"screen_definition", "pipeline_run", "screen_result", "candidate"} <= tables
 
 
-def test_schema_v6_migrates_a_v5_database(tmp_path):
+def test_schema_v7_migrates_a_v5_database(tmp_path):
     database = ResearchDB(tmp_path / "v5.db")
     with database.connect() as db:
         db.execute(
@@ -87,7 +87,7 @@ def test_schema_v6_migrates_a_v5_database(tmp_path):
             db.executescript(sql)
             db.execute("INSERT INTO schema_version VALUES (?,?,?)", (version, "now", description))
     assert database.schema_version() == 5
-    assert database.migrate() == 6
+    assert database.migrate() == 7
 
 
 def test_screen_spec_canonical_hash_is_order_independent():
@@ -291,12 +291,14 @@ def test_result_and_candidate_rows_are_structurally_append_only(database, spec):
         db.execute("UPDATE screen_result SET confidence=0.5")
 
 
-def test_candidate_write_after_complete_is_rejected(database, spec):
+def test_candidate_write_after_complete_is_allowed_and_append_only(database, spec):
     store = ScreenStore(database)
     run_id = start(store, spec, count=0)
     store.complete_run(run_id)
-    with database.connect() as db, pytest.raises(sqlite3.IntegrityError, match="immutable"):
+    with database.connect() as db:
         db.execute(
             "INSERT INTO candidate VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             ("c", run_id, "s1", 1, "[]", "[]", "{}", 0, None, None, None, "now"),
         )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            db.execute("UPDATE candidate SET ordinal=2 WHERE candidate_id='c'")
