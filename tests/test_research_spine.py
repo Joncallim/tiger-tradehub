@@ -32,7 +32,7 @@ def test_schema_and_migration_are_idempotent(tmp_path):
     assert database.migrate() == PHASE_0_SCHEMA_VERSION
     assert database.check()["ok"]
     with database.connect(read_only=True) as db:
-        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 4
+        assert db.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 5
 
 
 def test_settings_use_only_research_prefix(monkeypatch, tmp_path):
@@ -378,6 +378,162 @@ def test_identity_is_pit_safe_append_only_and_correctable(tmp_path):
         )
 
 
+def test_identity_supersession_domains_do_not_erase_ticker_history(tmp_path):
+    database = initialized(tmp_path)
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+            ("s1", "OLD", "NYSE", "One", None, None, "SUPPORTED", "2020-01-01", None),
+        )
+    identities = SecurityIdentityStore(database)
+    baseline = identities.insert(
+        security_id="s1",
+        event_type="baseline",
+        old_value=None,
+        new_value="OLD",
+        event_time="2020-01-01",
+        public_available_time="2020-01-01",
+        pat_provenance="source_reported",
+    )
+    for event_type in ("share_class_change", "delisting"):
+        with pytest.raises(ValueError, match="compatible event domain"):
+            identities.insert(
+                security_id="s1",
+                event_type=event_type,
+                old_value="OLD",
+                new_value=None,
+                event_time="2025-01-01",
+                public_available_time="2025-01-01",
+                pat_provenance="source_reported",
+                supersedes_id=baseline,
+            )
+        assert identities.ticker_at("s1", "2026-01-01") == "OLD"
+
+    with database.connect() as db:
+        for event_type in ("share_class_change", "delisting"):
+            with pytest.raises(sqlite3.IntegrityError, match="compatible event domain"):
+                db.execute(
+                    """INSERT INTO security_identity_event(
+                    security_id,event_type,old_value,new_value,event_time,
+                    public_available_time,pat_provenance,ingested_time,supersedes_id
+                    ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        "s1",
+                        event_type,
+                        "OLD",
+                        None,
+                        "2025-01-01",
+                        "2025-01-01",
+                        "source_reported",
+                        "2025-01-01",
+                        baseline,
+                    ),
+                )
+
+    ticker_change = identities.insert(
+        security_id="s1",
+        event_type="ticker_change",
+        old_value="OLD",
+        new_value="NEW",
+        event_time="2025-01-01",
+        public_available_time="2025-01-01",
+        pat_provenance="source_reported",
+        supersedes_id=baseline,
+    )
+    assert ticker_change
+    assert identities.ticker_at("s1", "2026-01-01") == "NEW"
+
+
+def test_ticker_lineage_ignores_legacy_cross_domain_successors(tmp_path):
+    database = initialized(tmp_path)
+    with database.connect() as db:
+        for security_id in ("share", "delisted"):
+            db.execute(
+                "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    security_id,
+                    "OLD",
+                    "NYSE",
+                    "One",
+                    None,
+                    None,
+                    "SUPPORTED",
+                    "2020-01-01",
+                    None,
+                ),
+            )
+        db.execute("DROP TRIGGER identity_supersession_valid")
+        share_baseline = db.execute(
+            """INSERT INTO security_identity_event(
+            security_id,event_type,new_value,event_time,public_available_time,
+            pat_provenance,ingested_time
+            ) VALUES (?,?,?,?,?,?,?)""",
+            (
+                "share",
+                "baseline",
+                "OLD",
+                "2020-01-01",
+                "2020-01-01",
+                "source_reported",
+                "2020-01-01",
+            ),
+        ).lastrowid
+        db.execute(
+            """INSERT INTO security_identity_event(
+            security_id,event_type,old_value,new_value,event_time,public_available_time,
+            pat_provenance,ingested_time,supersedes_id
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                "share",
+                "share_class_change",
+                "A",
+                "B",
+                "2025-01-01",
+                "2025-01-01",
+                "source_reported",
+                "2025-01-01",
+                share_baseline,
+            ),
+        )
+        ticker_change = db.execute(
+            """INSERT INTO security_identity_event(
+            security_id,event_type,old_value,new_value,event_time,public_available_time,
+            pat_provenance,ingested_time
+            ) VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                "delisted",
+                "ticker_change",
+                "OLDER",
+                "OLD",
+                "2020-01-01",
+                "2020-01-01",
+                "source_reported",
+                "2020-01-01",
+            ),
+        ).lastrowid
+        db.execute(
+            """INSERT INTO security_identity_event(
+            security_id,event_type,old_value,event_time,public_available_time,
+            pat_provenance,ingested_time,supersedes_id
+            ) VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                "delisted",
+                "delisting",
+                "OLD",
+                "2025-01-01",
+                "2025-01-01",
+                "source_reported",
+                "2025-01-01",
+                ticker_change,
+            ),
+        )
+
+    identities = SecurityIdentityStore(database)
+    assert identities.ticker_at("share", "2020-01-01") == "OLD"
+    assert identities.ticker_at("share", "2026-01-01") == "OLD"
+    assert identities.ticker_at("delisted", "2026-01-01") == "OLD"
+
+
 def test_experiment_reruns_and_attempts_append(tmp_path):
     database = initialized(tmp_path)
     registry = ExperimentRegistry(database)
@@ -591,11 +747,18 @@ def test_installed_ra00_command_runs_outside_repository(tmp_path):
     ]
 
 
-def test_wheel_embeds_commit_for_outside_repository_execution(tmp_path):
+def test_sdist_to_wheel_embeds_commit_for_outside_repository_execution(tmp_path):
     root = os.path.dirname(os.path.dirname(__file__))
-    wheel_dir = tmp_path / "wheel"
+    expected_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    distribution_dir = tmp_path / "dist"
     built = subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(wheel_dir)],
+        [sys.executable, "-m", "build", "--outdir", str(distribution_dir)],
         cwd=root,
         text=True,
         capture_output=True,
@@ -605,7 +768,8 @@ def test_wheel_embeds_commit_for_outside_repository_execution(tmp_path):
     environment = tmp_path / "venv"
     venv.EnvBuilder(with_pip=True).create(environment)
     python = environment / "bin" / "python"
-    wheel = next(wheel_dir.glob("*.whl"))
+    assert next(distribution_dir.glob("*.tar.gz"))
+    wheel = next(distribution_dir.glob("*.whl"))
     installed = subprocess.run(
         [str(python), "-m", "pip", "install", str(wheel)],
         text=True,
@@ -621,7 +785,9 @@ def test_wheel_embeds_commit_for_outside_repository_execution(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert re.fullmatch(r"[0-9a-f]{40}", json.loads(result.stdout)["commit_sha"])
+    commit_sha = json.loads(result.stdout)["commit_sha"]
+    assert re.fullmatch(r"[0-9a-f]{40}", commit_sha)
+    assert commit_sha == expected_sha
 
 
 def test_package_has_no_tradehub_imports():

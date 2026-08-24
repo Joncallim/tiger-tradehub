@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PHASE_0_SCHEMA_VERSION = 4
+PHASE_0_SCHEMA_VERSION = 5
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -320,6 +320,34 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         ALTER TABLE snapshot_version ADD COLUMN status TEXT NOT NULL DEFAULT 'READY'
             CHECK (status IN ('PENDING','READY'));
         ALTER TABLE snapshot_version ADD COLUMN destination_path TEXT;
+        """,
+    ),
+    (
+        5,
+        "Enforce compatible identity supersession domains",
+        """
+        DROP TRIGGER identity_supersession_valid;
+        CREATE TRIGGER identity_supersession_valid BEFORE INSERT ON security_identity_event
+        WHEN NEW.supersedes_id IS NOT NULL BEGIN
+            SELECT CASE WHEN NEW.supersedes_id = NEW.id
+                THEN RAISE(ABORT, 'identity event cannot supersede itself') END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
+                    AND p.security_id=NEW.security_id
+            ) THEN RAISE(ABORT, 'identity supersession requires same security') END;
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
+                    AND NOT (
+                        p.event_type=NEW.event_type OR
+                        (p.event_type IN ('baseline','ticker_change') AND
+                         NEW.event_type IN ('baseline','ticker_change'))
+                    )
+            ) THEN RAISE(ABORT, 'identity supersession requires compatible event domain') END;
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM security_identity_event p WHERE p.id=NEW.supersedes_id
+                    AND NEW.public_available_time < p.public_available_time
+            ) THEN RAISE(ABORT, 'identity supersession cannot backdate knowledge time') END;
+        END;
         """,
     ),
 )
