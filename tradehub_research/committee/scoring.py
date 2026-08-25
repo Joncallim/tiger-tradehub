@@ -250,6 +250,14 @@ class Scorer:
                 "SELECT * FROM score_snapshot WHERE snapshot_id=?", (snapshot_id,)
             ).fetchone()
             if existing is not None:
+                self._transition(
+                    db,
+                    run_id,
+                    "READY_TO_SCORE",
+                    "SCORED",
+                    "SCORE_SNAPSHOT_REUSED",
+                    snapshot_id,
+                )
                 return self._decode(existing)
             prior = db.execute(
                 "SELECT s.*,p.as_of FROM score_snapshot s "

@@ -53,6 +53,10 @@ USAGE_KEYS = {"input_tokens", "output_tokens", "cached_tokens", "source"}
 COST_KEYS = {"amount", "currency", "source"}
 TELEMETRY_SOURCES = {"SELF_REPORTED", "UNKNOWN"}
 MAX_ASSESSMENT_BYTES = 64_000
+MAX_TOKEN_COUNT = 1_000_000_000
+MAX_COST_DIGITS = 32
+MAX_COST_SCALE = 12
+MAX_COST_INPUT_CHARS = 64
 
 
 class AssessmentValidationError(ValueError):
@@ -87,7 +91,9 @@ def normalize_usage(value: Any) -> dict[str, Any]:
     normalized: dict[str, Any] = {"source": source}
     for name in ("input_tokens", "output_tokens", "cached_tokens"):
         item = value[name]
-        if item is not None and (isinstance(item, bool) or not isinstance(item, int) or item < 0):
+        if item is not None and (
+            isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= MAX_TOKEN_COUNT
+        ):
             raise AssessmentValidationError(f"usage.{name} must be a nonnegative integer or null")
         if source == "UNKNOWN" and item is not None:
             raise AssessmentValidationError("UNKNOWN usage cannot contain token counts")
@@ -108,14 +114,29 @@ def normalize_cost(value: Any) -> dict[str, Any]:
     elif isinstance(amount, bool) or not isinstance(amount, (str, int, float, Decimal)):
         raise AssessmentValidationError("cost.amount must be a finite nonnegative decimal or null")
     else:
+        if isinstance(amount, str) and len(amount) > MAX_COST_INPUT_CHARS:
+            raise AssessmentValidationError("cost.amount exceeds decimal input bound")
+        if isinstance(amount, int) and amount.bit_length() > 128:
+            raise AssessmentValidationError("cost.amount exceeds decimal digit bound")
+        if isinstance(amount, Decimal):
+            amount_tuple = amount.as_tuple()
+            if len(amount_tuple.digits) > MAX_COST_DIGITS or (
+                isinstance(amount_tuple.exponent, int) and abs(amount_tuple.exponent) > 128
+            ):
+                raise AssessmentValidationError("cost.amount exceeds decimal digit or scale bound")
         try:
             decimal = Decimal(str(amount))
-        except InvalidOperation as exc:
+        except (InvalidOperation, ValueError) as exc:
             raise AssessmentValidationError(
                 "cost.amount must be a finite nonnegative decimal or null"
             ) from exc
         if not decimal.is_finite() or decimal < 0:
             raise AssessmentValidationError("cost.amount must be finite and nonnegative")
+        digits = len(decimal.as_tuple().digits)
+        integer_digits = max(1, decimal.adjusted() + 1) if decimal else 1
+        scale = max(0, -decimal.as_tuple().exponent)
+        if digits > MAX_COST_DIGITS or integer_digits > MAX_COST_DIGITS or scale > MAX_COST_SCALE:
+            raise AssessmentValidationError("cost.amount exceeds decimal digit or scale bound")
         normalized_amount = format(decimal.normalize(), "f")
     currency = value["currency"]
     if currency is not None and (not isinstance(currency, str) or not 1 <= len(currency) <= 12):
@@ -213,6 +234,10 @@ def validate_assessment(
                 raise AssessmentValidationError("invalid verdict")
             _string(verdict["statement"], "verdict statement")
             cited = _id_list(verdict["cited_evidence_ids"], "verdict evidence", in_pack)
+            if verdict["verdict"] != "unresolved" and not cited:
+                raise AssessmentValidationError(
+                    "resolving verdict must cite at least one in-pack evidence ID"
+                )
             all_citations.update(cited)
             normalized_claims.append({**dict(verdict), "cited_evidence_ids": sorted(cited)})
         claims = []
