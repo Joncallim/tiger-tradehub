@@ -193,19 +193,27 @@ class SecurityIdentityStore:
             return int(cursor.lastrowid)
 
     def ticker_at(self, security_id: str, as_of: str) -> str | None:
-        as_of = normalize_ts(as_of)
         with self.database.connect(read_only=True) as db:
-            event = db.execute(
-                """WITH RECURSIVE visible_chain(root_id,descendant_id) AS (
+            return self.ticker_at_connection(db, security_id, as_of)
+
+    @staticmethod
+    def ticker_at_connection(db: sqlite3.Connection, security_id: str, as_of: str) -> str | None:
+        """Resolve a PIT ticker within the caller's existing SQLite snapshot."""
+        as_of = normalize_ts(as_of)
+        event = db.execute(
+            """WITH RECURSIVE visible_chain(root_id,descendant_id) AS (
                     SELECT candidate.id,candidate.id FROM security_identity_event candidate
-                    WHERE candidate.public_available_time IS NOT NULL
+                    WHERE candidate.security_id=?
+                      AND candidate.public_available_time IS NOT NULL
                       AND candidate.event_type IN ('baseline','ticker_change')
+                      AND candidate.pat_provenance IN ('source_reported','derived_from_index')
                       AND candidate.public_available_time <= ?
                       AND candidate.event_time <= ?
                       AND NOT EXISTS (
                         SELECT 1 FROM security_identity_event predecessor
                         WHERE predecessor.id=candidate.supersedes_id
                           AND predecessor.event_type IN ('baseline','ticker_change')
+                          AND predecessor.pat_provenance IN ('source_reported','derived_from_index')
                           AND predecessor.public_available_time IS NOT NULL
                           AND predecessor.public_available_time <= ?
                           AND predecessor.event_time <= ?)
@@ -213,7 +221,9 @@ class SecurityIdentityStore:
                     SELECT chain.root_id,successor.id FROM visible_chain chain
                     JOIN security_identity_event successor
                       ON successor.supersedes_id=chain.descendant_id
+                     AND successor.security_id=?
                      AND successor.event_type IN ('baseline','ticker_change')
+                     AND successor.pat_provenance IN ('source_reported','derived_from_index')
                     WHERE successor.public_available_time IS NOT NULL
                       AND successor.public_available_time <= ?
                       AND successor.event_time <= ?
@@ -233,6 +243,31 @@ class SecurityIdentityStore:
                   AND identity.pat_provenance IN ('source_reported','derived_from_index')
                 ORDER BY identity.event_time DESC,identity.public_available_time DESC,
                     identity.id DESC LIMIT 1""",
-                (as_of, as_of, as_of, as_of, as_of, as_of, security_id),
+            (
+                security_id,
+                as_of,
+                as_of,
+                as_of,
+                as_of,
+                security_id,
+                as_of,
+                as_of,
+                security_id,
+            ),
+        ).fetchone()
+        return str(event["new_value"]) if event is not None else None
+
+    @staticmethod
+    def has_authoritative_ticker_history_connection(
+        db: sqlite3.Connection, security_id: str
+    ) -> bool:
+        """Return whether any authoritative ticker-domain identity history exists."""
+        return (
+            db.execute(
+                "SELECT 1 FROM security_identity_event WHERE security_id=? "
+                "AND event_type IN ('baseline','ticker_change') "
+                "AND pat_provenance IN ('source_reported','derived_from_index') LIMIT 1",
+                (security_id,),
             ).fetchone()
-            return str(event["new_value"]) if event is not None else None
+            is not None
+        )

@@ -69,14 +69,14 @@ def result(run_id, spec, security_id="s1", *, passed=True, computed_at=None):
     )
 
 
-def test_schema_v7_applies_fresh(database):
-    assert database.schema_version() == PHASE_0_SCHEMA_VERSION == 7
+def test_current_schema_applies_fresh(database):
+    assert database.schema_version() == PHASE_0_SCHEMA_VERSION == 9
     with database.connect(read_only=True) as db:
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"screen_definition", "pipeline_run", "screen_result", "candidate"} <= tables
 
 
-def test_schema_v7_migrates_a_v5_database(tmp_path):
+def test_current_schema_migrates_a_v5_database(tmp_path):
     database = ResearchDB(tmp_path / "v5.db")
     with database.connect() as db:
         db.execute(
@@ -87,7 +87,7 @@ def test_schema_v7_migrates_a_v5_database(tmp_path):
             db.executescript(sql)
             db.execute("INSERT INTO schema_version VALUES (?,?,?)", (version, "now", description))
     assert database.schema_version() == 5
-    assert database.migrate() == 7
+    assert database.migrate() == 9
 
 
 def test_screen_spec_canonical_hash_is_order_independent():

@@ -30,7 +30,14 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.2,<2.0"]
 telegram = ["python-telegram-bot>=21.4"]
-dev = ["build>=1.2.0", "pip-audit>=2.7.0", "pytest>=8.2.0", "ruff>=0.5.0"]
+dev = [
+  "build>=1.2.0",
+  "mcp>=1.2,<2.0",
+  "pip-audit>=2.7.0",
+  "pytest>=8.2.0",
+  "ruff==0.15.17",
+  "setuptools>=83.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/Joncallim/tiger-tradehub"
@@ -44,10 +51,11 @@ tradehub-telegram = "tradehub.telegram_bot:main"
 tradehub-acceptance = "tradehub.acceptance.runner:main"
 tradehub-research = "tradehub_research.cli:main"
 tradehub-research-acceptance = "tradehub_research.acceptance.runner:main"
+tradehub-research-mcp = "tradehub_research.mcp_server:main"
 research-db = "tradehub_research.cli:main"
 
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
