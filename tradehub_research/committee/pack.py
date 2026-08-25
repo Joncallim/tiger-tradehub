@@ -295,7 +295,12 @@ class EvidencePackBuilder:
         ticker_as_of = SecurityIdentityStore.ticker_at_connection(
             db, candidate["security_id"], candidate["as_of"]
         )
-        if not ticker_as_of:
+        if (
+            ticker_as_of is None
+            and not SecurityIdentityStore.has_authoritative_ticker_history_connection(
+                db, candidate["security_id"]
+            )
+        ):
             ticker_as_of = candidate["canonical_ticker"]
         body: dict[str, Any] = {
             "pack_spec_version": PACK_SPEC_VERSION,
