@@ -1263,7 +1263,9 @@ def test_pack_ticker_uses_knowable_supersession_version(tmp_path, as_of, expecte
 
 def test_pack_ticker_without_identity_event_uses_canonical_ticker(tmp_path):
     database, candidate_id = _fixture(tmp_path / "canonical-ticker.db")
-    assert EvidencePackBuilder(database).build(candidate_id).body["identity"]["ticker_as_of"] == "TST"
+    assert (
+        EvidencePackBuilder(database).build(candidate_id).body["identity"]["ticker_as_of"] == "TST"
+    )
 
 
 def test_candidate_trends_follow_as_of_not_snapshot_hash(tmp_path):
