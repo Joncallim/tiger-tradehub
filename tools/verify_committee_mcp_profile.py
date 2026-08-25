@@ -27,9 +27,7 @@ def deployed_profile(hermes: str) -> dict:
     if command_match is None:
         raise ValueError("Hermes test output did not report the stdio command")
     return {
-        "servers": [
-            {"name": EXPECTED_SERVER, "command": command_match.group(1), "tools": tools}
-        ]
+        "servers": [{"name": EXPECTED_SERVER, "command": command_match.group(1), "tools": tools}]
     }
 
 

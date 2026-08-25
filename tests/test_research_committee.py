@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from tradehub_research.committee.api import app, get_database, get_settings
 from tradehub_research.committee.pack import EvidencePackBuilder, PackBuildError
 from tradehub_research.committee.routing import CommitteeRouter
+from tradehub_research.committee.scoring import Scorer
 from tradehub_research.committee.store import CommitteeStore, ComparatorSpec, ScoringSpec
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
@@ -583,11 +584,7 @@ def _valid_assessment(
 ) -> dict[str, object]:
     claims = claims or []
     citations = sorted(
-        {
-            evidence_id
-            for claim in claims
-            for evidence_id in claim.get("cited_evidence_ids", [])
-        }
+        {evidence_id for claim in claims for evidence_id in claim.get("cited_evidence_ids", [])}
     )
     value = {
         **_assessment(pack_hash),
@@ -682,32 +679,48 @@ def test_targeted_focus_exact_coverage_and_atomic_rejection(tmp_path):
     with pytest.raises(ValueError, match="exactly cover"):
         router.submit(run, _attempt(work, "accepted", partial))
     with store.database.connect(read_only=True) as db:
-        assert db.execute(
-            "SELECT count(*) FROM model_assessment WHERE committee_run_id=? AND role='red_team'", (run,)
-        ).fetchone()[0] == 0
-        assert db.execute(
-            "SELECT count(*) FROM dispute_resolution WHERE committee_run_id=?", (run,)
-        ).fetchone()[0] == 0
-        assert db.execute(
-            "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
-        ).fetchone()[0] == 0
+        assert (
+            db.execute(
+                "SELECT count(*) FROM model_assessment WHERE committee_run_id=? AND role='red_team'",
+                (run,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT count(*) FROM dispute_resolution WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_shared_item_verdict_is_rejected_before_artifact_write(tmp_path):
     store, router, run, pack_hash = _disputed_committee(tmp_path / "shared.db", include_shared=True)
     work = router.get_work(run)
     with store.database.connect(read_only=True) as db:
-        buckets = json.loads(db.execute(
-            "SELECT report_json FROM comparison_report WHERE committee_run_id=?", (run,)
-        ).fetchone()[0])
+        buckets = json.loads(
+            db.execute(
+                "SELECT report_json FROM comparison_report WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+        )
     shared_id = buckets["SHARED"][0]["item_id"]
     bad = _verdict_assessment(pack_hash, "red_team", "provider-red", [_verdict(shared_id)])
     with pytest.raises(ValueError, match="exactly cover"):
         router.submit(run, _attempt(work, "accepted", bad))
     with store.database.connect(read_only=True) as db:
-        assert db.execute(
-            "SELECT count(*) FROM model_assessment WHERE committee_run_id=? AND role='red_team'", (run,)
-        ).fetchone()[0] == 0
+        assert (
+            db.execute(
+                "SELECT count(*) FROM model_assessment WHERE committee_run_id=? AND role='red_team'",
+                (run,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_red_team_remainder_is_exact_arbiter_focus_then_scores(tmp_path):
@@ -729,15 +742,20 @@ def test_red_team_remainder_is_exact_arbiter_focus_then_scores(tmp_path):
     result = router.submit(run, _attempt(arbiter_work, "accepted", arbiter))
     assert result["state"] == "SCORED"
     with store.database.connect(read_only=True) as db:
-        resolutions = list(db.execute(
-            "SELECT role,focus_hash,focus_json FROM dispute_resolution WHERE committee_run_id=? ORDER BY role",
-            (run,),
-        ))
+        resolutions = list(
+            db.execute(
+                "SELECT role,focus_hash,focus_json FROM dispute_resolution WHERE committee_run_id=? ORDER BY role",
+                (run,),
+            )
+        )
         assert len(resolutions) == 2
         assert json.loads(resolutions[0]["focus_json"])["items"] == arbiter_work["focus"]["items"]
-        assert db.execute(
-            "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
-        ).fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_exact_full_red_team_coverage_resolves_and_scores(tmp_path):
@@ -752,18 +770,14 @@ def test_exact_full_red_team_coverage_resolves_and_scores(tmp_path):
 def test_unresolved_arbiter_escalates_without_score(tmp_path):
     store, router, run, pack_hash = _disputed_committee(tmp_path / "arbiter-open.db")
     red_work = router.get_work(run)
-    red_verdicts = [
-        _verdict(item["item_id"], "unresolved") for item in red_work["focus"]["items"]
-    ]
+    red_verdicts = [_verdict(item["item_id"], "unresolved") for item in red_work["focus"]["items"]]
     red = _verdict_assessment(pack_hash, "red_team", "provider-red", red_verdicts)
     router.submit(run, _attempt(red_work, "accepted", red))
     arbiter_work = router.get_work(run)
     arbiter_verdicts = [
         _verdict(item["item_id"], "unresolved") for item in arbiter_work["focus"]["items"]
     ]
-    arbiter = _verdict_assessment(
-        pack_hash, "arbiter", "provider-arbiter", arbiter_verdicts
-    )
+    arbiter = _verdict_assessment(pack_hash, "arbiter", "provider-arbiter", arbiter_verdicts)
     assert router.submit(run, _attempt(arbiter_work, "accepted", arbiter))["state"] == "ESCALATE"
     with store.database.connect(read_only=True) as db:
         assert db.execute("SELECT count(*) FROM score_snapshot").fetchone()[0] == 0
@@ -825,9 +839,12 @@ def test_b_first_same_provider_is_rejected_symmetrically(tmp_path):
     with pytest.raises(ValueError, match="providers must differ"):
         router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_a", "same"))
     with store.database.connect(read_only=True) as db:
-        assert db.execute(
-            "SELECT count(*) FROM model_assessment WHERE committee_run_id=?", (run,)
-        ).fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT count(*) FROM model_assessment WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_accepted_retry_and_telemetry_clone_keep_one_snapshot_identity(tmp_path):
@@ -846,7 +863,10 @@ def test_accepted_retry_and_telemetry_clone_keep_one_snapshot_identity(tmp_path)
     clone = deepcopy(a)
     clone.update(provider="telemetry-provider", model_id="other", model_route="other")
     clone["usage"] = {
-        "input_tokens": 99, "output_tokens": 7, "cached_tokens": 2, "source": "SELF_REPORTED"
+        "input_tokens": 99,
+        "output_tokens": 7,
+        "cached_tokens": 2,
+        "source": "SELF_REPORTED",
     }
     clone["cost"] = {"amount": "1.25", "currency": "USD", "source": "SELF_REPORTED"}
     clone_attempt = _attempt(work, "accepted", clone)
@@ -860,13 +880,19 @@ def test_accepted_retry_and_telemetry_clone_keep_one_snapshot_identity(tmp_path)
     assert scored["state"] == "SCORED"
     router.submit(run, clone_attempt)
     with store.database.connect(read_only=True) as db:
-        snapshots = list(db.execute(
-            "SELECT snapshot_id,score_input_hash FROM score_snapshot WHERE committee_run_id=?", (run,)
-        ))
+        snapshots = list(
+            db.execute(
+                "SELECT snapshot_id,score_input_hash FROM score_snapshot WHERE committee_run_id=?",
+                (run,),
+            )
+        )
         assert len(snapshots) == 1
-        assert db.execute(
-            "SELECT count(*) FROM model_assessment WHERE committee_run_id=?", (run,)
-        ).fetchone()[0] == 2
+        assert (
+            db.execute(
+                "SELECT count(*) FROM model_assessment WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_telemetry_only_full_paths_have_identical_logical_artifacts(tmp_path):
@@ -920,9 +946,12 @@ def test_ready_to_score_status_recovers_after_injected_score_failure(tmp_path):
     assert store.current_state(run) == "READY_TO_SCORE"
     assert router.status(run)["state"] == "SCORED"
     with store.database.connect(read_only=True) as db:
-        assert db.execute(
-            "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
-        ).fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_pack_replay_ignores_later_cluster_and_ticker_rows(tmp_path):
@@ -935,8 +964,200 @@ def test_pack_replay_ignores_later_cluster_and_ticker_rows(tmp_path):
             "INSERT INTO security_identity_event(security_id,event_type,old_value,new_value,event_time,"
             "public_available_time,pat_provenance,ingested_time) VALUES (?,?,?,?,?,?,?,?)",
             (
-                "sec", "ticker_change", "OLD", "NEW", "2025-01-01Z", "2025-01-01Z",
-                "source_reported", "2025-01-02Z",
+                "sec",
+                "ticker_change",
+                "OLD",
+                "NEW",
+                "2025-01-01Z",
+                "2025-01-01Z",
+                "source_reported",
+                "2025-01-02Z",
             ),
         )
     assert EvidencePackBuilder(database).build(candidate_id) == first
+
+
+def test_candidate_trends_follow_as_of_not_snapshot_hash(tmp_path):
+    database, candidate_id = _fixture(tmp_path / "chronology.db")
+    pack = EvidencePackBuilder(database).build(candidate_id)
+    store = CommitteeStore(database)
+    comparator, scoring = store.ensure_registry_rows()
+    raw = sqlite3.connect(database.path)
+    try:
+        for run_id, as_of in (
+            ("history-old", "2025-01-01T00:00:00Z"),
+            ("history-mid", "2025-01-02T00:00:00Z"),
+            ("history-new", "2025-01-03T00:00:00Z"),
+        ):
+            raw.execute(
+                "INSERT INTO pipeline_run(run_id,as_of,universe_hash,screen_manifest_json,"
+                "screen_manifest_hash,funnel_config_json,funnel_config_hash,input_snapshot_id,"
+                "input_view_hash,expected_security_count,status,failure_json,started_at,finished_at,"
+                "flags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    as_of,
+                    "u",
+                    "[]",
+                    f"manifest-{run_id}",
+                    "{}",
+                    "funnel",
+                    None,
+                    f"view-{run_id}",
+                    1,
+                    "COMPLETE",
+                    None,
+                    as_of,
+                    as_of,
+                    "[]",
+                ),
+            )
+            raw.execute(
+                "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    f"committee-{run_id}",
+                    candidate_id,
+                    run_id,
+                    pack.pack_hash,
+                    "[]",
+                    1,
+                    comparator,
+                    scoring,
+                    "{}",
+                    1,
+                    as_of,
+                ),
+            )
+        for snapshot_id, run_id, conviction in (
+            ("z-old", "history-old", 15),
+            ("a-mid", "history-mid", 85),
+            ("m-new", "history-new", 40),
+        ):
+            raw.execute(
+                "INSERT INTO score_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    snapshot_id,
+                    candidate_id,
+                    f"committee-{run_id}",
+                    scoring,
+                    f"input-{snapshot_id}",
+                    f"evidence-{snapshot_id}",
+                    "[]",
+                    "comparison",
+                    "[]",
+                    "{}",
+                    "[]",
+                    "{}",
+                    0,
+                    0,
+                    conviction,
+                    conviction,
+                    0.5,
+                    0.5,
+                    None,
+                    None,
+                    None,
+                    "STABLE",
+                    "EVIDENCE_DRIVEN",
+                    None,
+                    "[]",
+                    f"result-{snapshot_id}",
+                    as_of,
+                ),
+            )
+        raw.commit()
+    finally:
+        raw.close()
+    snapshots = Scorer(database).list_candidate(candidate_id)
+    assert [item["snapshot_id"] for item in snapshots] == ["z-old", "a-mid", "m-new"]
+    assert snapshots[-1]["trend_3"] == 25
+
+
+def test_prior_snapshot_selection_excludes_future_as_of(tmp_path):
+    store, run, pack_hash = _committee(tmp_path / "prior-bound.db")
+    raw = sqlite3.connect(store.database.path)
+    try:
+        raw.execute(
+            "INSERT INTO pipeline_run(run_id,as_of,universe_hash,screen_manifest_json,"
+            "screen_manifest_hash,funnel_config_json,funnel_config_hash,input_snapshot_id,"
+            "input_view_hash,expected_security_count,status,failure_json,started_at,finished_at,"
+            "flags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "future-run",
+                "2026-01-01T00:00:00Z",
+                "u",
+                "[]",
+                "future-manifest",
+                "{}",
+                "funnel",
+                None,
+                "future-view",
+                1,
+                "COMPLETE",
+                None,
+                "2026-01-01Z",
+                "2026-01-01Z",
+                "[]",
+            ),
+        )
+        raw.execute(
+            "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "future-committee",
+                "candidate",
+                "future-run",
+                pack_hash,
+                "[]",
+                1,
+                ComparatorSpec().config_hash,
+                ScoringSpec().config_hash,
+                "{}",
+                1,
+                "2026-01-01Z",
+            ),
+        )
+        raw.execute(
+            "INSERT INTO score_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "future-snapshot",
+                "candidate",
+                "future-committee",
+                ScoringSpec().config_hash,
+                "future-input",
+                "future-evidence",
+                "[]",
+                "comparison",
+                "[]",
+                "{}",
+                "[]",
+                "{}",
+                0,
+                0,
+                90,
+                90,
+                1.0,
+                1.0,
+                None,
+                None,
+                None,
+                "INITIAL",
+                "INITIAL",
+                None,
+                "[]",
+                "future-result",
+                "2026-01-01Z",
+            ),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+    claims = [_claim("valuation_vs_history", "bullish")]
+    router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_a", "provider-a", claims))
+    router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_b", "provider-b", claims))
+    with store.database.connect(read_only=True) as db:
+        current = db.execute(
+            "SELECT prior_snapshot_id FROM score_snapshot WHERE committee_run_id=?", (run,)
+        ).fetchone()
+    assert current[0] is None
