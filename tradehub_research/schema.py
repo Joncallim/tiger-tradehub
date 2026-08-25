@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-PHASE_0_SCHEMA_VERSION = 7
+# ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
+
+PHASE_0_SCHEMA_VERSION = 8
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -492,6 +494,172 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             ON provider_bootstrap_symbol(provider, first_requested_at);
         DROP INDEX evidence_kind_pit_idx;
         DROP INDEX evidence_form4_pit_idx;
+        """,
+    ),
+    (
+        8,
+        "Phase 2 evidence packs and committee artifacts",
+        """
+        CREATE TABLE comparator_definition (
+            config_hash TEXT PRIMARY KEY,
+            comparator_version INTEGER NOT NULL UNIQUE CHECK(comparator_version > 0),
+            taxonomy_version INTEGER NOT NULL CHECK(taxonomy_version > 0),
+            spec_json TEXT NOT NULL CHECK(json_valid(spec_json)),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE scoring_version (
+            config_hash TEXT PRIMARY KEY,
+            scoring_version INTEGER NOT NULL UNIQUE CHECK(scoring_version > 0),
+            spec_json TEXT NOT NULL CHECK(json_valid(spec_json)),
+            description TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE evidence_pack (
+            pack_hash TEXT PRIMARY KEY,
+            pack_spec_version INTEGER NOT NULL CHECK(pack_spec_version > 0),
+            candidate_id TEXT NOT NULL REFERENCES candidate(candidate_id),
+            pipeline_run_id TEXT NOT NULL REFERENCES pipeline_run(run_id),
+            body_json TEXT NOT NULL CHECK(json_valid(body_json)),
+            body_chars INTEGER NOT NULL CHECK(body_chars >= 0),
+            built_at TEXT NOT NULL,
+            UNIQUE(candidate_id, pack_spec_version)
+        );
+        CREATE TABLE committee_run (
+            committee_run_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL REFERENCES candidate(candidate_id),
+            pipeline_run_id TEXT NOT NULL REFERENCES pipeline_run(run_id),
+            pack_hash TEXT NOT NULL REFERENCES evidence_pack(pack_hash),
+            role_set_json TEXT NOT NULL CHECK(json_valid(role_set_json)),
+            committee_policy_version INTEGER NOT NULL CHECK(committee_policy_version > 0),
+            comparator_config_hash TEXT NOT NULL REFERENCES comparator_definition(config_hash),
+            scoring_config_hash TEXT NOT NULL REFERENCES scoring_version(config_hash),
+            prompt_versions_json TEXT NOT NULL CHECK(json_valid(prompt_versions_json)),
+            assessment_schema_version INTEGER NOT NULL CHECK(assessment_schema_version > 0),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE committee_transition (
+            transition_id TEXT PRIMARY KEY,
+            committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
+            from_state TEXT CHECK(from_state IS NULL OR from_state IN (
+                'PENDING_NEUTRALS','RED_TEAM_REQUIRED','ARBITER_REQUIRED','READY_TO_SCORE',
+                'SCORED','BLOCKED','ESCALATE')),
+            to_state TEXT NOT NULL CHECK(to_state IN (
+                'PENDING_NEUTRALS','RED_TEAM_REQUIRED','ARBITER_REQUIRED','READY_TO_SCORE',
+                'SCORED','BLOCKED','ESCALATE')),
+            cause_code TEXT NOT NULL,
+            artifact_id TEXT,
+            occurred_at TEXT NOT NULL,
+            UNIQUE(committee_run_id, from_state, to_state, cause_code, artifact_id)
+        );
+        CREATE TABLE model_assessment (
+            assessment_id TEXT PRIMARY KEY,
+            committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
+            candidate_id TEXT NOT NULL REFERENCES candidate(candidate_id),
+            pack_hash TEXT NOT NULL REFERENCES evidence_pack(pack_hash),
+            role TEXT NOT NULL CHECK(role IN (
+                'neutral_analyst_a','neutral_analyst_b','red_team','arbiter')),
+            provider TEXT NOT NULL, model_id TEXT NOT NULL, prompt_version TEXT NOT NULL,
+            assessment_schema_version INTEGER NOT NULL CHECK(assessment_schema_version > 0),
+            taxonomy_version INTEGER NOT NULL CHECK(taxonomy_version > 0),
+            model_route TEXT NOT NULL,
+            billing_class TEXT NOT NULL CHECK(billing_class IN ('subscription','local','paid')),
+            claims_json TEXT NOT NULL CHECK(json_valid(claims_json)),
+            cited_evidence_ids_json TEXT NOT NULL CHECK(json_valid(cited_evidence_ids_json)),
+            missing_evidence_json TEXT NOT NULL CHECK(json_valid(missing_evidence_json)),
+            thesis_json TEXT NOT NULL CHECK(json_valid(thesis_json)),
+            confidence REAL NOT NULL CHECK(confidence BETWEEN 0 AND 1),
+            uncertainty REAL NOT NULL CHECK(uncertainty BETWEEN 0 AND 1),
+            usage_json TEXT NOT NULL CHECK(json_valid(usage_json)),
+            cost_json TEXT NOT NULL CHECK(json_valid(cost_json)),
+            evaluation_time TEXT NOT NULL, submitted_at TEXT NOT NULL, payload_hash TEXT NOT NULL,
+            UNIQUE(committee_run_id, role)
+        );
+        CREATE TABLE model_call_attempt (
+            attempt_id TEXT PRIMARY KEY,
+            committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
+            role TEXT NOT NULL CHECK(role IN (
+                'neutral_analyst_a','neutral_analyst_b','red_team','arbiter')),
+            attempt_number INTEGER NOT NULL CHECK(attempt_number BETWEEN 1 AND 2),
+            provider TEXT NOT NULL, model_id TEXT NOT NULL, model_route TEXT NOT NULL,
+            billing_class TEXT NOT NULL CHECK(billing_class IN ('subscription','local','paid')),
+            prompt_version TEXT NOT NULL, prompt_template_hash TEXT NOT NULL,
+            pack_hash TEXT NOT NULL REFERENCES evidence_pack(pack_hash), outcome TEXT NOT NULL,
+            usage_json TEXT NOT NULL CHECK(json_valid(usage_json)),
+            cost_json TEXT NOT NULL CHECK(json_valid(cost_json)), diagnostic_hash TEXT,
+            diagnostic_excerpt TEXT, requested_at TEXT NOT NULL, completed_at TEXT,
+            UNIQUE(committee_run_id, role, attempt_number)
+        );
+        CREATE TABLE comparison_report (
+            comparison_id TEXT PRIMARY KEY,
+            committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
+            assessment_id_a TEXT NOT NULL REFERENCES model_assessment(assessment_id),
+            assessment_id_b TEXT NOT NULL REFERENCES model_assessment(assessment_id),
+            comparator_config_hash TEXT NOT NULL REFERENCES comparator_definition(config_hash),
+            report_json TEXT NOT NULL CHECK(json_valid(report_json)),
+            agreement REAL CHECK(agreement IS NULL OR agreement BETWEEN 0 AND 1),
+            routing_decision TEXT NOT NULL, result_hash TEXT NOT NULL, computed_at TEXT NOT NULL,
+            UNIQUE(committee_run_id, assessment_id_a, assessment_id_b, comparator_config_hash)
+        );
+        CREATE TABLE dispute_resolution (
+            resolution_id TEXT PRIMARY KEY,
+            committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
+            comparison_id TEXT NOT NULL REFERENCES comparison_report(comparison_id),
+            role TEXT NOT NULL CHECK(role IN ('red_team','arbiter')),
+            assessment_id TEXT NOT NULL REFERENCES model_assessment(assessment_id),
+            focus_hash TEXT NOT NULL, resolution_json TEXT NOT NULL CHECK(json_valid(resolution_json)),
+            result_hash TEXT NOT NULL, computed_at TEXT NOT NULL,
+            UNIQUE(comparison_id, role)
+        );
+        CREATE TABLE score_snapshot (
+            snapshot_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL REFERENCES candidate(candidate_id),
+            committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
+            scoring_config_hash TEXT NOT NULL REFERENCES scoring_version(config_hash),
+            score_input_hash TEXT NOT NULL UNIQUE, scored_evidence_hash TEXT NOT NULL,
+            assessment_ids_json TEXT NOT NULL CHECK(json_valid(assessment_ids_json)),
+            comparison_id TEXT NOT NULL REFERENCES comparison_report(comparison_id),
+            resolution_ids_json TEXT NOT NULL CHECK(json_valid(resolution_ids_json)),
+            family_contributions_json TEXT NOT NULL CHECK(json_valid(family_contributions_json)),
+            underlying_groups_json TEXT NOT NULL CHECK(json_valid(underlying_groups_json)),
+            penalties_json TEXT NOT NULL CHECK(json_valid(penalties_json)),
+            base_evidence REAL NOT NULL, confluence_bonus REAL NOT NULL, raw_score REAL NOT NULL,
+            conviction INTEGER NOT NULL CHECK(conviction BETWEEN 0 AND 100 AND conviction % 5 = 0),
+            data_quality REAL NOT NULL CHECK(data_quality BETWEEN 0 AND 1),
+            committee_agreement REAL CHECK(committee_agreement IS NULL OR committee_agreement BETWEEN 0 AND 1),
+            prior_snapshot_id TEXT REFERENCES score_snapshot(snapshot_id), prior_conviction INTEGER,
+            conviction_delta INTEGER, trajectory_label TEXT NOT NULL CHECK(trajectory_label IN (
+                'INITIAL','REBASED','RISING','FALLING','STABLE')),
+            change_cause TEXT NOT NULL CHECK(change_cause IN (
+                'INITIAL','SCORING_VERSION_CHANGE','MODEL_REASSESSMENT',
+                'CORRECTION_RESTATEMENT','EVIDENCE_DRIVEN')),
+            material_change_time TEXT,
+            reason_codes_json TEXT NOT NULL CHECK(json_valid(reason_codes_json)),
+            result_hash TEXT NOT NULL, computed_at TEXT NOT NULL
+        );
+        CREATE INDEX committee_candidate_idx ON committee_run(candidate_id, created_at);
+        CREATE INDEX assessment_run_role_idx ON model_assessment(committee_run_id, role);
+        CREATE INDEX attempt_run_role_idx ON model_call_attempt(committee_run_id, role, attempt_number);
+        CREATE INDEX score_candidate_idx ON score_snapshot(candidate_id, material_change_time, snapshot_id);
+
+        CREATE TRIGGER comparator_definition_no_update BEFORE UPDATE ON comparator_definition BEGIN SELECT RAISE(ABORT, 'comparator_definition is append-only'); END;
+        CREATE TRIGGER comparator_definition_no_delete BEFORE DELETE ON comparator_definition BEGIN SELECT RAISE(ABORT, 'comparator_definition is append-only'); END;
+        CREATE TRIGGER scoring_version_no_update BEFORE UPDATE ON scoring_version BEGIN SELECT RAISE(ABORT, 'scoring_version is append-only'); END;
+        CREATE TRIGGER scoring_version_no_delete BEFORE DELETE ON scoring_version BEGIN SELECT RAISE(ABORT, 'scoring_version is append-only'); END;
+        CREATE TRIGGER evidence_pack_no_update BEFORE UPDATE ON evidence_pack BEGIN SELECT RAISE(ABORT, 'evidence_pack is append-only'); END;
+        CREATE TRIGGER evidence_pack_no_delete BEFORE DELETE ON evidence_pack BEGIN SELECT RAISE(ABORT, 'evidence_pack is append-only'); END;
+        CREATE TRIGGER committee_run_no_update BEFORE UPDATE ON committee_run BEGIN SELECT RAISE(ABORT, 'committee_run is append-only'); END;
+        CREATE TRIGGER committee_run_no_delete BEFORE DELETE ON committee_run BEGIN SELECT RAISE(ABORT, 'committee_run is append-only'); END;
+        CREATE TRIGGER committee_transition_no_update BEFORE UPDATE ON committee_transition BEGIN SELECT RAISE(ABORT, 'committee_transition is append-only'); END;
+        CREATE TRIGGER committee_transition_no_delete BEFORE DELETE ON committee_transition BEGIN SELECT RAISE(ABORT, 'committee_transition is append-only'); END;
+        CREATE TRIGGER model_assessment_no_update BEFORE UPDATE ON model_assessment BEGIN SELECT RAISE(ABORT, 'model_assessment is append-only'); END;
+        CREATE TRIGGER model_assessment_no_delete BEFORE DELETE ON model_assessment BEGIN SELECT RAISE(ABORT, 'model_assessment is append-only'); END;
+        CREATE TRIGGER model_call_attempt_no_update BEFORE UPDATE ON model_call_attempt BEGIN SELECT RAISE(ABORT, 'model_call_attempt is append-only'); END;
+        CREATE TRIGGER model_call_attempt_no_delete BEFORE DELETE ON model_call_attempt BEGIN SELECT RAISE(ABORT, 'model_call_attempt is append-only'); END;
+        CREATE TRIGGER comparison_report_no_update BEFORE UPDATE ON comparison_report BEGIN SELECT RAISE(ABORT, 'comparison_report is append-only'); END;
+        CREATE TRIGGER comparison_report_no_delete BEFORE DELETE ON comparison_report BEGIN SELECT RAISE(ABORT, 'comparison_report is append-only'); END;
+        CREATE TRIGGER dispute_resolution_no_update BEFORE UPDATE ON dispute_resolution BEGIN SELECT RAISE(ABORT, 'dispute_resolution is append-only'); END;
+        CREATE TRIGGER dispute_resolution_no_delete BEFORE DELETE ON dispute_resolution BEGIN SELECT RAISE(ABORT, 'dispute_resolution is append-only'); END;
+        CREATE TRIGGER score_snapshot_no_update BEFORE UPDATE ON score_snapshot BEGIN SELECT RAISE(ABORT, 'score_snapshot is append-only'); END;
+        CREATE TRIGGER score_snapshot_no_delete BEFORE DELETE ON score_snapshot BEGIN SELECT RAISE(ABORT, 'score_snapshot is append-only'); END;
         """,
     ),
 )
