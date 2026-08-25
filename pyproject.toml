@@ -44,6 +44,7 @@ tradehub-telegram = "tradehub.telegram_bot:main"
 tradehub-acceptance = "tradehub.acceptance.runner:main"
 tradehub-research = "tradehub_research.cli:main"
 tradehub-research-acceptance = "tradehub_research.acceptance.runner:main"
+tradehub-research-mcp = "tradehub_research.mcp_server:main"
 research-db = "tradehub_research.cli:main"
 
 [build-system]
