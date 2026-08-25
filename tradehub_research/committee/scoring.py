@@ -64,6 +64,32 @@ def _independence_units(evidence: list[dict[str, Any]]) -> list[str]:
     return sorted(units)
 
 
+def semantic_screen_payload(screen: dict[str, Any]) -> dict[str, Any]:
+    """Project a packed screen onto stable methodology and output semantics."""
+    return {
+        "family": screen["family"],
+        "screen_id": screen["screen_id"],
+        "screen_version": screen["screen_version"],
+        "feature_schema_version": screen["feature_schema_version"],
+        "config_hash": screen["config_hash"],
+        "sufficient_data": bool(screen["sufficient_data"]),
+        "passed": bool(screen["passed"]),
+        "confidence": screen["confidence"],
+        "data_quality": screen["data_quality"],
+        "reason_codes": sorted(set(screen.get("reason_codes", []))),
+        "evidence_ids": sorted(set(screen.get("evidence_ids", []))),
+        "raw_features": screen["raw_features"],
+    }
+
+
+def semantic_screen_hash(screen: dict[str, Any]) -> str:
+    return _hash("semantic-screen-v1", semantic_screen_payload(screen))
+
+
+def _semantic_screen_hashes(screens: list[dict[str, Any]]) -> list[str]:
+    return sorted(semantic_screen_hash(screen) for screen in screens)
+
+
 def score_screens(
     screens: list[dict[str, Any]], evidence: list[dict[str, Any]], spec: dict[str, Any]
 ) -> dict[str, Any]:
@@ -133,13 +159,21 @@ def score_screens(
             "content_hash": item["content_hash"],
             "source_id": item.get("source_id"),
             "underlying_group": item.get("underlying_group"),
+            "cluster_ids": sorted(
+                {
+                    cluster_id
+                    for cluster_id in item.get("cluster_ids", [])
+                    if isinstance(cluster_id, str) and cluster_id
+                }
+            ),
             "public_available_time": item["public_available_time"],
             "supersedes_evidence_id": item.get("supersedes_evidence_id"),
         }
         for item in sorted(scored_evidence.values(), key=lambda value: value["evidence_id"])
     ]
+    scored_identity = {"records": records, "independence_units": independence_units}
     scored_hash = hashlib.sha256(
-        ("scored-evidence-v1\0" + canonical_json(records)).encode()
+        ("scored-evidence-v2\0" + canonical_json(scored_identity)).encode()
     ).hexdigest()
     return {
         "family_contributions": contributions,
@@ -263,9 +297,7 @@ class Scorer:
                 )
             )
             result = score_screens(pack["screens"], pack["evidence"], spec)
-            screen_hashes = sorted(
-                (row["screen_result_id"], row["result_hash"]) for row in pack["screens"]
-            )
+            screen_hashes = _semantic_screen_hashes(pack["screens"])
             logical = {
                 "scoring_config_hash": run["scoring_config_hash"],
                 "candidate_id": run["candidate_id"],
@@ -439,9 +471,7 @@ class Scorer:
                 "SELECT body_json FROM evidence_pack WHERE pack_hash=?", (old_run[0],)
             ).fetchone()[0]
         )
-        old_screens = sorted(
-            (row["screen_result_id"], row["result_hash"]) for row in old_pack["screens"]
-        )
+        old_screens = _semantic_screen_hashes(old_pack["screens"])
         if (
             prior["scored_evidence_hash"] == result["scored_evidence_hash"]
             and old_screens != screen_hashes

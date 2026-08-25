@@ -16,8 +16,13 @@ from tradehub_research.committee.assessment import AssessmentValidationError
 from tradehub_research.committee.comparator import Comparator
 from tradehub_research.committee.pack import EvidencePackBuilder, PackBuildError
 from tradehub_research.committee.routing import CommitteeRouter
-from tradehub_research.committee.scoring import Scorer
-from tradehub_research.committee.store import CommitteeStore, ComparatorSpec, ScoringSpec
+from tradehub_research.committee.scoring import Scorer, score_screens, semantic_screen_hash
+from tradehub_research.committee.store import (
+    CommitteeStore,
+    ComparatorSpec,
+    LegacyScoringSpec,
+    ScoringSpec,
+)
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
 from tradehub_research.schema import MIGRATIONS, PHASE_0_SCHEMA_VERSION
@@ -272,6 +277,49 @@ def test_registry_specs_and_idempotence(tmp_path):
     assert store.ensure_registry_rows() == store.ensure_registry_rows()
     assert len(ComparatorSpec().as_dict()["taxonomy"]) == 30
     assert sum(ScoringSpec().as_dict()["weights"].values()) == 90
+    assert LegacyScoringSpec().config_hash == (
+        "c4c0e2731479a9d3897101f82bc8ab70cc23cb7d4c2fbf0caecb86988d96e8bb"
+    )
+    with database.connect(read_only=True) as db:
+        rows = list(
+            db.execute(
+                "SELECT scoring_version,config_hash,description FROM scoring_version "
+                "ORDER BY scoring_version"
+            )
+        )
+    assert [(row["scoring_version"], row["config_hash"]) for row in rows] == [
+        (1, LegacyScoringSpec().config_hash),
+        (2, ScoringSpec().config_hash),
+    ]
+    assert "v1" in rows[0]["description"] and "v2" in rows[1]["description"]
+
+
+def test_live_v1_registry_upgrades_without_overwrite_or_version_reuse(tmp_path):
+    database = ResearchDB(tmp_path / "registry-upgrade.db")
+    database.migrate()
+    legacy = LegacyScoringSpec()
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO scoring_version VALUES (?,?,?,?,?)",
+            (legacy.config_hash, 1, legacy.spec_json, "existing live v1", "2025-01-01Z"),
+        )
+
+    _, current_hash = CommitteeStore(database).ensure_registry_rows()
+
+    assert current_hash == ScoringSpec().config_hash
+    with database.connect(read_only=True) as db:
+        rows = list(
+            db.execute(
+                "SELECT scoring_version,config_hash,spec_json,description FROM scoring_version "
+                "ORDER BY scoring_version"
+            )
+        )
+    assert len(rows) == 2
+    assert tuple(rows[0]) == (1, legacy.config_hash, legacy.spec_json, "existing live v1")
+    assert (rows[1]["scoring_version"], rows[1]["config_hash"]) == (
+        2,
+        ScoringSpec().config_hash,
+    )
 
 
 def test_v8_artifact_tables_are_append_only(tmp_path):
@@ -1097,6 +1145,52 @@ def test_semantic_snapshot_reuse_completes_and_links_every_run(tmp_path):
         assert {row["artifact_id"] for row in links} == {first["snapshot_id"]}
 
 
+def test_trajectory_uses_stable_screen_semantics_across_pipeline_runs(tmp_path):
+    database, candidate_id = _fixture(tmp_path / "trajectory-screen-semantics.db")
+    pack = EvidencePackBuilder(database).build(candidate_id)
+    store = CommitteeStore(database)
+    comparator, scoring = store.ensure_registry_rows()
+    old_run = store.create_or_resume_committee_run(
+        candidate_id=candidate_id,
+        pack_hash=pack.pack_hash,
+        committee_policy_version=1,
+        comparator_config_hash=comparator,
+        scoring_config_hash=scoring,
+        prompt_versions={"neutral": "v1"},
+        assessment_schema_version=1,
+    )
+    result = score_screens(pack.body["screens"], pack.body["evidence"], ScoringSpec().as_dict())
+    prior = {
+        "committee_run_id": old_run,
+        "scoring_config_hash": scoring,
+        "scored_evidence_hash": result["scored_evidence_hash"],
+        "conviction": result["conviction"],
+    }
+    rerun_screens = deepcopy(pack.body["screens"])
+    for index, screen in enumerate(rerun_screens):
+        screen["screen_result_id"] = f"run-b-result-{index}"
+        screen["result_hash"] = f"run-b-hash-{index}"
+    screen_hashes = sorted(semantic_screen_hash(screen) for screen in rerun_screens)
+
+    with database.connect(read_only=True) as db:
+        unchanged = Scorer(database)._trajectory(
+            db, prior, {"scoring_config_hash": scoring}, result, screen_hashes, {}
+        )
+        changed_screens = deepcopy(rerun_screens)
+        changed_screens[0]["config_hash"] = "actual-config-change"
+        changed = Scorer(database)._trajectory(
+            db,
+            prior,
+            {"scoring_config_hash": scoring},
+            result,
+            sorted(semantic_screen_hash(screen) for screen in changed_screens),
+            {},
+        )
+
+    assert unchanged[:3] == ("MODEL_REASSESSMENT", "STABLE", 0)
+    assert changed[:3] == ("SCREEN_METHODOLOGY_CHANGE", "REBASED", None)
+
+
 def test_ready_to_score_status_recovers_after_injected_score_failure(tmp_path):
     store, run, pack_hash = _committee(tmp_path / "recover.db")
     router = CommitteeRouter(store.database)
@@ -1259,6 +1353,66 @@ def test_pack_ticker_uses_knowable_supersession_version(tmp_path, as_of, expecte
         ],
     )
     assert pack.body["identity"]["ticker_as_of"] == expected
+
+
+@pytest.mark.parametrize(
+    ("as_of", "expected"),
+    (("2025-03-01", "OLD"), ("2025-09-01", "CORRECTED")),
+)
+def test_pack_ticker_ignores_nonauthoritative_successor_until_authoritative_correction(
+    tmp_path, as_of, expected
+):
+    pack = _identity_pack(
+        tmp_path / f"authoritative-chain-{expected}.db",
+        as_of,
+        [
+            {
+                "event_type": "baseline",
+                "old_value": None,
+                "new_value": "OLD",
+                "event_time": "2025-01-01",
+                "public_available_time": "2025-01-01",
+                "pat_provenance": "source_reported",
+            },
+            {
+                "event_type": "ticker_change",
+                "old_value": "OLD",
+                "new_value": "OBSERVED",
+                "event_time": "2025-02-01",
+                "public_available_time": "2025-02-01",
+                "pat_provenance": "observed_at_ingest",
+                "supersedes_index": 0,
+            },
+            {
+                "event_type": "ticker_change",
+                "old_value": "OLD",
+                "new_value": "CORRECTED",
+                "event_time": "2025-06-01",
+                "public_available_time": "2025-08-01",
+                "pat_provenance": "derived_from_index",
+                "supersedes_index": 1,
+            },
+        ],
+    )
+    assert pack.body["identity"]["ticker_as_of"] == expected
+
+
+def test_pack_does_not_use_canonical_fallback_before_authoritative_history_is_knowable(tmp_path):
+    pack = _identity_pack(
+        tmp_path / "future-authoritative-ticker.db",
+        "2025-03-01",
+        [
+            {
+                "event_type": "baseline",
+                "old_value": None,
+                "new_value": "OLD",
+                "event_time": "2025-06-01",
+                "public_available_time": "2025-06-01",
+                "pat_provenance": "source_reported",
+            }
+        ],
+    )
+    assert pack.body["identity"]["ticker_as_of"] is None
 
 
 def test_pack_ticker_without_identity_event_uses_canonical_ticker(tmp_path):

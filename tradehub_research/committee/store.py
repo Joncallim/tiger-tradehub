@@ -128,8 +128,40 @@ class ComparatorSpec:
 
 
 @dataclass(frozen=True)
-class ScoringSpec:
+class LegacyScoringSpec:
     scoring_version: int = 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "scoring_version": self.scoring_version,
+            "weights": {
+                "valuation": 18,
+                "inflection": 18,
+                "quality": 18,
+                "informed_activity": 18,
+                "event": 12,
+                "momentum_confirmation": 6,
+            },
+            "confluence": {"formula": "5*min(2,max(0,N-1))", "cap": 10},
+            "missing_penalty": {"formula": "min(10,2*count)", "cap": 10},
+            "staleness_penalty": {"formula": "min(6,2*count)", "cap": 6},
+            "conviction_bucket": 5,
+            "decimal_places": 6,
+            "rounding": "round_half_up",
+        }
+
+    @property
+    def spec_json(self) -> str:
+        return canonical_json(self.as_dict())
+
+    @property
+    def config_hash(self) -> str:
+        return hashlib.sha256(self.spec_json.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class ScoringSpec:
+    scoring_version: int = 2
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -170,7 +202,7 @@ class CommitteeStore:
         self.database = database
 
     def ensure_registry_rows(self) -> tuple[str, str]:
-        comparator, scoring = ComparatorSpec(), ScoringSpec()
+        comparator, legacy_scoring, scoring = ComparatorSpec(), LegacyScoringSpec(), ScoringSpec()
         with self.database.connect() as db:
             self._ensure_registry(
                 db,
@@ -185,10 +217,19 @@ class CommitteeStore:
                 db,
                 "scoring_version",
                 "scoring_version",
+                legacy_scoring.scoring_version,
+                legacy_scoring.config_hash,
+                legacy_scoring.spec_json,
+                ("Phase 2 scoring v1 (legacy underlying-group confluence)",),
+            )
+            self._ensure_registry(
+                db,
+                "scoring_version",
+                "scoring_version",
                 scoring.scoring_version,
                 scoring.config_hash,
                 scoring.spec_json,
-                ("Phase 2 scoring v1",),
+                ("Phase 2 scoring v2 (cluster-aware source independence)",),
             )
         return comparator.config_hash, scoring.config_hash
 

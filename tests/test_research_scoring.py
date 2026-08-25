@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
-from tradehub_research.committee.scoring import classify_trajectory, score_screens
+from tradehub_research.committee.scoring import (
+    classify_trajectory,
+    score_screens,
+    semantic_screen_hash,
+)
 from tradehub_research.committee.store import ScoringSpec
 
 
@@ -110,6 +116,26 @@ def test_distinct_sources_sharing_cluster_collapse_to_one_unit():
     assert result["confluence_bonus"] == 0
 
 
+def test_cluster_topology_changes_score_and_complete_scored_evidence_hash():
+    screens = [_screen("valuation", evidence=["a"]), _screen("quality", evidence=["b"])]
+    independent = [
+        _evidence("a", "event:one:a", source_id="one", clusters=["one-local"]),
+        _evidence("b", "event:two:b", source_id="two", clusters=["two-local"]),
+    ]
+    linked = deepcopy(independent)
+    linked[0]["cluster_ids"].append("z-shared")
+    linked[1]["cluster_ids"].append("z-shared")
+
+    independent_result = score_screens(screens, independent, ScoringSpec().as_dict())
+    linked_result = score_screens(screens, linked, ScoringSpec().as_dict())
+
+    assert len(independent_result["underlying_groups"]) == 2
+    assert len(linked_result["underlying_groups"]) == 1
+    assert (independent_result["confluence_bonus"], linked_result["confluence_bonus"]) == (5, 0)
+    assert (independent_result["conviction"], linked_result["conviction"]) == (35, 30)
+    assert independent_result["scored_evidence_hash"] != linked_result["scored_evidence_hash"]
+
+
 def test_missing_source_id_is_not_a_confluence_unit():
     screens = [_screen("valuation", evidence=["a"]), _screen("quality", evidence=["b"])]
     evidence = [
@@ -200,6 +226,58 @@ def test_screen_only_change_is_an_explicit_rebase():
         committee_hashes_differ=False,
         correction_chain=False,
     ) == {
+        "change_cause": "SCREEN_METHODOLOGY_CHANGE",
+        "trajectory_label": "REBASED",
+        "delta": None,
+    }
+
+
+def test_semantic_screen_identity_ignores_run_scoped_ids_but_detects_config_change():
+    screen = {
+        "family": "valuation",
+        "screen_id": "value",
+        "screen_version": 1,
+        "feature_schema_version": 1,
+        "config_hash": "config-v1",
+        "screen_result_id": "run-a-result",
+        "result_hash": "run-a-hash",
+        "sufficient_data": True,
+        "passed": True,
+        "confidence": 0.8,
+        "data_quality": 0.9,
+        "reason_codes": ["b", "a"],
+        "evidence_ids": ["e2", "e1"],
+        "raw_features": {"z": 2, "a": [1, 2]},
+    }
+    rerun = deepcopy(screen)
+    rerun.update(screen_result_id="run-b-result", result_hash="run-b-hash")
+    rerun["reason_codes"].reverse()
+    rerun["evidence_ids"].reverse()
+
+    assert semantic_screen_hash(screen) == semantic_screen_hash(rerun)
+    unchanged = classify_trajectory(
+        {"scoring_config_hash": "score-v2", "scored_evidence_hash": "same", "conviction": 50},
+        {"scoring_config_hash": "score-v2", "scored_evidence_hash": "same", "conviction": 50},
+        screen_hashes_equal=True,
+        committee_hashes_differ=True,
+        correction_chain=False,
+    )
+    assert unchanged == {
+        "change_cause": "MODEL_REASSESSMENT",
+        "trajectory_label": "STABLE",
+        "delta": 0,
+    }
+
+    rerun["config_hash"] = "config-v2"
+    assert semantic_screen_hash(screen) != semantic_screen_hash(rerun)
+    changed = classify_trajectory(
+        {"scoring_config_hash": "score-v2", "scored_evidence_hash": "same", "conviction": 50},
+        {"scoring_config_hash": "score-v2", "scored_evidence_hash": "same", "conviction": 50},
+        screen_hashes_equal=False,
+        committee_hashes_differ=False,
+        correction_chain=False,
+    )
+    assert changed == {
         "change_cause": "SCREEN_METHODOLOGY_CHANGE",
         "trajectory_label": "REBASED",
         "delta": None,
