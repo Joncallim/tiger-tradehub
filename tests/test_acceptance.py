@@ -239,7 +239,11 @@ def test_fa00_artifacts_contain_no_secrets():
     assert result.status == Status.PASS
     for path in result.artifacts:
         text = Path(path).read_text()
-        for secret in ("TEST-PAPER-ACCOUNT-PLACEHOLDER", "TEST-TIGER-ID-PLACEHOLDER", "AbCdEfGhIjKlMnOpQrStUvWxYz012345"):
+        for secret in (
+            "TEST-PAPER-ACCOUNT-PLACEHOLDER",
+            "TEST-TIGER-ID-PLACEHOLDER",
+            "AbCdEfGhIjKlMnOpQrStUvWxYz012345",
+        ):
             assert secret not in text, f"secret leaked into artifact {path}"
 
 
