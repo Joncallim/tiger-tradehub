@@ -619,7 +619,7 @@ def shared_xbrl_regression(tmp: Path) -> None:
         for family in ("valuation", "inflection", "quality")
     ]
     scored = score_screens(screens, evidence, ScoringSpec().as_dict())
-    assert scored["underlying_groups"] == ["xbrl:src:acc"]
+    assert scored["underlying_groups"] == ['independence:v1:["src"]']
     assert scored["confluence_bonus"] == 0 and scored["raw_score"] == 50
 
     def bucket(value: str) -> int:

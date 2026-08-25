@@ -25,6 +25,45 @@ def _six(value: Decimal) -> Decimal:
     return value.quantize(Q, rounding=ROUND_HALF_UP)
 
 
+def _independence_units(evidence: list[dict[str, Any]]) -> list[str]:
+    """Return deterministic v1 source components linked by shared evidence clusters."""
+    source_clusters: dict[str, set[str]] = {}
+    cluster_sources: dict[str, set[str]] = {}
+    for item in evidence:
+        source_id = item.get("source_id")
+        if not isinstance(source_id, str) or not source_id:
+            continue
+        clusters = {
+            cluster_id
+            for cluster_id in item.get("cluster_ids", [])
+            if isinstance(cluster_id, str) and cluster_id
+        }
+        source_clusters.setdefault(source_id, set()).update(clusters)
+        for cluster_id in clusters:
+            cluster_sources.setdefault(cluster_id, set()).add(source_id)
+
+    neighbors = {source_id: set() for source_id in source_clusters}
+    for sources in cluster_sources.values():
+        for source_id in sources:
+            neighbors[source_id].update(sources - {source_id})
+
+    units = []
+    unseen = set(neighbors)
+    while unseen:
+        root = min(unseen)
+        component = {root}
+        queue = [root]
+        unseen.remove(root)
+        while queue:
+            current = queue.pop()
+            for other in sorted(neighbors[current] & unseen):
+                unseen.remove(other)
+                component.add(other)
+                queue.append(other)
+        units.append("independence:v1:" + canonical_json(sorted(component)))
+    return sorted(units)
+
+
 def score_screens(
     screens: list[dict[str, Any]], evidence: list[dict[str, Any]], spec: dict[str, Any]
 ) -> dict[str, Any]:
@@ -39,7 +78,6 @@ def score_screens(
     base = low_quality = Decimal(0)
     quality_numerator = Decimal(0)
     missing_count = stale_count = 0
-    groups: set[str] = set()
     scored_evidence: dict[str, dict[str, Any]] = {}
     reason_codes: set[str] = set()
     for family, weight in weights.items():
@@ -66,8 +104,6 @@ def score_screens(
                 group = item.get("underlying_group")
                 if not group and item.get("record_type") == "xbrl_fact":
                     raise ValueError("UNGROUPABLE_XBRL")
-                if group:
-                    groups.add(group)
                 scored_evidence[evidence_id] = item
         contributions[family] = {
             "weight": int(weight),
@@ -79,7 +115,8 @@ def score_screens(
         }
     missing_penalty = min(Decimal(10), Decimal(2 * missing_count))
     staleness_penalty = min(Decimal(6), Decimal(2 * stale_count))
-    confluence = Decimal(5 * min(2, max(0, len(groups) - 1)))
+    independence_units = _independence_units(list(scored_evidence.values()))
+    confluence = Decimal(5 * min(2, max(0, len(independence_units) - 1)))
     raw = _six(
         max(
             Decimal(0),
@@ -94,7 +131,7 @@ def score_screens(
         {
             "evidence_id": item["evidence_id"],
             "content_hash": item["content_hash"],
-            "source_id": item["source_id"],
+            "source_id": item.get("source_id"),
             "underlying_group": item.get("underlying_group"),
             "public_available_time": item["public_available_time"],
             "supersedes_evidence_id": item.get("supersedes_evidence_id"),
@@ -106,7 +143,7 @@ def score_screens(
     ).hexdigest()
     return {
         "family_contributions": contributions,
-        "underlying_groups": sorted(groups),
+        "underlying_groups": independence_units,
         "penalties": {
             "low_quality": float(_six(low_quality)),
             "missing": float(_six(missing_penalty)),
