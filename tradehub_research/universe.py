@@ -197,9 +197,7 @@ class SecurityIdentityStore:
             return self.ticker_at_connection(db, security_id, as_of)
 
     @staticmethod
-    def ticker_at_connection(
-        db: sqlite3.Connection, security_id: str, as_of: str
-    ) -> str | None:
+    def ticker_at_connection(db: sqlite3.Connection, security_id: str, as_of: str) -> str | None:
         """Resolve a PIT ticker within the caller's existing SQLite snapshot."""
         as_of = normalize_ts(as_of)
         event = db.execute(

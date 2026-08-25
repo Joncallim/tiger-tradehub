@@ -67,8 +67,7 @@ def test_one_xbrl_source_across_three_families_is_one_independence_unit():
         _screen("quality", evidence=["q"]),
     ]
     evidence = [
-        _evidence(item, "xbrl:sec:accession", record_type="xbrl_fact")
-        for item in ("v", "i", "q")
+        _evidence(item, "xbrl:sec:accession", record_type="xbrl_fact") for item in ("v", "i", "q")
     ]
     result = score_screens(screens, evidence, ScoringSpec().as_dict())
     assert result["underlying_groups"] == ['independence:v1:["sec"]']
@@ -93,9 +92,7 @@ def test_distinct_unlinked_sources_earn_bounded_confluence_bonus():
     ]
     evidence = [
         _evidence(item, f"event:{source}:{item}", source_id=source)
-        for item, source in zip(
-            ("a", "b", "c", "d"), ("one", "two", "three", "four"), strict=True
-        )
+        for item, source in zip(("a", "b", "c", "d"), ("one", "two", "three", "four"), strict=True)
     ]
     result = score_screens(screens, evidence, ScoringSpec().as_dict())
     assert len(result["underlying_groups"]) == 4
