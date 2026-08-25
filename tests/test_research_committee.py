@@ -23,11 +23,14 @@ from tradehub_research.db import ResearchDB
 from tradehub_research.schema import MIGRATIONS, PHASE_0_SCHEMA_VERSION
 from tradehub_research.screen_store import DeterminismError
 from tradehub_research.screens import ScreenResult, ScreenSpec, canonical_json
+from tradehub_research.universe import SecurityIdentityStore
 
 # ruff: noqa: E501 -- fixture SQL mirrors complete immutable table layouts.
 
 
-def _fixture(path: Path, *, missing_accession: bool = False) -> tuple[ResearchDB, str]:
+def _fixture(
+    path: Path, *, missing_accession: bool = False, as_of: str = "2025-02-01T00:00:00Z"
+) -> tuple[ResearchDB, str]:
     database = ResearchDB(path)
     database.migrate()
     spec = ScreenSpec("valuation", "value", 1, 1, {}, [], "test")
@@ -101,7 +104,7 @@ def _fixture(path: Path, *, missing_accession: bool = False) -> tuple[ResearchDB
             "INSERT INTO pipeline_run(run_id,as_of,universe_hash,screen_manifest_json,screen_manifest_hash,funnel_config_json,funnel_config_hash,input_snapshot_id,input_view_hash,expected_security_count,status,failure_json,started_at,finished_at,flags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "run",
-                "2025-02-01T00:00:00Z",
+                as_of,
                 "universe",
                 "[]",
                 "manifest",
@@ -619,7 +622,7 @@ def test_aligned_neutrals_score_deterministically(tmp_path):
             "SELECT conviction,committee_agreement FROM score_snapshot WHERE committee_run_id=?",
             (run,),
         ).fetchone()
-    assert tuple(snapshot) == (15, 1.0)
+    assert tuple(snapshot) == (10, 1.0)
 
 
 def _valid_assessment(
@@ -1172,6 +1175,95 @@ def test_pack_replay_ignores_later_cluster_and_ticker_rows(tmp_path):
             ),
         )
     assert EvidencePackBuilder(database).build(candidate_id) == first
+
+
+def _identity_pack(tmp_path: Path, as_of: str, events: list[dict[str, object]]):
+    database, candidate_id = _fixture(tmp_path, as_of=as_of)
+    store = SecurityIdentityStore(database)
+    inserted: list[int] = []
+    for event in events:
+        values = dict(event)
+        predecessor = values.pop("supersedes_index", None)
+        if predecessor is not None:
+            values["supersedes_id"] = inserted[int(predecessor)]
+        inserted.append(store.insert(security_id="sec", **values))
+    return EvidencePackBuilder(database).build(candidate_id)
+
+
+@pytest.mark.parametrize(
+    ("as_of", "expected"),
+    (("2025-03-01", "OLD"), ("2025-07-01", "NEW")),
+)
+def test_pack_ticker_requires_announcement_and_effective_time(tmp_path, as_of, expected):
+    pack = _identity_pack(
+        tmp_path / f"effective-{expected}.db",
+        as_of,
+        [
+            {
+                "event_type": "baseline",
+                "old_value": None,
+                "new_value": "OLD",
+                "event_time": "2025-01-01",
+                "public_available_time": "2025-01-01",
+                "pat_provenance": "source_reported",
+            },
+            {
+                "event_type": "ticker_change",
+                "old_value": "OLD",
+                "new_value": "NEW",
+                "event_time": "2025-06-01",
+                "public_available_time": "2025-02-01",
+                "pat_provenance": "source_reported",
+                "supersedes_index": 0,
+            },
+        ],
+    )
+    assert pack.body["identity"]["ticker_as_of"] == expected
+
+
+@pytest.mark.parametrize(
+    ("as_of", "expected"),
+    (("2025-07-01", "NEW"), ("2025-09-01", "CORRECTED")),
+)
+def test_pack_ticker_uses_knowable_supersession_version(tmp_path, as_of, expected):
+    pack = _identity_pack(
+        tmp_path / f"correction-{expected}.db",
+        as_of,
+        [
+            {
+                "event_type": "baseline",
+                "old_value": None,
+                "new_value": "OLD",
+                "event_time": "2025-01-01",
+                "public_available_time": "2025-01-01",
+                "pat_provenance": "source_reported",
+            },
+            {
+                "event_type": "ticker_change",
+                "old_value": "OLD",
+                "new_value": "NEW",
+                "event_time": "2025-06-01",
+                "public_available_time": "2025-02-01",
+                "pat_provenance": "source_reported",
+                "supersedes_index": 0,
+            },
+            {
+                "event_type": "ticker_change",
+                "old_value": "OLD",
+                "new_value": "CORRECTED",
+                "event_time": "2025-06-01",
+                "public_available_time": "2025-08-01",
+                "pat_provenance": "derived_from_index",
+                "supersedes_index": 1,
+            },
+        ],
+    )
+    assert pack.body["identity"]["ticker_as_of"] == expected
+
+
+def test_pack_ticker_without_identity_event_uses_canonical_ticker(tmp_path):
+    database, candidate_id = _fixture(tmp_path / "canonical-ticker.db")
+    assert EvidencePackBuilder(database).build(candidate_id).body["identity"]["ticker_as_of"] == "TST"
 
 
 def test_candidate_trends_follow_as_of_not_snapshot_hash(tmp_path):

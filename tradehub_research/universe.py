@@ -193,10 +193,17 @@ class SecurityIdentityStore:
             return int(cursor.lastrowid)
 
     def ticker_at(self, security_id: str, as_of: str) -> str | None:
-        as_of = normalize_ts(as_of)
         with self.database.connect(read_only=True) as db:
-            event = db.execute(
-                """WITH RECURSIVE visible_chain(root_id,descendant_id) AS (
+            return self.ticker_at_connection(db, security_id, as_of)
+
+    @staticmethod
+    def ticker_at_connection(
+        db: sqlite3.Connection, security_id: str, as_of: str
+    ) -> str | None:
+        """Resolve a PIT ticker within the caller's existing SQLite snapshot."""
+        as_of = normalize_ts(as_of)
+        event = db.execute(
+            """WITH RECURSIVE visible_chain(root_id,descendant_id) AS (
                     SELECT candidate.id,candidate.id FROM security_identity_event candidate
                     WHERE candidate.public_available_time IS NOT NULL
                       AND candidate.event_type IN ('baseline','ticker_change')
@@ -233,6 +240,6 @@ class SecurityIdentityStore:
                   AND identity.pat_provenance IN ('source_reported','derived_from_index')
                 ORDER BY identity.event_time DESC,identity.public_available_time DESC,
                     identity.id DESC LIMIT 1""",
-                (as_of, as_of, as_of, as_of, as_of, as_of, security_id),
-            ).fetchone()
-            return str(event["new_value"]) if event is not None else None
+            (as_of, as_of, as_of, as_of, as_of, as_of, security_id),
+        ).fetchone()
+        return str(event["new_value"]) if event is not None else None

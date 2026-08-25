@@ -12,6 +12,7 @@ from typing import Any
 from tradehub_research.db import ResearchDB, normalize_ts, utc_now
 from tradehub_research.screen_store import DeterminismError
 from tradehub_research.screens import canonical_json
+from tradehub_research.universe import SecurityIdentityStore
 
 PACK_SPEC_VERSION = 1
 MAX_EVIDENCE_ROWS = 256
@@ -291,25 +292,11 @@ class EvidencePackBuilder:
             )
         screens.sort(key=lambda item: (item["family"], item["screen_id"], item["screen_version"]))
         flags = sorted(set(json.loads(candidate["flags_json"] or "[]")))
-        ticker_event = db.execute(
-            "SELECT new_value FROM security_identity_event WHERE security_id=? "
-            "AND event_type='ticker_change' AND public_available_time IS NOT NULL "
-            "AND public_available_time<=? AND pat_provenance IN "
-            "('source_reported','derived_from_index') ORDER BY event_time DESC,id DESC LIMIT 1",
-            (candidate["security_id"], candidate["as_of"]),
-        ).fetchone()
-        if ticker_event is None:
-            ticker_event = db.execute(
-                "SELECT old_value FROM security_identity_event WHERE security_id=? "
-                "AND event_type='ticker_change' AND public_available_time>? "
-                "ORDER BY public_available_time,event_time,id LIMIT 1",
-                (candidate["security_id"], candidate["as_of"]),
-            ).fetchone()
-        ticker_as_of = (
-            candidate["canonical_ticker"]
-            if ticker_event is None or not ticker_event[0]
-            else ticker_event[0]
+        ticker_as_of = SecurityIdentityStore.ticker_at_connection(
+            db, candidate["security_id"], candidate["as_of"]
         )
+        if not ticker_as_of:
+            ticker_as_of = candidate["canonical_ticker"]
         body: dict[str, Any] = {
             "pack_spec_version": PACK_SPEC_VERSION,
             "candidate": {"candidate_id": candidate_id, "security_id": candidate["security_id"]},
