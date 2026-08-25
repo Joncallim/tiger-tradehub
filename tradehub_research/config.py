@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,3 +17,6 @@ class ResearchSettings(BaseSettings):
     adapter_cache_dir: Path = Path("data/research/raw")
     tiingo_token: str | None = None
     tiingo_license_confirmed: bool = False
+    api_token: SecretStr = SecretStr("")
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 8091

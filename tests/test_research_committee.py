@@ -4,9 +4,13 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
+from tradehub_research.committee.api import app, get_database, get_settings
 from tradehub_research.committee.pack import EvidencePackBuilder, PackBuildError
+from tradehub_research.committee.routing import CommitteeRouter
 from tradehub_research.committee.store import CommitteeStore, ComparatorSpec, ScoringSpec
+from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
 from tradehub_research.schema import MIGRATIONS, PHASE_0_SCHEMA_VERSION
 from tradehub_research.screen_store import DeterminismError
@@ -398,3 +402,121 @@ def test_call_attempt_slot_is_insert_or_verify(tmp_path):
             attempt_number=1,
             **dict(payload, model_id="different"),
         )
+
+
+def test_committee_http_auth_create_status_work_and_score_reads(tmp_path):
+    database, candidate_id = _fixture(tmp_path / "api.db")
+    settings = ResearchSettings(api_token="research-secret")
+    app.dependency_overrides[get_database] = lambda: database
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client = TestClient(app)
+        assert (
+            client.post("/committee-runs", json={"candidate_id": candidate_id}).status_code == 401
+        )
+        headers = {"Authorization": "Bearer research-secret"}
+        created = client.post(
+            "/committee-runs", json={"candidate_id": candidate_id}, headers=headers
+        )
+        assert created.status_code == 200
+        run_id = created.json()["committee_run_id"]
+        assert (
+            client.post(
+                "/committee-runs", json={"candidate_id": candidate_id}, headers=headers
+            ).json()["committee_run_id"]
+            == run_id
+        )
+        assert (
+            client.get(f"/committee-runs/{run_id}", headers=headers).json()["state"]
+            == "PENDING_NEUTRALS"
+        )
+        work = client.get(f"/committee-runs/{run_id}/work", headers=headers).json()["work"]
+        assert work["role"] == "neutral_analyst_a"
+        assert "neutral_analyst_b" not in str(work)
+        assert client.get("/score-snapshots/missing", headers=headers).status_code == 404
+        assert client.get(
+            f"/candidates/{candidate_id}/score-snapshots", headers=headers
+        ).json() == {"score_snapshots": []}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_atomic_validated_neutral_submission_advances_after_both(tmp_path):
+    store, run, pack_hash = _committee(tmp_path / "submit-route.db")
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+
+    def valid(role: str) -> dict[str, object]:
+        return {
+            **_assessment(pack_hash),
+            "role": role,
+            "evaluation_time": "2025-02-01T00:00:00Z",
+            "thesis": {
+                "summary": "summary",
+                "upside_mechanism": "upside",
+                "downside_mechanism": "downside",
+                "thesis_break_conditions": [],
+            },
+        }
+
+    assert router.submit(run, valid("neutral_analyst_a"))["state"] == "PENDING_NEUTRALS"
+    analyst_b = valid("neutral_analyst_b")
+    analyst_b["provider"] = "provider-b"
+    assert router.submit(run, analyst_b)["state"] == "RED_TEAM_REQUIRED"
+    with store.database.connect(read_only=True) as db:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM model_assessment WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            db.execute(
+                "SELECT count(*) FROM comparison_report WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_aligned_neutrals_score_deterministically(tmp_path):
+    store, run, pack_hash = _committee(tmp_path / "aligned-score.db")
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+
+    def aligned(role: str, provider: str) -> dict[str, object]:
+        return {
+            **_assessment(pack_hash),
+            "role": role,
+            "provider": provider,
+            "evaluation_time": "2025-02-01T00:00:00Z",
+            "claims": [
+                {
+                    "claim_key": "valuation_vs_history",
+                    "claim_type": "fact",
+                    "direction": "bullish",
+                    "statement": "supported",
+                    "materiality": 3,
+                    "uncertainty": 0.2,
+                    "cited_evidence_ids": ["x2"],
+                    "contradictory_evidence_ids": [],
+                    "falsification_condition": None,
+                }
+            ],
+            "cited_evidence_ids": ["x2"],
+            "thesis": {
+                "summary": "summary",
+                "upside_mechanism": "upside",
+                "downside_mechanism": "downside",
+                "thesis_break_conditions": [],
+            },
+        }
+
+    router.submit(run, aligned("neutral_analyst_a", "provider-a"))
+    result = router.submit(run, aligned("neutral_analyst_b", "provider-b"))
+    assert result["state"] == "SCORED"
+    with store.database.connect(read_only=True) as db:
+        snapshot = db.execute(
+            "SELECT conviction,committee_agreement FROM score_snapshot WHERE committee_run_id=?",
+            (run,),
+        ).fetchone()
+    assert tuple(snapshot) == (15, 1.0)

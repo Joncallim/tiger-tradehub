@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+from tradehub_research.committee.scoring import classify_trajectory, score_screens
+from tradehub_research.committee.store import ScoringSpec
+
+
+def _screen(family: str, *, quality: float = 1, evidence: list[str] | None = None, **changes):
+    row = {
+        "family": family,
+        "sufficient_data": True,
+        "passed": True,
+        "data_quality": quality,
+        "reason_codes": [],
+        "evidence_ids": evidence or [],
+    }
+    row.update(changes)
+    return row
+
+
+def _evidence(evidence_id: str, group: str):
+    return {
+        "evidence_id": evidence_id,
+        "content_hash": evidence_id + "-hash",
+        "source_id": "sec",
+        "underlying_group": group,
+        "public_available_time": "2025-01-01Z",
+        "supersedes_evidence_id": None,
+    }
+
+
+def test_exact_arithmetic_penalties_bonus_and_half_up():
+    screens = [
+        _screen("valuation", quality=0.5, evidence=["a"]),
+        _screen("inflection", evidence=["b"], reason_codes=["stale_source"]),
+        _screen("quality", sufficient_data=False, passed=False, data_quality=0),
+        _screen("informed_activity", sufficient_data=False, passed=False, data_quality=0),
+        _screen("event", sufficient_data=False, passed=False, data_quality=0),
+        _screen("momentum_confirmation", sufficient_data=False, passed=False, data_quality=0),
+    ]
+    result = score_screens(
+        screens, [_evidence("a", "g1"), _evidence("b", "g2")], ScoringSpec().as_dict()
+    )
+    assert result["base_evidence"] == 36
+    assert result["confluence_bonus"] == 5
+    assert result["penalties"] == {"low_quality": 9.0, "missing": 6.0, "staleness": 2.0}
+    assert result["raw_score"] == 24
+    assert result["conviction"] == 25
+
+
+def test_shared_xbrl_three_families_is_one_group_and_no_bonus():
+    screens = [
+        _screen("valuation", evidence=["v"]),
+        _screen("inflection", evidence=["i"]),
+        _screen("quality", evidence=["q"]),
+    ]
+    evidence = [_evidence(item, "xbrl:sec:accession") for item in ("v", "i", "q")]
+    result = score_screens(screens, evidence, ScoringSpec().as_dict())
+    assert result["underlying_groups"] == ["xbrl:sec:accession"]
+    assert result["confluence_bonus"] == 0
+    assert result["raw_score"] == 50  # 54 base - 4 missing event/activity
+
+
+def test_trajectory_four_causes_and_direction_labels():
+    current = {
+        "scoring_config_hash": "v1",
+        "scored_evidence_hash": "new",
+        "conviction": 65,
+    }
+    assert classify_trajectory(
+        None,
+        current,
+        screen_hashes_equal=False,
+        committee_hashes_differ=False,
+        correction_chain=False,
+    ) == {"change_cause": "INITIAL", "trajectory_label": "INITIAL", "delta": None}
+    prior = {
+        "scoring_config_hash": "old",
+        "scored_evidence_hash": "old",
+        "conviction": 70,
+    }
+    assert (
+        classify_trajectory(
+            prior,
+            current,
+            screen_hashes_equal=False,
+            committee_hashes_differ=False,
+            correction_chain=False,
+        )["trajectory_label"]
+        == "REBASED"
+    )
+    prior.update(scoring_config_hash="v1", scored_evidence_hash="new", conviction=65)
+    assert classify_trajectory(
+        prior,
+        current,
+        screen_hashes_equal=True,
+        committee_hashes_differ=True,
+        correction_chain=False,
+    ) == {"change_cause": "MODEL_REASSESSMENT", "trajectory_label": "STABLE", "delta": 0}
+    prior.update(scored_evidence_hash="old", conviction=70)
+    correction = classify_trajectory(
+        prior,
+        current,
+        screen_hashes_equal=False,
+        committee_hashes_differ=False,
+        correction_chain=True,
+    )
+    assert correction == {
+        "change_cause": "CORRECTION_RESTATEMENT",
+        "trajectory_label": "FALLING",
+        "delta": -5,
+    }
+    current["conviction"] = 75
+    evidence = classify_trajectory(
+        prior,
+        current,
+        screen_hashes_equal=False,
+        committee_hashes_differ=False,
+        correction_chain=False,
+    )
+    assert evidence == {
+        "change_cause": "EVIDENCE_DRIVEN",
+        "trajectory_label": "RISING",
+        "delta": 5,
+    }
