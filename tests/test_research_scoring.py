@@ -64,9 +64,7 @@ def test_shared_xbrl_three_families_is_one_group_and_no_bonus():
 
 def test_duplicate_scored_family_is_rejected():
     with pytest.raises(ValueError, match="duplicate scored screen family"):
-        score_screens(
-            [_screen("valuation"), _screen("valuation")], [], ScoringSpec().as_dict()
-        )
+        score_screens([_screen("valuation"), _screen("valuation")], [], ScoringSpec().as_dict())
 
 
 def test_trajectory_four_causes_and_direction_labels():

@@ -29,7 +29,14 @@ CALL_TIMEOUT_SECONDS = 120
 FOCUS_BUCKETS = ("EVIDENCE_CONFLICT", "CONTRADICTORY", "UNSUPPORTED", "OMITTED")
 ATTEMPT_OUTCOMES = {"accepted", "malformed", "unavailable", "timeout"}
 ATTEMPT_REQUIRED_KEYS = {
-    "work_id", "outcome", "provider", "model_id", "model_route", "billing_class", "usage", "cost"
+    "work_id",
+    "outcome",
+    "provider",
+    "model_id",
+    "model_route",
+    "billing_class",
+    "usage",
+    "cost",
 }
 ATTEMPT_OPTIONAL_KEYS = {"assessment", "diagnostic_excerpt"}
 
@@ -41,7 +48,8 @@ def _hash(domain: str, value: object) -> str:
 def _focus_body(db: sqlite3.Connection, run_id: str, role: str) -> dict[str, Any]:
     comparison = db.execute(
         "SELECT comparison_id,report_json FROM comparison_report WHERE committee_run_id=? "
-        "ORDER BY rowid DESC LIMIT 1", (run_id,),
+        "ORDER BY rowid DESC LIMIT 1",
+        (run_id,),
     ).fetchone()
     if comparison is None:
         raise ValueError("targeted work requires a comparison")
@@ -49,23 +57,27 @@ def _focus_body(db: sqlite3.Connection, run_id: str, role: str) -> dict[str, Any
     items = []
     for bucket in FOCUS_BUCKETS:
         for item in buckets.get(bucket, []):
-            items.append({
-                "item_id": item["item_id"], "bucket": bucket,
-                "claim_a": item.get("claim_a"), "claim_b": item.get("claim_b"),
-                "evidence_ids": item.get("evidence_ids", []),
-                "material": bool(item.get("material", False)),
-            })
+            items.append(
+                {
+                    "item_id": item["item_id"],
+                    "bucket": bucket,
+                    "claim_a": item.get("claim_a"),
+                    "claim_b": item.get("claim_b"),
+                    "evidence_ids": item.get("evidence_ids", []),
+                    "material": bool(item.get("material", False)),
+                }
+            )
     items.sort(key=lambda item: item["item_id"])
     if role == "arbiter":
         resolution = db.execute(
             "SELECT resolution_json FROM dispute_resolution WHERE committee_run_id=? "
-            "AND role='red_team' ORDER BY rowid DESC LIMIT 1", (run_id,),
+            "AND role='red_team' ORDER BY rowid DESC LIMIT 1",
+            (run_id,),
         ).fetchone()
         if resolution is None:
             raise ValueError("arbiter work requires a red-team resolution")
         unresolved = {
-            item["item_id"] for item in json.loads(resolution[0])
-            if item["verdict"] == "unresolved"
+            item["item_id"] for item in json.loads(resolution[0]) if item["verdict"] == "unresolved"
         }
         items = [item for item in items if item["item_id"] in unresolved and item["material"]]
         if not items:
@@ -92,12 +104,18 @@ class CommitteeRouter:
 
     def _base_status(self, run_id: str) -> dict[str, Any]:
         with self.database.connect(read_only=True) as db:
-            run = db.execute("SELECT * FROM committee_run WHERE committee_run_id=?", (run_id,)).fetchone()
+            run = db.execute(
+                "SELECT * FROM committee_run WHERE committee_run_id=?", (run_id,)
+            ).fetchone()
             if run is None:
                 raise KeyError(run_id)
-            roles = [row[0] for row in db.execute(
-                "SELECT role FROM model_assessment WHERE committee_run_id=? ORDER BY role", (run_id,)
-            )]
+            roles = [
+                row[0]
+                for row in db.execute(
+                    "SELECT role FROM model_assessment WHERE committee_run_id=? ORDER BY role",
+                    (run_id,),
+                )
+            ]
             attempts = db.execute(
                 "SELECT count(*) FROM model_call_attempt WHERE committee_run_id=?", (run_id,)
             ).fetchone()[0]
@@ -106,9 +124,13 @@ class CommitteeRouter:
             ).fetchone()[0]
         state = self.store.current_state(run_id)
         return {
-            "committee_run_id": run_id, "candidate_id": run["candidate_id"],
-            "pack_hash": run["pack_hash"], "state": state, "accepted_roles": roles,
-            "model_calls": issued, "completed_attempts": attempts,
+            "committee_run_id": run_id,
+            "candidate_id": run["candidate_id"],
+            "pack_hash": run["pack_hash"],
+            "state": state,
+            "accepted_roles": roles,
+            "model_calls": issued,
+            "completed_attempts": attempts,
             "required_work": self._required(state, roles),
         }
 
@@ -116,7 +138,8 @@ class CommitteeRouter:
         self._recover_ready_to_score(run_id)
         result = self._base_status(run_id)
         result["work"] = [
-            envelope for role in result["required_work"]
+            envelope
+            for role in result["required_work"]
             if (envelope := self._get_or_issue_work(run_id, role)) is not None
         ]
         with self.database.connect(read_only=True) as db:
@@ -128,7 +151,9 @@ class CommitteeRouter:
     @staticmethod
     def _required(state: str | None, roles: list[str]) -> list[str]:
         if state == "PENDING_NEUTRALS":
-            return [role for role in ("neutral_analyst_a", "neutral_analyst_b") if role not in roles]
+            return [
+                role for role in ("neutral_analyst_a", "neutral_analyst_b") if role not in roles
+            ]
         if state == "RED_TEAM_REQUIRED" and "red_team" not in roles:
             return ["red_team"]
         if state == "ARBITER_REQUIRED" and "arbiter" not in roles:
@@ -149,7 +174,9 @@ class CommitteeRouter:
         if role not in status["required_work"]:
             return None
         with self.database.connect(read_only=True) as db:
-            run = db.execute("SELECT * FROM committee_run WHERE committee_run_id=?", (run_id,)).fetchone()
+            run = db.execute(
+                "SELECT * FROM committee_run WHERE committee_run_id=?", (run_id,)
+            ).fetchone()
             attempts = db.execute(
                 "SELECT count(*) FROM model_call_attempt WHERE committee_run_id=? AND role=?",
                 (run_id, role),
@@ -160,13 +187,16 @@ class CommitteeRouter:
             open_work = db.execute(
                 "SELECT w.* FROM committee_work w LEFT JOIN model_call_attempt a ON a.work_id=w.work_id "
                 "WHERE w.committee_run_id=? AND w.role=? AND a.attempt_id IS NULL "
-                "ORDER BY w.attempt_number LIMIT 1", (run_id, role),
+                "ORDER BY w.attempt_number LIMIT 1",
+                (run_id, role),
             ).fetchone()
             prompts = json.loads(run["prompt_versions_json"])
-            spec = json.loads(db.execute(
-                "SELECT spec_json FROM comparator_definition WHERE config_hash=?",
-                (run["comparator_config_hash"],),
-            ).fetchone()[0])
+            spec = json.loads(
+                db.execute(
+                    "SELECT spec_json FROM comparator_definition WHERE config_hash=?",
+                    (run["comparator_config_hash"],),
+                ).fetchone()[0]
+            )
             focus_body = _focus_body(db, run_id, role) if role in {"red_team", "arbiter"} else None
         if open_work is not None:
             return self._work_envelope(dict(open_work))
@@ -178,10 +208,15 @@ class CommitteeRouter:
             raise ValueError("missing prompt version for authorized role")
         focus_hash = _focus_hash(focus_body) if focus_body is not None else None
         work_id = self.store.insert_work(
-            committee_run_id=run_id, role=role, attempt_number=attempts + 1,
-            pack_hash=run["pack_hash"], prompt_version=prompt,
+            committee_run_id=run_id,
+            role=role,
+            attempt_number=attempts + 1,
+            pack_hash=run["pack_hash"],
+            prompt_version=prompt,
             assessment_schema_version=run["assessment_schema_version"],
-            taxonomy_version=spec["taxonomy_version"], focus_hash=focus_hash, focus=focus_body,
+            taxonomy_version=spec["taxonomy_version"],
+            focus_hash=focus_hash,
+            focus=focus_body,
         )
         with self.database.connect(read_only=True) as db:
             row = db.execute("SELECT * FROM committee_work WHERE work_id=?", (work_id,)).fetchone()
@@ -192,11 +227,15 @@ class CommitteeRouter:
         focus_body = json.loads(work["focus_json"]) if work["focus_json"] else None
         focus = None if focus_body is None else {**focus_body, "focus_hash": work["focus_hash"]}
         return {
-            "type": "committee_work_v1", "work_id": work["work_id"],
-            "committee_run_id": work["committee_run_id"], "pack_hash": work["pack_hash"],
-            "role": work["role"], "prompt_version": work["prompt_version"],
+            "type": "committee_work_v1",
+            "work_id": work["work_id"],
+            "committee_run_id": work["committee_run_id"],
+            "pack_hash": work["pack_hash"],
+            "role": work["role"],
+            "prompt_version": work["prompt_version"],
             "assessment_schema_version": work["assessment_schema_version"],
-            "taxonomy_version": work["taxonomy_version"], "timeout_seconds": CALL_TIMEOUT_SECONDS,
+            "taxonomy_version": work["taxonomy_version"],
+            "timeout_seconds": CALL_TIMEOUT_SECONDS,
             "attempt_number": work["attempt_number"],
             "attempts_remaining": MAX_ATTEMPTS_PER_ROLE - work["attempt_number"] + 1,
             "focus": focus,
@@ -222,7 +261,9 @@ class CommitteeRouter:
 
         assessment = envelope.get("assessment")
         if not isinstance(assessment, Mapping):
-            return self._record_malformed_and_raise(run_id, work, envelope, "accepted outcome requires an assessment")
+            return self._record_malformed_and_raise(
+                run_id, work, envelope, "accepted outcome requires an assessment"
+            )
         assessment_input = dict(assessment)
         try:
             normalized = validate_for_run(self.database, run_id, role, assessment_input)
@@ -238,8 +279,11 @@ class CommitteeRouter:
         with self.database.connect() as db:
             attempt_id = self._record_attempt(run_id, work, envelope, connection=db)
             assessment_id = self.store.insert_assessment(
-                committee_run_id=run_id, role=role, payload=normalized,
-                validate=lambda _: None, connection=db,
+                committee_run_id=run_id,
+                role=role,
+                payload=normalized,
+                validate=lambda _: None,
+                connection=db,
             )
             if role in {"red_team", "arbiter"}:
                 resolution_id = self._persist_resolution(
@@ -257,20 +301,29 @@ class CommitteeRouter:
                         for item in normalized["claims"]
                     )
                 target = (
-                    "ARBITER_REQUIRED" if role == "red_team" and unresolved else
-                    "ESCALATE" if role == "arbiter" and unresolved else "READY_TO_SCORE"
+                    "ARBITER_REQUIRED"
+                    if role == "red_team" and unresolved
+                    else "ESCALATE"
+                    if role == "arbiter" and unresolved
+                    else "READY_TO_SCORE"
                 )
                 self.store.record_transition(
-                    run_id, state, target,
+                    run_id,
+                    state,
+                    target,
                     "RED_TEAM_REVIEWED" if role == "red_team" else "ARBITER_REVIEWED",
-                    resolution_id, connection=db,
+                    resolution_id,
+                    connection=db,
                 )
         if state == "PENDING_NEUTRALS":
             roles = self._base_status(run_id)["accepted_roles"]
             if all(item in roles for item in ("neutral_analyst_a", "neutral_analyst_b")):
                 comparison = Comparator(self.database).compare_and_persist(run_id)
                 self.store.record_transition(
-                    run_id, state, comparison["routing_decision"], "NEUTRALS_COMPARED",
+                    run_id,
+                    state,
+                    comparison["routing_decision"],
+                    "NEUTRALS_COMPARED",
                     comparison["comparison_id"],
                 )
                 target = comparison["routing_decision"]
@@ -297,17 +350,28 @@ class CommitteeRouter:
         work = self._get_or_issue_work(run_id, role)
         if work is None:
             raise ValueError("role is not currently authorized")
-        return self.submit(run_id, {
-            "work_id": work["work_id"], "outcome": "accepted",
-            "provider": assessment["provider"], "model_id": assessment["model_id"],
-            "model_route": assessment["model_route"], "billing_class": assessment["billing_class"],
-            "usage": assessment["usage"], "cost": assessment["cost"], "assessment": assessment_input,
-        })
+        return self.submit(
+            run_id,
+            {
+                "work_id": work["work_id"],
+                "outcome": "accepted",
+                "provider": assessment["provider"],
+                "model_id": assessment["model_id"],
+                "model_route": assessment["model_route"],
+                "billing_class": assessment["billing_class"],
+                "usage": assessment["usage"],
+                "cost": assessment["cost"],
+                "assessment": assessment_input,
+            },
+        )
 
     @staticmethod
     def _validate_attempt_envelope(value: Mapping[str, Any]) -> dict[str, Any]:
         keys = set(value)
-        if not ATTEMPT_REQUIRED_KEYS <= keys or not keys <= ATTEMPT_REQUIRED_KEYS | ATTEMPT_OPTIONAL_KEYS:
+        if (
+            not ATTEMPT_REQUIRED_KEYS <= keys
+            or not keys <= ATTEMPT_REQUIRED_KEYS | ATTEMPT_OPTIONAL_KEYS
+        ):
             raise ValueError("attempt envelope has partial or unknown fields")
         outcome = value["outcome"]
         if outcome not in ATTEMPT_OUTCOMES:
@@ -336,7 +400,9 @@ class CommitteeRouter:
 
     def _completed_attempt(self, work_id: str) -> dict[str, Any] | None:
         with self.database.connect(read_only=True) as db:
-            row = db.execute("SELECT * FROM model_call_attempt WHERE work_id=?", (work_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM model_call_attempt WHERE work_id=?", (work_id,)
+            ).fetchone()
         return None if row is None else dict(row)
 
     def _retry_completed(
@@ -353,15 +419,23 @@ class CommitteeRouter:
             with self.database.connect(read_only=True) as db:
                 stored = db.execute(
                     "SELECT assessment_id,semantic_assessment_hash FROM model_assessment "
-                    "WHERE committee_run_id=? AND role=?", (run_id, role),
+                    "WHERE committee_run_id=? AND role=?",
+                    (run_id, role),
                 ).fetchone()
-            if stored is None or stored["semantic_assessment_hash"] != semantic_assessment_hash(role, normalized):
+            if stored is None or stored["semantic_assessment_hash"] != semantic_assessment_hash(
+                role, normalized
+            ):
                 raise DeterminismError("accepted retry changed semantic assessment")
             return {
-                "attempt_id": completed["attempt_id"], "assessment_id": stored["assessment_id"],
+                "attempt_id": completed["attempt_id"],
+                "assessment_id": stored["assessment_id"],
                 **self.status(run_id),
             }
-        return {"attempt_id": completed["attempt_id"], "outcome": completed["outcome"], **self.status(run_id)}
+        return {
+            "attempt_id": completed["attempt_id"],
+            "outcome": completed["outcome"],
+            **self.status(run_id),
+        }
 
     @staticmethod
     def _validate_envelope_matches_assessment(
@@ -402,24 +476,44 @@ class CommitteeRouter:
                     raise ValueError("arbiter provider must differ from red team")
 
     def _record_attempt(
-        self, run_id: str, work: Mapping[str, Any], envelope: Mapping[str, Any], *,
-        connection: sqlite3.Connection | None = None, forced_outcome: str | None = None,
+        self,
+        run_id: str,
+        work: Mapping[str, Any],
+        envelope: Mapping[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
+        forced_outcome: str | None = None,
     ) -> str:
         return self.store.insert_call_attempt(
-            work_id=work["work_id"], committee_run_id=run_id, role=work["role"],
-            attempt_number=work["attempt_number"], connection=connection,
-            provider=envelope["provider"], model_id=envelope["model_id"],
-            model_route=envelope["model_route"], billing_class=envelope["billing_class"],
+            work_id=work["work_id"],
+            committee_run_id=run_id,
+            role=work["role"],
+            attempt_number=work["attempt_number"],
+            connection=connection,
+            provider=envelope["provider"],
+            model_id=envelope["model_id"],
+            model_route=envelope["model_route"],
+            billing_class=envelope["billing_class"],
             prompt_version=work["prompt_version"],
-            prompt_template_hash=_hash("prompt-template-v1", [work["role"], work["prompt_version"]]),
-            pack_hash=work["pack_hash"], outcome=forced_outcome or envelope["outcome"],
-            usage=envelope["usage"], cost=envelope["cost"], diagnostic_hash=None,
-            diagnostic_excerpt=envelope.get("diagnostic_excerpt"), requested_at=work["issued_at"],
+            prompt_template_hash=_hash(
+                "prompt-template-v1", [work["role"], work["prompt_version"]]
+            ),
+            pack_hash=work["pack_hash"],
+            outcome=forced_outcome or envelope["outcome"],
+            usage=envelope["usage"],
+            cost=envelope["cost"],
+            diagnostic_hash=None,
+            diagnostic_excerpt=envelope.get("diagnostic_excerpt"),
+            requested_at=work["issued_at"],
             completed_at=utc_now(),
         )
 
     def _record_malformed_and_raise(
-        self, run_id: str, work: Mapping[str, Any], envelope: Mapping[str, Any], message: str,
+        self,
+        run_id: str,
+        work: Mapping[str, Any],
+        envelope: Mapping[str, Any],
+        message: str,
         cause: Exception | None = None,
     ) -> Any:
         self._record_attempt(run_id, work, envelope, forced_outcome="malformed")
@@ -445,19 +539,26 @@ class CommitteeRouter:
         with self.database.connect(read_only=True) as db:
             last = db.execute(
                 "SELECT outcome FROM model_call_attempt WHERE committee_run_id=? AND role=? "
-                "ORDER BY attempt_number DESC LIMIT 1", (run_id, role),
+                "ORDER BY attempt_number DESC LIMIT 1",
+                (run_id, role),
             ).fetchone()
         self.record_exhaustion(
             run_id, role, unavailable=bool(last and last[0] in {"unavailable", "timeout"})
         )
 
     def _persist_resolution(
-        self, db: sqlite3.Connection, run_id: str, role: str, assessment_id: str,
-        verdicts: list[dict[str, Any]], work: Mapping[str, Any],
+        self,
+        db: sqlite3.Connection,
+        run_id: str,
+        role: str,
+        assessment_id: str,
+        verdicts: list[dict[str, Any]],
+        work: Mapping[str, Any],
     ) -> str:
         comparison = db.execute(
             "SELECT comparison_id FROM comparison_report WHERE committee_run_id=? "
-            "ORDER BY rowid DESC LIMIT 1", (run_id,),
+            "ORDER BY rowid DESC LIMIT 1",
+            (run_id,),
         ).fetchone()
         if comparison is None:
             raise ValueError("resolution requires comparison")
@@ -469,8 +570,15 @@ class CommitteeRouter:
         resolution_id = _hash("dispute-resolution-v1", logical)
         result_hash = _hash("resolution-result-v1", verdicts)
         expected = (
-            resolution_id, run_id, comparison["comparison_id"], role, assessment_id, focus_hash,
-            canonical_json(focus), canonical_json(verdicts), result_hash,
+            resolution_id,
+            run_id,
+            comparison["comparison_id"],
+            role,
+            assessment_id,
+            focus_hash,
+            canonical_json(focus),
+            canonical_json(verdicts),
+            result_hash,
         )
         existing = db.execute(
             "SELECT resolution_id,committee_run_id,comparison_id,role,assessment_id,focus_hash,"
@@ -481,11 +589,14 @@ class CommitteeRouter:
             if tuple(existing) != expected:
                 raise DeterminismError("resolution slot contains different bytes")
             return resolution_id
-        db.execute("INSERT INTO dispute_resolution VALUES (?,?,?,?,?,?,?,?,?,?)", (*expected, utc_now()))
+        db.execute(
+            "INSERT INTO dispute_resolution VALUES (?,?,?,?,?,?,?,?,?,?)", (*expected, utc_now())
+        )
         return resolution_id
 
     def _score(self, run_id: str) -> None:
         from tradehub_research.committee.scoring import Scorer
+
         Scorer(self.database).create_snapshot(run_id)
 
     def record_exhaustion(self, run_id: str, role: str, *, unavailable: bool) -> None:

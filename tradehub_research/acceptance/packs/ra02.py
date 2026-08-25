@@ -98,9 +98,16 @@ def _runtime(tmp: Path, name: str) -> tuple[CommitteeStore, CommitteeRouter, str
     database.migrate()
     definition = ScreenSpec("valuation", "value", 1, 1, {}, [], "RA-02")
     result = ScreenResult.create(
-        run_id="run", security_id="sec", config_hash=definition.config_hash,
-        raw_features={}, evidence_ids=["e1"], reason_codes=[], sufficient_data=True,
-        passed=True, confidence=0.8, data_quality=1.0,
+        run_id="run",
+        security_id="sec",
+        config_hash=definition.config_hash,
+        raw_features={},
+        evidence_ids=["e1"],
+        reason_codes=[],
+        sufficient_data=True,
+        passed=True,
+        confidence=0.8,
+        data_quality=1.0,
     )
     with database.connect() as db:
         db.execute(
@@ -114,17 +121,30 @@ def _runtime(tmp: Path, name: str) -> tuple[CommitteeStore, CommitteeRouter, str
         db.execute(
             "INSERT INTO evidence_event VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                "e1", "sec", "src",
+                "e1",
+                "sec",
+                "src",
                 canonical_json({"record_type": "xbrl_fact", "accession": "acc", "value": 1}),
-                1.0, None, 0, "hash", "e1-record", "2025-01-01Z",
-                "2025-01-01Z", "source_reported", "2025-01-02Z",
+                1.0,
+                None,
+                0,
+                "hash",
+                "e1-record",
+                "2025-01-01Z",
+                "2025-01-01Z",
+                "source_reported",
+                "2025-01-02Z",
             ),
         )
         db.execute(
             "INSERT INTO screen_definition VALUES (?,?,?,?,?,?)",
             (
-                definition.config_hash, definition.family, definition.screen_id,
-                definition.screen_version, definition.canonical_json(), "2025-01-01Z",
+                definition.config_hash,
+                definition.family,
+                definition.screen_id,
+                definition.screen_version,
+                definition.canonical_json(),
+                "2025-01-01Z",
             ),
         )
         db.execute(
@@ -133,32 +153,68 @@ def _runtime(tmp: Path, name: str) -> tuple[CommitteeStore, CommitteeRouter, str
             "input_view_hash,expected_security_count,status,failure_json,started_at,finished_at,"
             "flags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                "run", "2025-02-01T00:00:00Z", "universe", "[]", "manifest", "{}", "funnel",
-                None, "view", 1, "RUNNING", None, "2025-01-01Z", None, "[]",
+                "run",
+                "2025-02-01T00:00:00Z",
+                "universe",
+                "[]",
+                "manifest",
+                "{}",
+                "funnel",
+                None,
+                "view",
+                1,
+                "RUNNING",
+                None,
+                "2025-01-01Z",
+                None,
+                "[]",
             ),
         )
         db.execute(
             "INSERT INTO screen_result VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                result.screen_result_id, "run", "sec", definition.config_hash,
-                canonical_json(result.raw_features), canonical_json(result.evidence_ids), "[]",
-                1, 1, 0.8, 1.0, result.result_hash, "2025-01-02Z",
+                result.screen_result_id,
+                "run",
+                "sec",
+                definition.config_hash,
+                canonical_json(result.raw_features),
+                canonical_json(result.evidence_ids),
+                "[]",
+                1,
+                1,
+                0.8,
+                1.0,
+                result.result_hash,
+                "2025-01-02Z",
             ),
         )
         db.execute("UPDATE pipeline_run SET status='COMPLETE',finished_at='2025-01-02Z'")
         db.execute(
             "INSERT INTO candidate VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                "candidate", "run", "sec", 1, "[]", canonical_json([result.screen_result_id]),
-                "{}", 0, None, None, None, "2025-01-02Z",
+                "candidate",
+                "run",
+                "sec",
+                1,
+                "[]",
+                canonical_json([result.screen_result_id]),
+                "{}",
+                0,
+                None,
+                None,
+                None,
+                "2025-01-02Z",
             ),
         )
     pack = EvidencePackBuilder(database).build("candidate")
     store = CommitteeStore(database)
     comparator, scoring = store.ensure_registry_rows()
     run = store.create_or_resume_committee_run(
-        candidate_id="candidate", pack_hash=pack.pack_hash, committee_policy_version=1,
-        comparator_config_hash=comparator, scoring_config_hash=scoring,
+        candidate_id="candidate",
+        pack_hash=pack.pack_hash,
+        committee_policy_version=1,
+        comparator_config_hash=comparator,
+        scoring_config_hash=scoring,
         prompt_versions={"neutral": "v1", "red_team": "v1", "arbiter": "v1"},
         assessment_schema_version=1,
     )
@@ -187,10 +243,16 @@ def _runtime_payload(
 
 def _attempt(work: dict, outcome: str, assessment: dict | None = None) -> dict:
     value = {
-        "work_id": work["work_id"], "outcome": outcome, "provider": "provider",
-        "model_id": "model", "model_route": "route", "billing_class": "local",
+        "work_id": work["work_id"],
+        "outcome": outcome,
+        "provider": "provider",
+        "model_id": "model",
+        "model_route": "route",
+        "billing_class": "local",
         "usage": {
-            "input_tokens": None, "output_tokens": None, "cached_tokens": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "cached_tokens": None,
             "source": "UNKNOWN",
         },
         "cost": {"amount": None, "currency": None, "source": "UNKNOWN"},
@@ -237,15 +299,12 @@ def pack_stability_and_pit(tmp: Path) -> None:
     store, _, _, _ = _runtime(tmp, "pack")
     first = EvidencePackBuilder(store.database).build("candidate")
     with store.database.connect() as db:
-        db.execute(
-            "INSERT INTO evidence_cluster VALUES (?,?,?)", ("late", "late", "2025-01-01Z")
-        )
+        db.execute("INSERT INTO evidence_cluster VALUES (?,?,?)", ("late", "late", "2025-01-01Z"))
         db.execute("INSERT INTO evidence_cluster_member VALUES (?,?)", ("e1", "late"))
     second = EvidencePackBuilder(store.database).build("candidate")
     assert first == second
     assert all(
-        row["public_available_time"] <= first.body["run"]["as_of"]
-        for row in first.body["evidence"]
+        row["public_available_time"] <= first.body["run"]["as_of"] for row in first.body["evidence"]
     )
 
 
@@ -340,11 +399,15 @@ def red_team_routing(tmp: Path) -> None:
     ids = [item["item_id"] for item in red_work["focus"]["items"]]
     verdicts = [
         {
-            "item_id": ids[0], "verdict": "resolved_for_a", "statement": "resolved",
+            "item_id": ids[0],
+            "verdict": "resolved_for_a",
+            "statement": "resolved",
             "cited_evidence_ids": ["e1"],
         },
         {
-            "item_id": ids[1], "verdict": "unresolved", "statement": "open",
+            "item_id": ids[1],
+            "verdict": "unresolved",
+            "statement": "open",
             "cited_evidence_ids": ["e1"],
         },
     ]
@@ -381,8 +444,10 @@ def no_partial_score(tmp: Path) -> None:
     router.submit(run, _runtime_payload(pack_hash, "neutral_analyst_b", "b", b))
     work = router.get_work(run)
     verdict = {
-        "item_id": work["focus"]["items"][0]["item_id"], "verdict": "resolved_for_a",
-        "statement": "partial", "cited_evidence_ids": ["e1"],
+        "item_id": work["focus"]["items"][0]["item_id"],
+        "verdict": "resolved_for_a",
+        "statement": "partial",
+        "cited_evidence_ids": ["e1"],
     }
     partial = _runtime_payload(pack_hash, "red_team", "red", [verdict])
     try:
@@ -403,8 +468,12 @@ def shared_xbrl_regression(tmp: Path) -> None:
     assert evidence[0]["underlying_group"] == "xbrl:src:acc"
     screens = [
         {
-            "family": family, "sufficient_data": True, "passed": True,
-            "data_quality": 1, "reason_codes": [], "evidence_ids": ["e1"],
+            "family": family,
+            "sufficient_data": True,
+            "passed": True,
+            "data_quality": 1,
+            "reason_codes": [],
+            "evidence_ids": ["e1"],
         }
         for family in ("valuation", "inflection", "quality")
     ]
@@ -422,14 +491,26 @@ def shared_xbrl_regression(tmp: Path) -> None:
 def trajectory_stability(tmp: Path) -> None:
     prior = {"scoring_config_hash": "v1", "scored_evidence_hash": "same", "conviction": 50}
     current = {"scoring_config_hash": "v1", "scored_evidence_hash": "same", "conviction": 50}
-    assert classify_trajectory(
-        prior, current, screen_hashes_equal=True, committee_hashes_differ=True,
-        correction_chain=False,
-    )["change_cause"] == "MODEL_REASSESSMENT"
-    assert classify_trajectory(
-        prior, current, screen_hashes_equal=False, committee_hashes_differ=False,
-        correction_chain=False,
-    )["change_cause"] == "SCREEN_METHODOLOGY_CHANGE"
+    assert (
+        classify_trajectory(
+            prior,
+            current,
+            screen_hashes_equal=True,
+            committee_hashes_differ=True,
+            correction_chain=False,
+        )["change_cause"]
+        == "MODEL_REASSESSMENT"
+    )
+    assert (
+        classify_trajectory(
+            prior,
+            current,
+            screen_hashes_equal=False,
+            committee_hashes_differ=False,
+            correction_chain=False,
+        )["change_cause"]
+        == "SCREEN_METHODOLOGY_CHANGE"
+    )
     store, router, run, pack_hash = _runtime(tmp, "recovery")
     claim = [_claim()]
     router.submit(run, _runtime_payload(pack_hash, "neutral_analyst_a", "a", claim))
@@ -475,9 +556,7 @@ def telemetry_neutrality(tmp: Path) -> None:
         assert db.execute("SELECT count(*) FROM model_assessment").fetchone()[0] == 2
     router.submit(run, clone)
     with store.database.connect(read_only=True) as db:
-        retried = db.execute(
-            "SELECT snapshot_id,score_input_hash FROM score_snapshot"
-        ).fetchone()
+        retried = db.execute("SELECT snapshot_id,score_input_hash FROM score_snapshot").fetchone()
         assert tuple(retried) == tuple(snapshot)
 
 

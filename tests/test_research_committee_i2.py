@@ -106,11 +106,14 @@ def test_comparator_claim_permutations_are_byte_identical():
         claim("earnings_quality", direction="bearish", cited=["e4"]),
     ]
     expected = compare_assessments({"claims": claims_a}, {"claims": claims_b}, SPEC)
-    assert compare_assessments(
-        {"claims": list(reversed(claims_a))},
-        {"claims": [claims_b[1], claims_b[2], claims_b[0]]},
-        SPEC,
-    ) == expected
+    assert (
+        compare_assessments(
+            {"claims": list(reversed(claims_a))},
+            {"claims": [claims_b[1], claims_b[2], claims_b[0]]},
+            SPEC,
+        )
+        == expected
+    )
 
 
 def payload():

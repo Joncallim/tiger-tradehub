@@ -8,8 +8,18 @@ from typing import Any
 EXPECTED_SERVER = "tradehub-research"
 EXPECTED_TOOLS = {"get_evidence_pack", "submit_assessment", "committee_status"}
 FORBIDDEN = {
-    "preview", "confirm", "submit_order", "reconcile", "cancel", "account",
-    "position", "orders", "shell", "sql", "filesystem", "tradehub-mcp",
+    "preview",
+    "confirm",
+    "submit_order",
+    "reconcile",
+    "cancel",
+    "account",
+    "position",
+    "orders",
+    "shell",
+    "sql",
+    "filesystem",
+    "tradehub-mcp",
 }
 
 

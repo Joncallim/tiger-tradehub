@@ -254,7 +254,9 @@ class Scorer:
             prior = db.execute(
                 "SELECT s.*,p.as_of FROM score_snapshot s "
                 "JOIN candidate c ON c.candidate_id=s.candidate_id "
-                "JOIN pipeline_run p ON p.run_id=c.run_id "
+                "JOIN committee_run previous_run "
+                "ON previous_run.committee_run_id=s.committee_run_id "
+                "JOIN pipeline_run p ON p.run_id=previous_run.pipeline_run_id "
                 "WHERE c.security_id=? AND p.as_of<=? "
                 "ORDER BY p.as_of DESC,s.snapshot_id DESC LIMIT 1",
                 (run["security_id"], run["as_of"]),

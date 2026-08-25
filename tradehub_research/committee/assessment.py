@@ -87,9 +87,7 @@ def normalize_usage(value: Any) -> dict[str, Any]:
     normalized: dict[str, Any] = {"source": source}
     for name in ("input_tokens", "output_tokens", "cached_tokens"):
         item = value[name]
-        if item is not None and (
-            isinstance(item, bool) or not isinstance(item, int) or item < 0
-        ):
+        if item is not None and (isinstance(item, bool) or not isinstance(item, int) or item < 0):
             raise AssessmentValidationError(f"usage.{name} must be a nonnegative integer or null")
         if source == "UNKNOWN" and item is not None:
             raise AssessmentValidationError("UNKNOWN usage cannot contain token counts")
@@ -120,9 +118,7 @@ def normalize_cost(value: Any) -> dict[str, Any]:
             raise AssessmentValidationError("cost.amount must be finite and nonnegative")
         normalized_amount = format(decimal.normalize(), "f")
     currency = value["currency"]
-    if currency is not None and (
-        not isinstance(currency, str) or not 1 <= len(currency) <= 12
-    ):
+    if currency is not None and (not isinstance(currency, str) or not 1 <= len(currency) <= 12):
         raise AssessmentValidationError("cost.currency must be a bounded string or null")
     if source == "UNKNOWN" and (normalized_amount is not None or currency is not None):
         raise AssessmentValidationError("UNKNOWN cost cannot contain amount or currency")
