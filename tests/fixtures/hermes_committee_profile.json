@@ -1,0 +1,9 @@
+{
+  "servers": [
+    {
+      "name": "tradehub-research",
+      "command": "/home/jon/tiger-tradehub/.venv/bin/tradehub-research-mcp",
+      "tools": ["get_evidence_pack", "submit_assessment", "committee_status"]
+    }
+  ]
+}

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- long SQL projections mirror immutable row layouts.
 import hashlib
+import re
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from tradehub_research.committee.assessment import normalize_cost, normalize_usage
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.screen_store import DeterminismError
 from tradehub_research.screens import canonical_json
@@ -50,6 +52,41 @@ CLAIM_TAXONOMY = (
 
 def _logical_id(domain: str, value: object) -> str:
     return hashlib.sha256((domain + "\0" + canonical_json(value)).encode()).hexdigest()
+
+
+def semantic_assessment_payload(role: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project validated model content onto its telemetry-free logical identity."""
+    return {
+        "role": role,
+        "pack_hash": payload["pack_hash"],
+        "prompt_version": payload["prompt_version"],
+        "assessment_schema_version": payload["assessment_schema_version"],
+        "taxonomy_version": payload["taxonomy_version"],
+        "claims": payload["claims"],
+        "cited_evidence_ids": payload["cited_evidence_ids"],
+        "missing_evidence": payload["missing_evidence"],
+        "thesis": payload["thesis"],
+        "confidence": payload["confidence"],
+        "uncertainty": payload["uncertainty"],
+    }
+
+
+def semantic_assessment_hash(role: str, payload: Mapping[str, Any]) -> str:
+    return _logical_id("semantic-assessment-v1", semantic_assessment_payload(role, payload))
+
+
+def _sanitized_diagnostic(value: Any) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        raise ValueError("diagnostic_excerpt must be a string or null")
+    cleaned = re.sub(r"(?i)bearer\s+[a-z0-9._~+/=-]+", "Bearer [REDACTED]", value)
+    cleaned = re.sub(
+        r"(?i)(token|secret|authorization|private[_ -]?key)\s*[:=]\s*\S+",
+        r"\1=[REDACTED]",
+        cleaned,
+    )[:256]
+    return hashlib.sha256(cleaned.encode()).hexdigest(), cleaned
 
 
 @dataclass(frozen=True)
@@ -249,6 +286,7 @@ class CommitteeStore:
         to_state: str,
         cause_code: str,
         artifact_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> str:
         logical = {
             "committee_run_id": run_id,
@@ -258,25 +296,33 @@ class CommitteeStore:
             "artifact_id": artifact_id,
         }
         transition_id = _logical_id("committee-transition-v1", logical)
-        with self.database.connect() as db:
-            row = db.execute(
-                "SELECT committee_run_id,from_state,to_state,cause_code,artifact_id FROM committee_transition WHERE transition_id=?",
-                (transition_id,),
-            ).fetchone()
-            expected = (run_id, from_state, to_state, cause_code, artifact_id)
-            if row is not None:
-                if tuple(row) != expected:
-                    raise DeterminismError("transition identity collision")
-                return transition_id
-            current = self._current_state(db, run_id)
-            if current != from_state:
-                raise ValueError(
-                    f"transition expected {from_state!r}, current state is {current!r}"
+        if connection is None:
+            with self.database.connect() as db:
+                return self.record_transition(
+                    run_id,
+                    from_state,
+                    to_state,
+                    cause_code,
+                    artifact_id,
+                    connection=db,
                 )
-            db.execute(
-                "INSERT INTO committee_transition(transition_id,committee_run_id,from_state,to_state,cause_code,artifact_id,occurred_at) VALUES (?,?,?,?,?,?,?)",
-                (transition_id, *expected, utc_now()),
-            )
+        db = connection
+        row = db.execute(
+            "SELECT committee_run_id,from_state,to_state,cause_code,artifact_id FROM committee_transition WHERE transition_id=?",
+            (transition_id,),
+        ).fetchone()
+        expected = (run_id, from_state, to_state, cause_code, artifact_id)
+        if row is not None:
+            if tuple(row) != expected:
+                raise DeterminismError("transition identity collision")
+            return transition_id
+        current = self._current_state(db, run_id)
+        if current != from_state:
+            raise ValueError(f"transition expected {from_state!r}, current state is {current!r}")
+        db.execute(
+            "INSERT INTO committee_transition(transition_id,committee_run_id,from_state,to_state,cause_code,artifact_id,occurred_at) VALUES (?,?,?,?,?,?,?)",
+            (transition_id, *expected, utc_now()),
+        )
         return transition_id
 
     def current_state(self, run_id: str) -> str | None:
@@ -303,10 +349,14 @@ class CommitteeStore:
         role: str,
         payload: Mapping[str, Any],
         validate: Callable[[Mapping[str, Any]], Any],
+        connection: sqlite3.Connection | None = None,
     ) -> str:
         validate(payload)  # validation precedes and shares the all-or-nothing write boundary
-        logical = {"committee_run_id": committee_run_id, "role": role, "payload": dict(payload)}
-        assessment_id = _logical_id("model-assessment-v1", logical)
+        semantic_hash = semantic_assessment_hash(role, payload)
+        assessment_id = _logical_id(
+            "model-assessment-v2",
+            {"committee_run_id": committee_run_id, "semantic_assessment_hash": semantic_hash},
+        )
         payload_json = canonical_json(dict(payload))
         payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
         fields = (
@@ -357,32 +407,127 @@ class CommitteeStore:
             payload["evaluation_time"],
             payload["submitted_at"],
             payload_hash,
+            semantic_hash,
+        )
+        if connection is None:
+            with self.database.connect() as db:
+                return self.insert_assessment(
+                    committee_run_id=committee_run_id,
+                    role=role,
+                    payload=payload,
+                    validate=lambda _: None,
+                    connection=db,
+                )
+        db = connection
+        run = db.execute(
+            "SELECT candidate_id,pack_hash FROM committee_run WHERE committee_run_id=?",
+            (committee_run_id,),
+        ).fetchone()
+        if run is None or tuple(run) != (payload["candidate_id"], payload["pack_hash"]):
+            raise ValueError("assessment does not belong to committee run")
+        existing = db.execute(
+            "SELECT assessment_id,semantic_assessment_hash FROM model_assessment "
+            "WHERE committee_run_id=? AND role=?",
+            (committee_run_id, role),
+        ).fetchone()
+        if existing is not None:
+            if existing["semantic_assessment_hash"] != semantic_hash:
+                raise DeterminismError("role already has a different semantic assessment")
+            return str(existing["assessment_id"])
+        db.execute(
+            "INSERT INTO model_assessment VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            values,
+        )
+        return assessment_id
+
+    def insert_work(
+        self,
+        *,
+        committee_run_id: str,
+        role: str,
+        attempt_number: int,
+        pack_hash: str,
+        prompt_version: str,
+        assessment_schema_version: int,
+        taxonomy_version: int,
+        focus_hash: str | None,
+        focus: object | None,
+    ) -> str:
+        logical = {
+            "committee_run_id": committee_run_id,
+            "role": role,
+            "attempt_number": attempt_number,
+            "pack_hash": pack_hash,
+            "prompt_version": prompt_version,
+            "assessment_schema_version": assessment_schema_version,
+            "taxonomy_version": taxonomy_version,
+            "focus_hash": focus_hash,
+            "focus": focus,
+        }
+        work_id = _logical_id("committee-work-v1", logical)
+        expected = (
+            work_id,
+            committee_run_id,
+            role,
+            attempt_number,
+            pack_hash,
+            prompt_version,
+            assessment_schema_version,
+            taxonomy_version,
+            focus_hash,
+            None if focus is None else canonical_json(focus),
         )
         with self.database.connect() as db:
             run = db.execute(
-                "SELECT candidate_id,pack_hash FROM committee_run WHERE committee_run_id=?",
+                "SELECT pack_hash FROM committee_run WHERE committee_run_id=?",
                 (committee_run_id,),
             ).fetchone()
-            if run is None or tuple(run) != (payload["candidate_id"], payload["pack_hash"]):
-                raise ValueError("assessment does not belong to committee run")
+            if run is None or run[0] != pack_hash:
+                raise ValueError("work does not belong to committee run")
             existing = db.execute(
-                "SELECT assessment_id FROM model_assessment WHERE committee_run_id=? AND role=?",
-                (committee_run_id, role),
+                "SELECT work_id,committee_run_id,role,attempt_number,pack_hash,prompt_version,"
+                "assessment_schema_version,taxonomy_version,focus_hash,focus_json "
+                "FROM committee_work WHERE committee_run_id=? AND role=? AND attempt_number=?",
+                (committee_run_id, role, attempt_number),
             ).fetchone()
             if existing is not None:
-                if existing[0] != assessment_id:
-                    raise DeterminismError("role already has a different assessment")
-                return assessment_id
+                if tuple(existing) != expected:
+                    raise DeterminismError("work slot already contains different bytes")
+                return work_id
             db.execute(
-                "INSERT INTO model_assessment VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                values,
+                "INSERT INTO committee_work VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (*expected, utc_now()),
             )
-        return assessment_id
+        return work_id
 
     def insert_call_attempt(
-        self, *, committee_run_id: str, role: str, attempt_number: int, **payload: Any
+        self,
+        *,
+        work_id: str,
+        committee_run_id: str,
+        role: str,
+        attempt_number: int,
+        connection: sqlite3.Connection | None = None,
+        **payload: Any,
     ) -> str:
+        outcome = str(payload.get("outcome", "")).lower()
+        if outcome not in {"accepted", "malformed", "unavailable", "timeout"}:
+            raise ValueError("invalid attempt outcome")
+        usage = normalize_usage(payload.get("usage"))
+        cost = normalize_cost(payload.get("cost"))
+        diagnostic_hash, diagnostic_excerpt = _sanitized_diagnostic(
+            payload.get("diagnostic_excerpt")
+        )
+        payload = {
+            **payload,
+            "outcome": outcome,
+            "usage": usage,
+            "cost": cost,
+            "diagnostic_hash": diagnostic_hash,
+            "diagnostic_excerpt": diagnostic_excerpt,
+        }
         logical = {
+            "work_id": work_id,
             "committee_run_id": committee_run_id,
             "role": role,
             "attempt_number": attempt_number,
@@ -410,6 +555,7 @@ class CommitteeStore:
             raise ValueError(f"missing attempt fields: {', '.join(missing)}")
         values = (
             attempt_id,
+            work_id,
             committee_run_id,
             role,
             attempt_number,
@@ -428,19 +574,35 @@ class CommitteeStore:
             payload["requested_at"],
             payload["completed_at"],
         )
-        with self.database.connect() as db:
-            row = db.execute(
-                "SELECT attempt_id FROM model_call_attempt WHERE committee_run_id=? AND role=? AND attempt_number=?",
-                (committee_run_id, role, attempt_number),
-            ).fetchone()
-            if row is not None:
-                if row[0] != attempt_id:
-                    raise DeterminismError("attempt slot already contains different bytes")
-                return attempt_id
-            db.execute(
-                "INSERT INTO model_call_attempt VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                values,
-            )
+        if connection is None:
+            with self.database.connect() as db:
+                return self.insert_call_attempt(
+                    work_id=work_id,
+                    committee_run_id=committee_run_id,
+                    role=role,
+                    attempt_number=attempt_number,
+                    connection=db,
+                    **payload,
+                )
+        db = connection
+        work = db.execute(
+            "SELECT committee_run_id,role,attempt_number FROM committee_work WHERE work_id=?",
+            (work_id,),
+        ).fetchone()
+        if work is None or tuple(work) != (committee_run_id, role, attempt_number):
+            raise ValueError("attempt does not match issued work")
+        row = db.execute(
+            "SELECT attempt_id FROM model_call_attempt WHERE committee_run_id=? AND role=? AND attempt_number=?",
+            (committee_run_id, role, attempt_number),
+        ).fetchone()
+        if row is not None:
+            if row[0] != attempt_id:
+                raise DeterminismError("attempt slot already contains different bytes")
+            return attempt_id
+        db.execute(
+            "INSERT INTO model_call_attempt VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            values,
+        )
         return attempt_id
 
 

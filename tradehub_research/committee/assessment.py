@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from tradehub_research.db import ResearchDB
@@ -32,7 +33,6 @@ TOP_LEVEL = {
     "usage",
     "cost",
     "evaluation_time",
-    "submitted_at",
 }
 CLAIM_KEYS = {
     "claim_key",
@@ -48,6 +48,11 @@ CLAIM_KEYS = {
 THESIS_KEYS = {"summary", "upside_mechanism", "downside_mechanism", "thesis_break_conditions"}
 VERDICT_KEYS = {"item_id", "verdict", "statement", "cited_evidence_ids"}
 VERDICTS = {"resolved_for_a", "resolved_for_b", "both_wrong", "unresolved"}
+MISSING_EVIDENCE_KEYS = {"claim_key", "description", "materiality"}
+USAGE_KEYS = {"input_tokens", "output_tokens", "cached_tokens", "source"}
+COST_KEYS = {"amount", "currency", "source"}
+TELEMETRY_SOURCES = {"SELF_REPORTED", "UNKNOWN"}
+MAX_ASSESSMENT_BYTES = 64_000
 
 
 class AssessmentValidationError(ValueError):
@@ -73,16 +78,55 @@ def _string(value: Any, name: str, *, optional: bool = False) -> str | None:
     return value
 
 
-def _string_tree(value: Any, name: str) -> None:
-    if isinstance(value, str):
-        if len(value) > 512:
-            raise AssessmentValidationError(f"{name} string exceeds 512 code points")
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            _string_tree(item, f"{name}[{index}]")
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            _string_tree(item, f"{name}.{key}")
+def normalize_usage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != USAGE_KEYS:
+        raise AssessmentValidationError("usage must contain the exact typed usage fields")
+    source = value["source"]
+    if source not in TELEMETRY_SOURCES:
+        raise AssessmentValidationError("invalid usage source")
+    normalized: dict[str, Any] = {"source": source}
+    for name in ("input_tokens", "output_tokens", "cached_tokens"):
+        item = value[name]
+        if item is not None and (
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+        ):
+            raise AssessmentValidationError(f"usage.{name} must be a nonnegative integer or null")
+        if source == "UNKNOWN" and item is not None:
+            raise AssessmentValidationError("UNKNOWN usage cannot contain token counts")
+        normalized[name] = item
+    return normalized
+
+
+def normalize_cost(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != COST_KEYS:
+        raise AssessmentValidationError("cost must contain the exact typed cost fields")
+    source = value["source"]
+    if source not in TELEMETRY_SOURCES:
+        raise AssessmentValidationError("invalid cost source")
+    amount = value["amount"]
+    normalized_amount: str | None
+    if amount is None:
+        normalized_amount = None
+    elif isinstance(amount, bool) or not isinstance(amount, (str, int, float, Decimal)):
+        raise AssessmentValidationError("cost.amount must be a finite nonnegative decimal or null")
+    else:
+        try:
+            decimal = Decimal(str(amount))
+        except InvalidOperation as exc:
+            raise AssessmentValidationError(
+                "cost.amount must be a finite nonnegative decimal or null"
+            ) from exc
+        if not decimal.is_finite() or decimal < 0:
+            raise AssessmentValidationError("cost.amount must be finite and nonnegative")
+        normalized_amount = format(decimal.normalize(), "f")
+    currency = value["currency"]
+    if currency is not None and (
+        not isinstance(currency, str) or not 1 <= len(currency) <= 12
+    ):
+        raise AssessmentValidationError("cost.currency must be a bounded string or null")
+    if source == "UNKNOWN" and (normalized_amount is not None or currency is not None):
+        raise AssessmentValidationError("UNKNOWN cost cannot contain amount or currency")
+    return {"amount": normalized_amount, "currency": currency, "source": source}
 
 
 def _id_list(value: Any, name: str, in_pack: set[str]) -> list[str]:
@@ -142,7 +186,6 @@ def validate_assessment(
         "model_route",
         "billing_class",
         "evaluation_time",
-        "submitted_at",
     ):
         _string(payload[name], name)
     if payload["billing_class"] not in {"subscription", "local", "paid"}:
@@ -175,7 +218,7 @@ def validate_assessment(
             _string(verdict["statement"], "verdict statement")
             cited = _id_list(verdict["cited_evidence_ids"], "verdict evidence", in_pack)
             all_citations.update(cited)
-            normalized_claims.append(dict(verdict))
+            normalized_claims.append({**dict(verdict), "cited_evidence_ids": sorted(cited)})
         claims = []
     for index, claim in enumerate(claims):
         if not isinstance(claim, Mapping) or set(claim) != CLAIM_KEYS:
@@ -201,6 +244,8 @@ def validate_assessment(
         contradictory = _id_list(
             claim["contradictory_evidence_ids"], "contradictory_evidence_ids", in_pack
         )
+        if set(cited) & set(contradictory):
+            raise AssessmentValidationError("cited and contradictory evidence must be disjoint")
         if claim["materiality"] >= comparator_spec["material_threshold"]:
             material += 1
             if not cited:
@@ -212,7 +257,13 @@ def validate_assessment(
             raise AssessmentValidationError("projection requires falsification condition")
         all_citations.update(cited)
         all_citations.update(contradictory)
-        normalized_claims.append(dict(claim))
+        normalized_claims.append(
+            {
+                **dict(claim),
+                "cited_evidence_ids": sorted(cited),
+                "contradictory_evidence_ids": sorted(contradictory),
+            }
+        )
     if material > bounds["material_claims"]:
         raise AssessmentValidationError("material claims bound exceeded")
     cited_top = _id_list(payload["cited_evidence_ids"], "assessment cited_evidence_ids", in_pack)
@@ -221,7 +272,22 @@ def validate_assessment(
     missing_evidence = payload["missing_evidence"]
     if not isinstance(missing_evidence, list) or len(missing_evidence) > bounds["missing_evidence"]:
         raise AssessmentValidationError("missing evidence bound exceeded")
-    _string_tree(missing_evidence, "missing_evidence")
+    normalized_missing = []
+    for index, item in enumerate(missing_evidence):
+        if not isinstance(item, Mapping) or set(item) != MISSING_EVIDENCE_KEYS:
+            raise AssessmentValidationError(
+                f"missing_evidence {index} has partial or unknown fields"
+            )
+        if item["claim_key"] not in taxonomy:
+            raise AssessmentValidationError("missing evidence claim key is invalid")
+        _string(item["description"], "missing evidence description")
+        if (
+            isinstance(item["materiality"], bool)
+            or not isinstance(item["materiality"], int)
+            or not 1 <= item["materiality"] <= 5
+        ):
+            raise AssessmentValidationError("missing evidence materiality must be 1 to 5")
+        normalized_missing.append(dict(item))
     thesis = payload["thesis"]
     if not isinstance(thesis, Mapping) or set(thesis) != THESIS_KEYS:
         raise AssessmentValidationError("thesis has partial or unknown fields")
@@ -232,18 +298,37 @@ def validate_assessment(
         raise AssessmentValidationError("thesis break condition bound exceeded")
     for item in breaks:
         _string(item, "thesis break condition")
-    if not isinstance(payload["usage"], Mapping) or not isinstance(payload["cost"], Mapping):
-        raise AssessmentValidationError("usage and cost must be objects")
-    _string_tree(payload["usage"], "usage")
-    _string_tree(payload["cost"], "cost")
+    usage = normalize_usage(payload["usage"])
+    cost = normalize_cost(payload["cost"])
+    normalized_claims.sort(
+        key=lambda item: (
+            item.get("item_id", ""),
+            item.get("claim_key", ""),
+            item.get("claim_type", ""),
+            item.get("direction", ""),
+        )
+    )
+    normalized_missing.sort(
+        key=lambda item: (item["claim_key"], item["materiality"], item["description"])
+    )
     normalized = dict(payload)
     normalized.update(
         claims=normalized_claims,
-        cited_evidence_ids=cited_top,
+        cited_evidence_ids=sorted(cited_top),
+        missing_evidence=normalized_missing,
         confidence=confidence,
         uncertainty=uncertainty,
-        thesis=dict(thesis),
+        thesis={**dict(thesis), "thesis_break_conditions": sorted(breaks)},
+        usage=usage,
+        cost=cost,
     )
+    from tradehub_research.db import utc_now
+
+    normalized["submitted_at"] = utc_now()
+    from tradehub_research.screens import canonical_json
+
+    if len(canonical_json(normalized).encode()) > MAX_ASSESSMENT_BYTES:
+        raise AssessmentValidationError("assessment artifact exceeds byte bound")
     return normalized
 
 

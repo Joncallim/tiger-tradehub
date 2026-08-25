@@ -94,6 +94,25 @@ def test_comparator_r1_r2_r3_r4_and_null_agreement():
     assert "R4" in r4["triggers"]
 
 
+def test_comparator_claim_permutations_are_byte_identical():
+    claims_a = [
+        claim("valuation_vs_history", direction="bullish", cited=["e1"]),
+        claim("valuation_vs_history", direction="bearish", cited=["e2"]),
+        claim("earnings_quality", direction="bullish", cited=["e3"]),
+    ]
+    claims_b = [
+        claim("valuation_vs_history", direction="bearish", cited=["e1"]),
+        claim("valuation_vs_history", direction="bullish", cited=["e2"]),
+        claim("earnings_quality", direction="bearish", cited=["e4"]),
+    ]
+    expected = compare_assessments({"claims": claims_a}, {"claims": claims_b}, SPEC)
+    assert compare_assessments(
+        {"claims": list(reversed(claims_a))},
+        {"claims": [claims_b[1], claims_b[2], claims_b[0]]},
+        SPEC,
+    ) == expected
+
+
 def payload():
     return {
         "candidate_id": "candidate",
@@ -117,10 +136,14 @@ def payload():
         },
         "confidence": 0.5,
         "uncertainty": 0.5,
-        "usage": {},
-        "cost": {},
+        "usage": {
+            "input_tokens": None,
+            "output_tokens": None,
+            "cached_tokens": None,
+            "source": "UNKNOWN",
+        },
+        "cost": {"amount": None, "currency": None, "source": "UNKNOWN"},
         "evaluation_time": "2025-01-01Z",
-        "submitted_at": "2025-01-02Z",
     }
 
 
@@ -151,6 +174,26 @@ PACK = {"run": {"as_of": "2025-01-01Z"}, "evidence": [{"evidence_id": "e1"}]}
     ],
 )
 def test_assessment_strict_rejections(mutation):
+    value = payload()
+    mutation(value)
+    with pytest.raises(AssessmentValidationError):
+        validate_assessment(
+            value, run=RUN, pack_body=PACK, comparator_spec=SPEC, expected_role="neutral_analyst_a"
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda p: p.update(usage={"raw_prompt": "Bearer secret"}),
+        lambda p: p.update(
+            cost={"amount": None, "currency": None, "source": "UNKNOWN", "token": "secret"}
+        ),
+        lambda p: p.update(missing_evidence=[{"unknown_field": {"nested": True}}]),
+        lambda p: p["claims"][0].update(contradictory_evidence_ids=["e1"]),
+    ],
+)
+def test_assessment_rejects_untyped_or_overlapping_artifacts(mutation):
     value = payload()
     mutation(value)
     with pytest.raises(AssessmentValidationError):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from tradehub_research.committee.scoring import classify_trajectory, score_screens
 from tradehub_research.committee.store import ScoringSpec
 
@@ -58,6 +60,13 @@ def test_shared_xbrl_three_families_is_one_group_and_no_bonus():
     assert result["underlying_groups"] == ["xbrl:sec:accession"]
     assert result["confluence_bonus"] == 0
     assert result["raw_score"] == 50  # 54 base - 4 missing event/activity
+
+
+def test_duplicate_scored_family_is_rejected():
+    with pytest.raises(ValueError, match="duplicate scored screen family"):
+        score_screens(
+            [_screen("valuation"), _screen("valuation")], [], ScoringSpec().as_dict()
+        )
 
 
 def test_trajectory_four_causes_and_direction_labels():
@@ -121,4 +130,20 @@ def test_trajectory_four_causes_and_direction_labels():
         "change_cause": "EVIDENCE_DRIVEN",
         "trajectory_label": "RISING",
         "delta": 5,
+    }
+
+
+def test_screen_only_change_is_an_explicit_rebase():
+    prior = {"scoring_config_hash": "v1", "scored_evidence_hash": "same", "conviction": 50}
+    current = {"scoring_config_hash": "v1", "scored_evidence_hash": "same", "conviction": 55}
+    assert classify_trajectory(
+        prior,
+        current,
+        screen_hashes_equal=False,
+        committee_hashes_differ=False,
+        correction_chain=False,
+    ) == {
+        "change_cause": "SCREEN_METHODOLOGY_CHANGE",
+        "trajectory_label": "REBASED",
+        "delta": None,
     }

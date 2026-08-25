@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import sqlite3
+import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -15,6 +17,7 @@ from mcp.client.stdio import stdio_client
 from tradehub_research.acceptance.packs.ra02 import ASSERTIONS, PACK, RUN, SPEC, _payload
 from tradehub_research.acceptance.runner import PACK_REGISTRY, run_pack
 from tradehub_research.committee.assessment import AssessmentValidationError, validate_assessment
+from tradehub_research.committee.capability import verify_committee_profile
 from tradehub_research.db import ResearchDB
 
 EXPECTED_SCHEMAS = {
@@ -27,13 +30,13 @@ EXPECTED_SCHEMAS = {
     "submit_assessment": {
         "properties": {
             "committee_run_id": {"title": "Committee Run Id", "type": "string"},
-            "assessment_json": {
+            "attempt_envelope": {
                 "additionalProperties": True,
-                "title": "Assessment Json",
+                "title": "Attempt Envelope",
                 "type": "object",
             },
         },
-        "required": ["committee_run_id", "assessment_json"],
+        "required": ["committee_run_id", "attempt_envelope"],
         "title": "submit_assessmentArguments",
         "type": "object",
     },
@@ -134,6 +137,30 @@ def test_injection_is_data_and_fabricated_citation_rejected():
             comparator_spec=SPEC,
             expected_role="neutral_analyst_a",
         )
+
+
+def test_aggregate_committee_profile_fixture_fails_closed():
+    fixture = Path(__file__).parent / "fixtures" / "hermes_committee_profile.json"
+    profile = json.loads(fixture.read_text())
+    verify_committee_profile(profile)
+    execution = deepcopy(profile)
+    execution["servers"].append(
+        {"name": "tradehub", "command": "tradehub-mcp", "tools": ["submit_order"]}
+    )
+    with pytest.raises(ValueError):
+        verify_committee_profile(execution)
+    forbidden = deepcopy(profile)
+    forbidden["servers"][0]["tools"].append("submit_order")
+    with pytest.raises(ValueError):
+        verify_committee_profile(forbidden)
+    script = Path(__file__).resolve().parents[1] / "tools" / "verify_committee_mcp_profile.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--profile", str(fixture)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0 and "PASS" in result.stdout
 
 
 def test_ra02_registry_prefix_and_assertion_coverage():
