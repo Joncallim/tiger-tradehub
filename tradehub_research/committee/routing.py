@@ -26,6 +26,7 @@ MAX_ATTEMPTS_PER_ROLE = 2
 MAX_ACCEPTED_ROLES = 4
 MAX_MODEL_CALLS = 8
 CALL_TIMEOUT_SECONDS = 120
+MAX_ATTEMPT_ENVELOPE_BYTES = 80_000
 FOCUS_BUCKETS = ("EVIDENCE_CONFLICT", "CONTRADICTORY", "UNSUPPORTED", "OMITTED")
 ATTEMPT_OUTCOMES = {"accepted", "malformed", "unavailable", "timeout"}
 ATTEMPT_REQUIRED_KEYS = {
@@ -98,9 +99,49 @@ class CommitteeRouter:
         if self.store.current_state(run_id) is None:
             self.store.record_transition(run_id, None, "PENDING_NEUTRALS", "CREATED")
 
-    def _recover_ready_to_score(self, run_id: str) -> None:
+    def _recover(self, run_id: str) -> None:
+        self._recover_pending_neutrals(run_id)
         if self.store.current_state(run_id) == "READY_TO_SCORE":
             self._score(run_id)
+
+    def _recover_pending_neutrals(self, run_id: str) -> None:
+        if self.store.current_state(run_id) != "PENDING_NEUTRALS":
+            return
+        with self.database.connect(read_only=True) as db:
+            roles = {
+                row[0]
+                for row in db.execute(
+                    "SELECT role FROM model_assessment WHERE committee_run_id=? "
+                    "AND role IN ('neutral_analyst_a','neutral_analyst_b')",
+                    (run_id,),
+                )
+            }
+            comparison = db.execute(
+                "SELECT comparison_id,routing_decision FROM comparison_report "
+                "WHERE committee_run_id=? ORDER BY rowid DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if roles != {"neutral_analyst_a", "neutral_analyst_b"}:
+            return
+        if comparison is None:
+            result = Comparator(self.database).compare_and_persist(run_id)
+            comparison_id = result["comparison_id"]
+            target = result["routing_decision"]
+        else:
+            comparison_id = comparison["comparison_id"]
+            target = comparison["routing_decision"]
+        if self.store.current_state(run_id) == "PENDING_NEUTRALS":
+            try:
+                self.store.record_transition(
+                    run_id,
+                    "PENDING_NEUTRALS",
+                    target,
+                    "NEUTRALS_COMPARED",
+                    comparison_id,
+                )
+            except ValueError:
+                if self.store.current_state(run_id) != target:
+                    raise
 
     def _base_status(self, run_id: str) -> dict[str, Any]:
         with self.database.connect(read_only=True) as db:
@@ -122,12 +163,18 @@ class CommitteeRouter:
             issued = db.execute(
                 "SELECT count(*) FROM committee_work WHERE committee_run_id=?", (run_id,)
             ).fetchone()[0]
-        state = self.store.current_state(run_id)
+            transition = db.execute(
+                "SELECT to_state,artifact_id FROM committee_transition WHERE committee_run_id=? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        state = transition["to_state"] if transition else None
         return {
             "committee_run_id": run_id,
             "candidate_id": run["candidate_id"],
             "pack_hash": run["pack_hash"],
             "state": state,
+            "artifact_id": transition["artifact_id"] if transition else None,
             "accepted_roles": roles,
             "model_calls": issued,
             "completed_attempts": attempts,
@@ -135,7 +182,7 @@ class CommitteeRouter:
         }
 
     def status(self, run_id: str) -> dict[str, Any]:
-        self._recover_ready_to_score(run_id)
+        self._recover(run_id)
         result = self._base_status(run_id)
         result["work"] = [
             envelope
@@ -161,7 +208,7 @@ class CommitteeRouter:
         return []
 
     def get_work(self, run_id: str) -> dict[str, Any] | None:
-        self._recover_ready_to_score(run_id)
+        self._recover(run_id)
         status = self._base_status(run_id)
         for role in status["required_work"]:
             work = self._get_or_issue_work(run_id, role)
@@ -276,45 +323,52 @@ class CommitteeRouter:
 
         state = status["state"]
         target = None
-        with self.database.connect() as db:
-            attempt_id = self._record_attempt(run_id, work, envelope, connection=db)
-            assessment_id = self.store.insert_assessment(
-                committee_run_id=run_id,
-                role=role,
-                payload=normalized,
-                validate=lambda _: None,
-                connection=db,
-            )
-            if role in {"red_team", "arbiter"}:
-                resolution_id = self._persist_resolution(
-                    db, run_id, role, assessment_id, normalized["claims"], work
-                )
-                unresolved = any(item["verdict"] == "unresolved" for item in normalized["claims"])
-                if role == "red_team" and unresolved:
-                    material_ids = {
-                        item["item_id"]
-                        for item in json.loads(work["focus_json"])["items"]
-                        if item["material"]
-                    }
-                    unresolved = any(
-                        item["verdict"] == "unresolved" and item["item_id"] in material_ids
-                        for item in normalized["claims"]
-                    )
-                target = (
-                    "ARBITER_REQUIRED"
-                    if role == "red_team" and unresolved
-                    else "ESCALATE"
-                    if role == "arbiter" and unresolved
-                    else "READY_TO_SCORE"
-                )
-                self.store.record_transition(
-                    run_id,
-                    state,
-                    target,
-                    "RED_TEAM_REVIEWED" if role == "red_team" else "ARBITER_REVIEWED",
-                    resolution_id,
+        try:
+            with self.database.connect() as db:
+                attempt_id = self._record_attempt(run_id, work, envelope, connection=db)
+                assessment_id = self.store.insert_assessment(
+                    committee_run_id=run_id,
+                    role=role,
+                    payload=normalized,
+                    validate=lambda _: None,
                     connection=db,
                 )
+                if role in {"red_team", "arbiter"}:
+                    resolution_id = self._persist_resolution(
+                        db, run_id, role, assessment_id, normalized["claims"], work
+                    )
+                    unresolved = any(
+                        item["verdict"] == "unresolved" for item in normalized["claims"]
+                    )
+                    if role == "red_team" and unresolved:
+                        material_ids = {
+                            item["item_id"]
+                            for item in json.loads(work["focus_json"])["items"]
+                            if item["material"]
+                        }
+                        unresolved = any(
+                            item["verdict"] == "unresolved" and item["item_id"] in material_ids
+                            for item in normalized["claims"]
+                        )
+                    target = (
+                        "ARBITER_REQUIRED"
+                        if role == "red_team" and unresolved
+                        else "ESCALATE"
+                        if role == "arbiter" and unresolved
+                        else "READY_TO_SCORE"
+                    )
+                    self.store.record_transition(
+                        run_id,
+                        state,
+                        target,
+                        "RED_TEAM_REVIEWED" if role == "red_team" else "ARBITER_REVIEWED",
+                        resolution_id,
+                        connection=db,
+                    )
+        except sqlite3.IntegrityError as exc:
+            if "neutral providers must differ" not in str(exc):
+                raise
+            return self._record_malformed_and_raise(run_id, work, envelope, str(exc), exc)
         if state == "PENDING_NEUTRALS":
             roles = self._base_status(run_id)["accepted_roles"]
             if all(item in roles for item in ("neutral_analyst_a", "neutral_analyst_b")):
@@ -327,9 +381,11 @@ class CommitteeRouter:
                     comparison["comparison_id"],
                 )
                 target = comparison["routing_decision"]
-        if target == "READY_TO_SCORE":
-            self._score(run_id)
-        return {"attempt_id": attempt_id, "assessment_id": assessment_id, **self.status(run_id)}
+        snapshot = self._score(run_id) if target == "READY_TO_SCORE" else None
+        result = {"attempt_id": attempt_id, "assessment_id": assessment_id, **self.status(run_id)}
+        if snapshot is not None:
+            result["snapshot_id"] = snapshot["snapshot_id"]
+        return result
 
     def _submit_raw_compatibility(self, run_id: str, assessment: dict[str, Any]) -> dict[str, Any]:
         role = assessment.get("role")
@@ -339,14 +395,15 @@ class CommitteeRouter:
         assessment_input.pop("submitted_at", None)
         with self.database.connect(read_only=True) as db:
             existing = db.execute(
-                "SELECT semantic_assessment_hash FROM model_assessment WHERE committee_run_id=? AND role=?",
+                "SELECT assessment_id,semantic_assessment_hash FROM model_assessment "
+                "WHERE committee_run_id=? AND role=?",
                 (run_id, role),
             ).fetchone()
         if existing is not None:
             normalized = validate_for_run(self.database, run_id, role, assessment_input)
-            if existing[0] != semantic_assessment_hash(role, normalized):
+            if existing["semantic_assessment_hash"] != semantic_assessment_hash(role, normalized):
                 raise DeterminismError("role already has a different semantic assessment")
-            return self.status(run_id)
+            return {"assessment_id": existing["assessment_id"], **self.status(run_id)}
         work = self._get_or_issue_work(run_id, role)
         if work is None:
             raise ValueError("role is not currently authorized")
@@ -389,6 +446,12 @@ class CommitteeRouter:
         diagnostic = value.get("diagnostic_excerpt")
         if diagnostic is not None and not isinstance(diagnostic, str):
             raise ValueError("diagnostic_excerpt must be a string or null")
+        try:
+            envelope_bytes = len(canonical_json(normalized).encode())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("attempt envelope must be canonical JSON data") from exc
+        if envelope_bytes > MAX_ATTEMPT_ENVELOPE_BYTES:
+            raise ValueError("attempt envelope exceeds byte bound")
         return normalized
 
     def _load_work(self, run_id: str, work_id: str) -> dict[str, Any]:
@@ -594,10 +657,10 @@ class CommitteeRouter:
         )
         return resolution_id
 
-    def _score(self, run_id: str) -> None:
+    def _score(self, run_id: str) -> dict[str, Any]:
         from tradehub_research.committee.scoring import Scorer
 
-        Scorer(self.database).create_snapshot(run_id)
+        return Scorer(self.database).create_snapshot(run_id)
 
     def record_exhaustion(self, run_id: str, role: str, *, unavailable: bool) -> None:
         state = self.store.current_state(run_id)

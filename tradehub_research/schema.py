@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-PHASE_0_SCHEMA_VERSION = 8
+PHASE_0_SCHEMA_VERSION = 9
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -683,6 +683,25 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         CREATE TRIGGER dispute_resolution_no_delete BEFORE DELETE ON dispute_resolution BEGIN SELECT RAISE(ABORT, 'dispute_resolution is append-only'); END;
         CREATE TRIGGER score_snapshot_no_update BEFORE UPDATE ON score_snapshot BEGIN SELECT RAISE(ABORT, 'score_snapshot is append-only'); END;
         CREATE TRIGGER score_snapshot_no_delete BEFORE DELETE ON score_snapshot BEGIN SELECT RAISE(ABORT, 'score_snapshot is append-only'); END;
+        """,
+    ),
+    (
+        9,
+        "Phase 2 committee provider-independence invariant",
+        """
+        CREATE TRIGGER neutral_provider_independence
+        BEFORE INSERT ON model_assessment
+        WHEN NEW.role IN ('neutral_analyst_a','neutral_analyst_b')
+          AND EXISTS (
+            SELECT 1 FROM model_assessment existing
+            WHERE existing.committee_run_id = NEW.committee_run_id
+              AND existing.role IN ('neutral_analyst_a','neutral_analyst_b')
+              AND existing.role <> NEW.role
+              AND existing.provider = NEW.provider
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'neutral providers must differ');
+        END;
         """,
     ),
 )

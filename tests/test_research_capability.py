@@ -14,7 +14,15 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from tradehub_research.acceptance.packs.ra02 import ASSERTIONS, PACK, RUN, SPEC, _payload
+from tradehub_research.acceptance.packs.ra02 import (
+    ASSERTIONS,
+    PACK,
+    RUN,
+    SPEC,
+    _attempt,
+    _payload,
+    _runtime,
+)
 from tradehub_research.acceptance.runner import PACK_REGISTRY, run_pack
 from tradehub_research.committee.assessment import AssessmentValidationError, validate_assessment
 from tradehub_research.committee.capability import verify_committee_profile
@@ -66,6 +74,22 @@ def _list_tools(db_path: Path) -> list[dict]:
     return anyio.run(run)
 
 
+def _call_tool(db_path: Path, name: str, arguments: dict) -> dict:
+    env = os.environ.copy()
+    env["RESEARCH_DB_PATH"] = str(db_path)
+
+    async def run() -> dict:
+        params = StdioServerParameters(
+            command=sys.executable, args=["-m", "tradehub_research.mcp_server"], env=env
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return (await session.call_tool(name, arguments)).model_dump(by_alias=True)
+
+    return anyio.run(run)
+
+
 def test_exact_research_mcp_capability_discovery(tmp_path):
     database = ResearchDB(tmp_path / "research.db")
     database.migrate()
@@ -91,6 +115,38 @@ def test_exact_research_mcp_capability_discovery(tmp_path):
     for tool in tools:
         exposed = f"{tool['name']} {tool.get('description', '')}".lower()
         assert not any(word in exposed for word in forbidden)
+
+
+def test_mcp_rejects_oversize_attempt_telemetry_without_ledger_write(tmp_path):
+    store, router, run, _ = _runtime(tmp_path, "mcp-attempt-bounds")
+    work = router.get_work(run)
+    giant_amount = _attempt(work, "unavailable")
+    giant_amount["cost"] = {
+        "amount": "9" * 100_000,
+        "currency": "USD",
+        "source": "SELF_REPORTED",
+    }
+    amount_result = _call_tool(
+        store.database.path,
+        "submit_assessment",
+        {"committee_run_id": run, "attempt_envelope": giant_amount},
+    )
+    assert amount_result["isError"] is True
+    giant_tokens = _attempt(work, "timeout")
+    giant_tokens["usage"] = {
+        "input_tokens": 1_000_000_001,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "source": "SELF_REPORTED",
+    }
+    token_result = _call_tool(
+        store.database.path,
+        "submit_assessment",
+        {"committee_run_id": run, "attempt_envelope": giant_tokens},
+    )
+    assert token_result["isError"] is True
+    with store.database.connect(read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM model_call_attempt").fetchone()[0] == 0
 
 
 def test_research_package_has_no_execution_import_or_schema_surface(tmp_path):

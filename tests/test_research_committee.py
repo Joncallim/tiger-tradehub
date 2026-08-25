@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from tradehub_research.committee.api import app, get_database, get_settings
+from tradehub_research.committee.assessment import AssessmentValidationError
+from tradehub_research.committee.comparator import Comparator
 from tradehub_research.committee.pack import EvidencePackBuilder, PackBuildError
 from tradehub_research.committee.routing import CommitteeRouter
 from tradehub_research.committee.scoring import Scorer
@@ -154,9 +158,9 @@ def _fixture(path: Path, *, missing_accession: bool = False) -> tuple[ResearchDB
     return database, "candidate"
 
 
-def test_schema_v8_fresh_and_append_only(tmp_path):
+def test_schema_v9_fresh_and_append_only(tmp_path):
     database = ResearchDB(tmp_path / "fresh.db")
-    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 8
+    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 9
     with database.connect() as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"evidence_pack", "committee_run", "score_snapshot"} <= tables
@@ -173,7 +177,7 @@ def test_schema_v7_upgrade_is_additive(tmp_path):
         for version, description, sql in MIGRATIONS[:7]:
             db.executescript(sql)
             db.execute("INSERT INTO schema_version VALUES (?,?,?)", (version, "now", description))
-    assert database.migrate() == 8
+    assert database.migrate() == 9
 
 
 def test_pack_exact_groups_supersession_and_hash_retry(tmp_path):
@@ -495,6 +499,48 @@ def test_committee_http_auth_create_status_work_and_score_reads(tmp_path):
         app.dependency_overrides.clear()
 
 
+def test_http_rejects_oversize_attempt_telemetry_without_ledger_write(tmp_path):
+    store, run, _ = _committee(tmp_path / "api-attempt-bounds.db")
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+    work = router.get_work(run)
+    settings = ResearchSettings(api_token="research-secret")
+    app.dependency_overrides[get_database] = lambda: store.database
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        client = TestClient(app)
+        headers = {"Authorization": "Bearer research-secret"}
+        giant_amount = _attempt(work, "unavailable")
+        giant_amount["cost"] = {
+            "amount": "9" * 100_000,
+            "currency": "USD",
+            "source": "SELF_REPORTED",
+        }
+        assert (
+            client.post(
+                f"/committee-runs/{run}/assessments", json=giant_amount, headers=headers
+            ).status_code
+            == 422
+        )
+        giant_tokens = _attempt(work, "timeout")
+        giant_tokens["usage"] = {
+            "input_tokens": 1_000_000_001,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "source": "SELF_REPORTED",
+        }
+        assert (
+            client.post(
+                f"/committee-runs/{run}/assessments", json=giant_tokens, headers=headers
+            ).status_code
+            == 422
+        )
+    finally:
+        app.dependency_overrides.clear()
+    with store.database.connect(read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM model_call_attempt").fetchone()[0] == 0
+
+
 def test_atomic_validated_neutral_submission_advances_after_both(tmp_path):
     store, run, pack_hash = _committee(tmp_path / "submit-route.db")
     router = CommitteeRouter(store.database)
@@ -758,6 +804,51 @@ def test_red_team_remainder_is_exact_arbiter_focus_then_scores(tmp_path):
         )
 
 
+def test_resolving_red_team_verdict_requires_in_pack_evidence_atomically(tmp_path):
+    store, router, run, pack_hash = _disputed_committee(tmp_path / "red-no-evidence.db")
+    work = router.get_work(run)
+    verdicts = [_verdict(item["item_id"]) for item in work["focus"]["items"]]
+    verdicts[0]["cited_evidence_ids"] = []
+    red = _verdict_assessment(pack_hash, "red_team", "provider-red", verdicts)
+    with pytest.raises(AssessmentValidationError, match="resolving verdict must cite"):
+        router.submit(run, _attempt(work, "accepted", red))
+    with store.database.connect(read_only=True) as db:
+        assert (
+            db.execute("SELECT count(*) FROM model_assessment WHERE role='red_team'").fetchone()[0]
+            == 0
+        )
+        assert db.execute("SELECT count(*) FROM dispute_resolution").fetchone()[0] == 0
+    assert store.current_state(run) == "RED_TEAM_REQUIRED"
+
+
+def test_resolving_arbiter_verdict_requires_in_pack_evidence_atomically(tmp_path):
+    store, router, run, pack_hash = _disputed_committee(tmp_path / "arbiter-no-evidence.db")
+    red_work = router.get_work(run)
+    red = _verdict_assessment(
+        pack_hash,
+        "red_team",
+        "provider-red",
+        [_verdict(item["item_id"], "unresolved") for item in red_work["focus"]["items"]],
+    )
+    router.submit(run, _attempt(red_work, "accepted", red))
+    work = router.get_work(run)
+    verdicts = [_verdict(item["item_id"], "resolved_for_b") for item in work["focus"]["items"]]
+    verdicts[0]["cited_evidence_ids"] = []
+    arbiter = _verdict_assessment(pack_hash, "arbiter", "provider-arbiter", verdicts)
+    with pytest.raises(AssessmentValidationError, match="resolving verdict must cite"):
+        router.submit(run, _attempt(work, "accepted", arbiter))
+    with store.database.connect(read_only=True) as db:
+        assert (
+            db.execute("SELECT count(*) FROM model_assessment WHERE role='arbiter'").fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute("SELECT count(*) FROM dispute_resolution WHERE role='arbiter'").fetchone()[0]
+            == 0
+        )
+    assert store.current_state(run) == "ARBITER_REQUIRED"
+
+
 def test_exact_full_red_team_coverage_resolves_and_scores(tmp_path):
     _, router, run, pack_hash = _disputed_committee(tmp_path / "red-resolved.db")
     work = router.get_work(run)
@@ -847,6 +938,39 @@ def test_b_first_same_provider_is_rejected_symmetrically(tmp_path):
         )
 
 
+def test_concurrent_neutrals_cannot_commit_the_same_provider(tmp_path):
+    store, run, pack_hash = _committee(tmp_path / "provider-concurrency.db")
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+    work = {item["role"]: item for item in router.status(run)["work"]}
+    barrier = Barrier(2)
+    original = CommitteeRouter._validate_provider_independence
+
+    def synchronized_check(self, run_id, role, provider):
+        original(self, run_id, role, provider)
+        barrier.wait(timeout=5)
+
+    def submit(role):
+        assessment = _valid_assessment(pack_hash, role, "same")
+        try:
+            return router.submit(run, _attempt(work[role], "accepted", assessment))
+        except ValueError as exc:
+            return exc
+
+    with patch.object(CommitteeRouter, "_validate_provider_independence", synchronized_check):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(submit, ("neutral_analyst_a", "neutral_analyst_b")))
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum("neutral providers must differ" in str(result) for result in results) == 1
+    with store.database.connect(read_only=True) as db:
+        rows = list(
+            db.execute(
+                "SELECT role,provider FROM model_assessment WHERE committee_run_id=?", (run,)
+            )
+        )
+        assert len(rows) == 1 and rows[0]["provider"] == "same"
+
+
 def test_accepted_retry_and_telemetry_clone_keep_one_snapshot_identity(tmp_path):
     store, run, pack_hash = _committee(tmp_path / "retry.db")
     router = CommitteeRouter(store.database)
@@ -932,6 +1056,44 @@ def test_telemetry_only_full_paths_have_identical_logical_artifacts(tmp_path):
     assert execute(tmp_path / "plain.db", False) == execute(tmp_path / "telemetry.db", True)
 
 
+def test_semantic_snapshot_reuse_completes_and_links_every_run(tmp_path):
+    store, first_run, pack_hash = _committee(tmp_path / "snapshot-reuse.db")
+    comparator, scoring = store.ensure_registry_rows()
+    claims = [_claim("valuation_vs_history", "bullish")]
+    a = _valid_assessment(pack_hash, "neutral_analyst_a", "provider-a", claims)
+    b = _valid_assessment(pack_hash, "neutral_analyst_b", "provider-b", claims)
+    first_router = CommitteeRouter(store.database)
+    first_router.initialize(first_run)
+    first_router.submit(first_run, a)
+    first = first_router.submit(first_run, b)
+    second_run = store.create_or_resume_committee_run(
+        candidate_id="candidate",
+        pack_hash=pack_hash,
+        committee_policy_version=2,
+        comparator_config_hash=comparator,
+        scoring_config_hash=scoring,
+        prompt_versions={"neutral": "v1", "red_team": "v1", "arbiter": "v1"},
+        assessment_schema_version=1,
+    )
+    second_router = CommitteeRouter(store.database)
+    second_router.initialize(second_run)
+    second_router.submit(second_run, a)
+    second = second_router.submit(second_run, b)
+    assert first["state"] == second["state"] == "SCORED"
+    assert first["snapshot_id"] == second["snapshot_id"]
+    assert first["artifact_id"] == second["artifact_id"] == first["snapshot_id"]
+    with store.database.connect(read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM score_snapshot").fetchone()[0] == 1
+        links = list(
+            db.execute(
+                "SELECT committee_run_id,artifact_id FROM committee_transition "
+                "WHERE to_state='SCORED' ORDER BY committee_run_id"
+            )
+        )
+        assert {row["committee_run_id"] for row in links} == {first_run, second_run}
+        assert {row["artifact_id"] for row in links} == {first["snapshot_id"]}
+
+
 def test_ready_to_score_status_recovers_after_injected_score_failure(tmp_path):
     store, run, pack_hash = _committee(tmp_path / "recover.db")
     router = CommitteeRouter(store.database)
@@ -949,6 +1111,41 @@ def test_ready_to_score_status_recovers_after_injected_score_failure(tmp_path):
         assert (
             db.execute(
                 "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@pytest.mark.parametrize("surface", ["status", "get_work", "retry"])
+def test_second_neutral_commit_boundary_recovers_once(tmp_path, surface):
+    store, run, pack_hash = _committee(tmp_path / f"neutral-recover-{surface}.db")
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+    claims = [_claim("valuation_vs_history", "bullish")]
+    router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_a", "provider-a", claims))
+    second = _valid_assessment(pack_hash, "neutral_analyst_b", "provider-b", claims)
+    with patch.object(Comparator, "compare_and_persist", side_effect=RuntimeError("injected")):
+        with pytest.raises(RuntimeError, match="injected"):
+            router.submit(run, second)
+    with store.database.connect(read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM model_assessment").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM comparison_report").fetchone()[0] == 0
+    assert store.current_state(run) == "PENDING_NEUTRALS"
+    if surface == "status":
+        recovered = router.status(run)
+    elif surface == "get_work":
+        assert router.get_work(run) is None
+        recovered = router.status(run)
+    else:
+        recovered = router.submit(run, second)
+        assert "assessment_id" in recovered
+    assert recovered["state"] == "SCORED" and recovered["artifact_id"]
+    with store.database.connect(read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM comparison_report").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM score_snapshot").fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT count(*) FROM committee_transition WHERE cause_code='NEUTRALS_COMPARED'"
             ).fetchone()[0]
             == 1
         )
