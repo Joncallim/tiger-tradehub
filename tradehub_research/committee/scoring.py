@@ -94,6 +94,9 @@ def score_screens(
     screens: list[dict[str, Any]], evidence: list[dict[str, Any]], spec: dict[str, Any]
 ) -> dict[str, Any]:
     """Apply §6 exactly. Committee/model fields are deliberately absent."""
+    scoring_version = spec.get("scoring_version")
+    if type(scoring_version) is not int or scoring_version not in {1, 2}:
+        raise ValueError(f"unsupported scoring_version: {scoring_version!r}")
     weights = {key: Decimal(str(value)) for key, value in spec["weights"].items()}
     scored_families = [row["family"] for row in screens if row["family"] in weights]
     if len(scored_families) != len(set(scored_families)):
@@ -104,6 +107,7 @@ def score_screens(
     base = low_quality = Decimal(0)
     quality_numerator = Decimal(0)
     missing_count = stale_count = 0
+    groups: set[str] = set()
     scored_evidence: dict[str, dict[str, Any]] = {}
     reason_codes: set[str] = set()
     for family, weight in weights.items():
@@ -130,6 +134,8 @@ def score_screens(
                 group = item.get("underlying_group")
                 if not group and item.get("record_type") == "xbrl_fact":
                     raise ValueError("UNGROUPABLE_XBRL")
+                if group:
+                    groups.add(group)
                 scored_evidence[evidence_id] = item
         contributions[family] = {
             "weight": int(weight),
@@ -141,8 +147,12 @@ def score_screens(
         }
     missing_penalty = min(Decimal(10), Decimal(2 * missing_count))
     staleness_penalty = min(Decimal(6), Decimal(2 * stale_count))
-    independence_units = _independence_units(list(scored_evidence.values()))
-    confluence = Decimal(5 * min(2, max(0, len(independence_units) - 1)))
+    scoring_units = (
+        sorted(groups)
+        if scoring_version == 1
+        else _independence_units(list(scored_evidence.values()))
+    )
+    confluence = Decimal(5 * min(2, max(0, len(scoring_units) - 1)))
     raw = _six(
         max(
             Decimal(0),
@@ -153,31 +163,47 @@ def score_screens(
     )
     conviction = int((raw / Decimal(5)).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * 5)
     data_quality = _six(quality_numerator / sum(weights.values()))
-    records = [
-        {
-            "evidence_id": item["evidence_id"],
-            "content_hash": item["content_hash"],
-            "source_id": item.get("source_id"),
-            "underlying_group": item.get("underlying_group"),
-            "cluster_ids": sorted(
-                {
-                    cluster_id
-                    for cluster_id in item.get("cluster_ids", [])
-                    if isinstance(cluster_id, str) and cluster_id
-                }
-            ),
-            "public_available_time": item["public_available_time"],
-            "supersedes_evidence_id": item.get("supersedes_evidence_id"),
-        }
-        for item in sorted(scored_evidence.values(), key=lambda value: value["evidence_id"])
-    ]
-    scored_identity = {"records": records, "independence_units": independence_units}
-    scored_hash = hashlib.sha256(
-        ("scored-evidence-v2\0" + canonical_json(scored_identity)).encode()
-    ).hexdigest()
+    if scoring_version == 1:
+        records = [
+            {
+                "evidence_id": item["evidence_id"],
+                "content_hash": item["content_hash"],
+                "source_id": item["source_id"],
+                "underlying_group": item.get("underlying_group"),
+                "public_available_time": item["public_available_time"],
+                "supersedes_evidence_id": item.get("supersedes_evidence_id"),
+            }
+            for item in sorted(scored_evidence.values(), key=lambda value: value["evidence_id"])
+        ]
+        scored_hash = hashlib.sha256(
+            ("scored-evidence-v1\0" + canonical_json(records)).encode()
+        ).hexdigest()
+    else:
+        records = [
+            {
+                "evidence_id": item["evidence_id"],
+                "content_hash": item["content_hash"],
+                "source_id": item.get("source_id"),
+                "underlying_group": item.get("underlying_group"),
+                "cluster_ids": sorted(
+                    {
+                        cluster_id
+                        for cluster_id in item.get("cluster_ids", [])
+                        if isinstance(cluster_id, str) and cluster_id
+                    }
+                ),
+                "public_available_time": item["public_available_time"],
+                "supersedes_evidence_id": item.get("supersedes_evidence_id"),
+            }
+            for item in sorted(scored_evidence.values(), key=lambda value: value["evidence_id"])
+        ]
+        scored_identity = {"records": records, "independence_units": scoring_units}
+        scored_hash = hashlib.sha256(
+            ("scored-evidence-v2\0" + canonical_json(scored_identity)).encode()
+        ).hexdigest()
     return {
         "family_contributions": contributions,
-        "underlying_groups": independence_units,
+        "underlying_groups": scoring_units,
         "penalties": {
             "low_quality": float(_six(low_quality)),
             "missing": float(_six(missing_penalty)),
