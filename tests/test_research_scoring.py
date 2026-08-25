@@ -9,7 +9,7 @@ from tradehub_research.committee.scoring import (
     score_screens,
     semantic_screen_hash,
 )
-from tradehub_research.committee.store import ScoringSpec
+from tradehub_research.committee.store import LegacyScoringSpec, ScoringSpec
 
 
 def _screen(family: str, *, quality: float = 1, evidence: list[str] | None = None, **changes):
@@ -64,6 +64,35 @@ def test_exact_arithmetic_penalties_bonus_and_half_up():
     assert result["penalties"] == {"low_quality": 9.0, "missing": 6.0, "staleness": 2.0}
     assert result["raw_score"] == 24
     assert result["conviction"] == 25
+
+
+def test_scoring_version_dispatch_preserves_v1_confluence_and_evidence_identity():
+    screens = [_screen("valuation", evidence=["a"]), _screen("quality", evidence=["b"])]
+    evidence = [
+        _evidence("a", "g1", source_id="same-source"),
+        _evidence("b", "g2", source_id="same-source"),
+    ]
+
+    legacy = score_screens(screens, evidence, LegacyScoringSpec().as_dict())
+    current = score_screens(screens, evidence, ScoringSpec().as_dict())
+
+    assert legacy["underlying_groups"] == ["g1", "g2"]
+    assert legacy["confluence_bonus"] == 5
+    assert (legacy["raw_score"], legacy["conviction"]) == (35, 35)
+    assert legacy["scored_evidence_hash"] == (
+        "0adbfa6beb9cb841f3228ef5c4dd212cc36e1a8e84fbbabdfd11b929a6878116"
+    )
+    assert all("cluster_ids" not in record for record in legacy["scored_evidence"])
+    assert current["underlying_groups"] == ['independence:v1:["same-source"]']
+    assert current["confluence_bonus"] == 0
+    assert (current["raw_score"], current["conviction"]) == (30, 30)
+    assert current["scored_evidence_hash"] != legacy["scored_evidence_hash"]
+
+
+def test_unsupported_scoring_version_fails_closed():
+    spec = ScoringSpec().as_dict() | {"scoring_version": 3}
+    with pytest.raises(ValueError, match="unsupported scoring_version: 3"):
+        score_screens([], [], spec)
 
 
 def test_one_xbrl_source_across_three_families_is_one_independence_unit():

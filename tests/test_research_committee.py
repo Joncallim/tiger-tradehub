@@ -322,6 +322,86 @@ def test_live_v1_registry_upgrades_without_overwrite_or_version_reuse(tmp_path):
     )
 
 
+def test_pending_v1_run_scores_with_legacy_semantics_after_registry_upgrade(tmp_path):
+    database, candidate_id = _fixture(tmp_path / "pending-v1-upgrade.db")
+    pack = EvidencePackBuilder(database).build(candidate_id)
+    comparator = ComparatorSpec()
+    legacy = LegacyScoringSpec()
+    with database.connect() as db:
+        db.execute(
+            "INSERT INTO comparator_definition VALUES (?,?,?,?,?)",
+            (
+                comparator.config_hash,
+                comparator.comparator_version,
+                comparator.taxonomy_version,
+                comparator.spec_json,
+                "2025-01-01Z",
+            ),
+        )
+        db.execute(
+            "INSERT INTO scoring_version VALUES (?,?,?,?,?)",
+            (legacy.config_hash, 1, legacy.spec_json, "existing live v1", "2025-01-01Z"),
+        )
+
+    store = CommitteeStore(database)
+    run = store.create_or_resume_committee_run(
+        candidate_id=candidate_id,
+        pack_hash=pack.pack_hash,
+        committee_policy_version=1,
+        comparator_config_hash=comparator.config_hash,
+        scoring_config_hash=legacy.config_hash,
+        prompt_versions={"neutral": "v1", "red_team": "v1", "arbiter": "v1"},
+        assessment_schema_version=1,
+    )
+    router = CommitteeRouter(database)
+    router.initialize(run)
+    assert store.current_state(run) == "PENDING_NEUTRALS"
+
+    _, current_hash = store.ensure_registry_rows()
+    assert current_hash == ScoringSpec().config_hash
+    claims = [_claim("valuation_vs_history", "bullish")]
+    router.submit(
+        run,
+        _valid_assessment(pack.pack_hash, "neutral_analyst_a", "provider-a", claims),
+    )
+    result = router.submit(
+        run,
+        _valid_assessment(pack.pack_hash, "neutral_analyst_b", "provider-b", claims),
+    )
+
+    legacy_score = score_screens(pack.body["screens"], pack.body["evidence"], legacy.as_dict())
+    current_score = score_screens(
+        pack.body["screens"], pack.body["evidence"], ScoringSpec().as_dict()
+    )
+    with database.connect(read_only=True) as db:
+        versions = list(
+            db.execute(
+                "SELECT scoring_version,config_hash FROM scoring_version ORDER BY scoring_version"
+            )
+        )
+        snapshot = db.execute(
+            "SELECT scoring_config_hash,scored_evidence_hash,confluence_bonus,raw_score,conviction "
+            "FROM score_snapshot WHERE committee_run_id=?",
+            (run,),
+        ).fetchone()
+
+    assert result["state"] == "SCORED"
+    assert [tuple(row) for row in versions] == [
+        (1, legacy.config_hash),
+        (2, ScoringSpec().config_hash),
+    ]
+    assert tuple(snapshot) == (
+        legacy.config_hash,
+        legacy_score["scored_evidence_hash"],
+        legacy_score["confluence_bonus"],
+        legacy_score["raw_score"],
+        legacy_score["conviction"],
+    )
+    assert legacy_score["confluence_bonus"] == 5
+    assert current_score["confluence_bonus"] == 0
+    assert legacy_score["scored_evidence_hash"] != current_score["scored_evidence_hash"]
+
+
 def test_v8_artifact_tables_are_append_only(tmp_path):
     database, _ = _fixture(tmp_path / "append.db")
     CommitteeStore(database).ensure_registry_rows()
