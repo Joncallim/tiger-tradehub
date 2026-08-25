@@ -36,6 +36,7 @@ dev = [
   "pip-audit>=2.7.0",
   "pytest>=8.2.0",
   "ruff==0.15.17",
+  "setuptools>=83.0.0",
 ]
 
 [project.urls]
@@ -54,7 +55,7 @@ tradehub-research-mcp = "tradehub_research.mcp_server:main"
 research-db = "tradehub_research.cli:main"
 
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
