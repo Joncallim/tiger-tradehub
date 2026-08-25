@@ -122,11 +122,10 @@ Run the API first, then add this MCP server to Claude Desktop or Claude Code con
 }
 ```
 
-Use the absolute path to `tradehub-mcp` from this checkout. For example, if the repo is in
-`/root/tiger-tradehub`, use:
+Use the absolute path to `tradehub-mcp` from this checkout. For example, if the repo is checked out at `/path/to/tiger-tradehub`, use:
 
 ```json
-"command": "/root/tiger-tradehub/.venv/bin/tradehub-mcp"
+"command": "/path/to/tiger-tradehub/.venv/bin/tradehub-mcp"
 ```
 
 Restart Claude after editing the config. Claude should then have TradeHub tools for health checks,

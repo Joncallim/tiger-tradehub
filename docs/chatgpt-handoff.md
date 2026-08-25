@@ -1,7 +1,7 @@
 # Tiger TradeHub — Functional Acceptance Hand-off for ChatGPT
 
 Date: 2026-08-23
-Repo: https://github.com/Joncallim/tiger-tradehub (local: /home/jon/tiger-tradehub)
+Repo: https://github.com/Joncallim/tiger-tradehub
 Tracker issue: #23 (Functional Acceptance Program — Hermes + DeepSeek V4 Flash)
 
 ## Where things stand
