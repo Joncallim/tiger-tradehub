@@ -10,6 +10,7 @@ from pathlib import Path
 
 from tradehub_research.acceptance.packs.ra00 import ASSERTIONS as RA00_ASSERTIONS
 from tradehub_research.acceptance.packs.ra01 import ASSERTIONS as RA01_ASSERTIONS
+from tradehub_research.acceptance.packs.ra02 import ASSERTIONS as RA02_ASSERTIONS
 from tradehub_research.acceptance.sanitize import sanitize
 from tradehub_research.acceptance.schema import AssertionResult, RunResult, Status
 
@@ -20,6 +21,7 @@ PackAssertion = tuple[str, Callable[[Path], None]]
 PACK_REGISTRY: dict[str, list[PackAssertion]] = {
     "RA-00": RA00_ASSERTIONS,
     "RA-01": RA01_ASSERTIONS,
+    "RA-02": RA02_ASSERTIONS,
 }
 
 
