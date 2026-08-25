@@ -572,10 +572,27 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             usage_json TEXT NOT NULL CHECK(json_valid(usage_json)),
             cost_json TEXT NOT NULL CHECK(json_valid(cost_json)),
             evaluation_time TEXT NOT NULL, submitted_at TEXT NOT NULL, payload_hash TEXT NOT NULL,
+            semantic_assessment_hash TEXT NOT NULL,
             UNIQUE(committee_run_id, role)
+        );
+        CREATE TABLE committee_work (
+            work_id TEXT PRIMARY KEY,
+            committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
+            role TEXT NOT NULL CHECK(role IN (
+                'neutral_analyst_a','neutral_analyst_b','red_team','arbiter')),
+            attempt_number INTEGER NOT NULL CHECK(attempt_number BETWEEN 1 AND 2),
+            pack_hash TEXT NOT NULL REFERENCES evidence_pack(pack_hash),
+            prompt_version TEXT NOT NULL,
+            assessment_schema_version INTEGER NOT NULL CHECK(assessment_schema_version > 0),
+            taxonomy_version INTEGER NOT NULL CHECK(taxonomy_version > 0),
+            focus_hash TEXT,
+            focus_json TEXT CHECK(focus_json IS NULL OR json_valid(focus_json)),
+            issued_at TEXT NOT NULL,
+            UNIQUE(committee_run_id, role, attempt_number)
         );
         CREATE TABLE model_call_attempt (
             attempt_id TEXT PRIMARY KEY,
+            work_id TEXT NOT NULL REFERENCES committee_work(work_id),
             committee_run_id TEXT NOT NULL REFERENCES committee_run(committee_run_id),
             role TEXT NOT NULL CHECK(role IN (
                 'neutral_analyst_a','neutral_analyst_b','red_team','arbiter')),
@@ -583,7 +600,9 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             provider TEXT NOT NULL, model_id TEXT NOT NULL, model_route TEXT NOT NULL,
             billing_class TEXT NOT NULL CHECK(billing_class IN ('subscription','local','paid')),
             prompt_version TEXT NOT NULL, prompt_template_hash TEXT NOT NULL,
-            pack_hash TEXT NOT NULL REFERENCES evidence_pack(pack_hash), outcome TEXT NOT NULL,
+            pack_hash TEXT NOT NULL REFERENCES evidence_pack(pack_hash),
+            outcome TEXT NOT NULL CHECK(outcome IN (
+                'accepted','malformed','unavailable','timeout')),
             usage_json TEXT NOT NULL CHECK(json_valid(usage_json)),
             cost_json TEXT NOT NULL CHECK(json_valid(cost_json)), diagnostic_hash TEXT,
             diagnostic_excerpt TEXT, requested_at TEXT NOT NULL, completed_at TEXT,
@@ -606,7 +625,8 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             comparison_id TEXT NOT NULL REFERENCES comparison_report(comparison_id),
             role TEXT NOT NULL CHECK(role IN ('red_team','arbiter')),
             assessment_id TEXT NOT NULL REFERENCES model_assessment(assessment_id),
-            focus_hash TEXT NOT NULL, resolution_json TEXT NOT NULL CHECK(json_valid(resolution_json)),
+            focus_hash TEXT NOT NULL, focus_json TEXT NOT NULL CHECK(json_valid(focus_json)),
+            resolution_json TEXT NOT NULL CHECK(json_valid(resolution_json)),
             result_hash TEXT NOT NULL, computed_at TEXT NOT NULL,
             UNIQUE(comparison_id, role)
         );
@@ -630,13 +650,14 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
                 'INITIAL','REBASED','RISING','FALLING','STABLE')),
             change_cause TEXT NOT NULL CHECK(change_cause IN (
                 'INITIAL','SCORING_VERSION_CHANGE','MODEL_REASSESSMENT',
-                'CORRECTION_RESTATEMENT','EVIDENCE_DRIVEN')),
+                'SCREEN_METHODOLOGY_CHANGE','CORRECTION_RESTATEMENT','EVIDENCE_DRIVEN')),
             material_change_time TEXT,
             reason_codes_json TEXT NOT NULL CHECK(json_valid(reason_codes_json)),
             result_hash TEXT NOT NULL, computed_at TEXT NOT NULL
         );
         CREATE INDEX committee_candidate_idx ON committee_run(candidate_id, created_at);
         CREATE INDEX assessment_run_role_idx ON model_assessment(committee_run_id, role);
+        CREATE INDEX work_run_role_idx ON committee_work(committee_run_id, role, attempt_number);
         CREATE INDEX attempt_run_role_idx ON model_call_attempt(committee_run_id, role, attempt_number);
         CREATE INDEX score_candidate_idx ON score_snapshot(candidate_id, material_change_time, snapshot_id);
 
@@ -652,6 +673,8 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         CREATE TRIGGER committee_transition_no_delete BEFORE DELETE ON committee_transition BEGIN SELECT RAISE(ABORT, 'committee_transition is append-only'); END;
         CREATE TRIGGER model_assessment_no_update BEFORE UPDATE ON model_assessment BEGIN SELECT RAISE(ABORT, 'model_assessment is append-only'); END;
         CREATE TRIGGER model_assessment_no_delete BEFORE DELETE ON model_assessment BEGIN SELECT RAISE(ABORT, 'model_assessment is append-only'); END;
+        CREATE TRIGGER committee_work_no_update BEFORE UPDATE ON committee_work BEGIN SELECT RAISE(ABORT, 'committee_work is append-only'); END;
+        CREATE TRIGGER committee_work_no_delete BEFORE DELETE ON committee_work BEGIN SELECT RAISE(ABORT, 'committee_work is append-only'); END;
         CREATE TRIGGER model_call_attempt_no_update BEFORE UPDATE ON model_call_attempt BEGIN SELECT RAISE(ABORT, 'model_call_attempt is append-only'); END;
         CREATE TRIGGER model_call_attempt_no_delete BEFORE DELETE ON model_call_attempt BEGIN SELECT RAISE(ABORT, 'model_call_attempt is append-only'); END;
         CREATE TRIGGER comparison_report_no_update BEFORE UPDATE ON comparison_report BEGIN SELECT RAISE(ABORT, 'comparison_report is append-only'); END;

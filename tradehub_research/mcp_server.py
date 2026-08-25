@@ -37,13 +37,15 @@ def create_server(database: ResearchDB | None = None) -> Any:
         return {"pack_hash": row["pack_hash"], "body": json.loads(row["body_json"])}
 
     @mcp.tool()
-    def submit_assessment(committee_run_id: str, assessment_json: dict[str, Any]) -> dict[str, Any]:
-        """Validate and record one typed committee assessment, returning current state."""
-        return CommitteeRouter(database).submit(committee_run_id, assessment_json)
+    def submit_assessment(
+        committee_run_id: str, attempt_envelope: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Record one issued committee work attempt and return current state."""
+        return CommitteeRouter(database).submit(committee_run_id, attempt_envelope)
 
     @mcp.tool()
     def committee_status(committee_run_id: str) -> dict[str, Any]:
-        """Return derived committee state and its required research work."""
+        """Return state plus each server-authorized current work envelope."""
         return CommitteeRouter(database).status(committee_run_id)
 
     return mcp

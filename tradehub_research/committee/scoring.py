@@ -30,6 +30,9 @@ def score_screens(
 ) -> dict[str, Any]:
     """Apply §6 exactly. Committee/model fields are deliberately absent."""
     weights = {key: Decimal(str(value)) for key, value in spec["weights"].items()}
+    scored_families = [row["family"] for row in screens if row["family"] in weights]
+    if len(scored_families) != len(set(scored_families)):
+        raise ValueError("duplicate scored screen family")
     by_family = {row["family"]: row for row in screens if row["family"] in weights}
     evidence_by_id = {row["evidence_id"]: row for row in evidence}
     contributions: dict[str, dict[str, Any]] = {}
@@ -142,6 +145,12 @@ def classify_trajectory(
             "delta": None,
         }
     evidence_equal = prior["scored_evidence_hash"] == current["scored_evidence_hash"]
+    if evidence_equal and not screen_hashes_equal:
+        return {
+            "change_cause": "SCREEN_METHODOLOGY_CHANGE",
+            "trajectory_label": "REBASED",
+            "delta": None,
+        }
     if evidence_equal and screen_hashes_equal and committee_hashes_differ:
         if prior["conviction"] != current["conviction"]:
             raise DeterminismError("model reassessment changed conviction")
@@ -167,6 +176,21 @@ class Scorer:
             ).fetchone()
             if run is None:
                 raise KeyError(run_id)
+            existing_run = db.execute(
+                "SELECT * FROM score_snapshot WHERE committee_run_id=? ORDER BY snapshot_id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if existing_run is not None:
+                if self._state(db, run_id) == "READY_TO_SCORE":
+                    self._transition(
+                        db,
+                        run_id,
+                        "READY_TO_SCORE",
+                        "SCORED",
+                        "SCORE_SNAPSHOT_CREATED",
+                        existing_run["snapshot_id"],
+                    )
+                return self._decode(existing_run)
             state = self._state(db, run_id)
             if state != "READY_TO_SCORE":
                 raise ValueError("committee is not ready to score")
@@ -189,13 +213,15 @@ class Scorer:
                 raise ValueError("comparison required")
             assessments = list(
                 db.execute(
-                    "SELECT assessment_id,payload_hash FROM model_assessment WHERE committee_run_id=? ORDER BY role",
+                    "SELECT role,assessment_id,semantic_assessment_hash FROM model_assessment "
+                    "WHERE committee_run_id=? ORDER BY role",
                     (run_id,),
                 )
             )
             resolutions = list(
                 db.execute(
-                    "SELECT resolution_id,result_hash FROM dispute_resolution WHERE committee_run_id=? ORDER BY role",
+                    "SELECT role,resolution_id,focus_hash,result_hash FROM dispute_resolution "
+                    "WHERE committee_run_id=? ORDER BY role",
                     (run_id,),
                 )
             )
@@ -208,9 +234,13 @@ class Scorer:
                 "candidate_id": run["candidate_id"],
                 "screen_results": screen_hashes,
                 "scored_evidence_hash": result["scored_evidence_hash"],
-                "comparison": [comparison["comparison_id"], comparison["result_hash"]],
-                "resolutions": [tuple(row) for row in resolutions],
-                "assessments": [tuple(row) for row in assessments],
+                "comparison": [run["comparator_config_hash"], comparison["result_hash"]],
+                "resolutions": [
+                    (row["role"], row["focus_hash"], row["result_hash"]) for row in resolutions
+                ],
+                "assessments": [
+                    (row["role"], row["semantic_assessment_hash"]) for row in assessments
+                ],
             }
             score_input_hash = _hash("score-input-v1", logical)
             snapshot_id = hashlib.sha256(
@@ -222,8 +252,12 @@ class Scorer:
             if existing is not None:
                 return self._decode(existing)
             prior = db.execute(
-                "SELECT s.*,p.as_of FROM score_snapshot s JOIN candidate c ON c.candidate_id=s.candidate_id JOIN pipeline_run p ON p.run_id=c.run_id WHERE c.security_id=? ORDER BY p.as_of DESC,s.snapshot_id DESC LIMIT 1",
-                (run["security_id"],),
+                "SELECT s.*,p.as_of FROM score_snapshot s "
+                "JOIN candidate c ON c.candidate_id=s.candidate_id "
+                "JOIN pipeline_run p ON p.run_id=c.run_id "
+                "WHERE c.security_id=? AND p.as_of<=? "
+                "ORDER BY p.as_of DESC,s.snapshot_id DESC LIMIT 1",
+                (run["security_id"], run["as_of"]),
             ).fetchone()
             cause, label, delta, material_time = self._trajectory(
                 db, prior, run, result, screen_hashes, logical
@@ -235,9 +269,9 @@ class Scorer:
                 "scoring_config_hash": run["scoring_config_hash"],
                 "score_input_hash": score_input_hash,
                 "scored_evidence_hash": result["scored_evidence_hash"],
-                "assessment_ids": [row[0] for row in assessments],
+                "assessment_ids": [row["assessment_id"] for row in assessments],
                 "comparison_id": comparison["comparison_id"],
-                "resolution_ids": [row[0] for row in resolutions],
+                "resolution_ids": [row["resolution_id"] for row in resolutions],
                 **{
                     key: result[key]
                     for key in (
@@ -363,6 +397,11 @@ class Scorer:
         )
         if (
             prior["scored_evidence_hash"] == result["scored_evidence_hash"]
+            and old_screens != screen_hashes
+        ):
+            return "SCREEN_METHODOLOGY_CHANGE", "REBASED", None, None
+        if (
+            prior["scored_evidence_hash"] == result["scored_evidence_hash"]
             and old_screens == screen_hashes
         ):
             if prior["conviction"] != result["conviction"]:
@@ -452,7 +491,10 @@ class Scorer:
         with self.database.connect(read_only=True) as db:
             rows = list(
                 db.execute(
-                    "SELECT * FROM score_snapshot WHERE candidate_id=? ORDER BY snapshot_id",
+                    "SELECT s.* FROM score_snapshot s "
+                    "JOIN committee_run r ON r.committee_run_id=s.committee_run_id "
+                    "JOIN pipeline_run p ON p.run_id=r.pipeline_run_id "
+                    "WHERE s.candidate_id=? ORDER BY p.as_of,s.snapshot_id",
                     (candidate_id,),
                 )
             )

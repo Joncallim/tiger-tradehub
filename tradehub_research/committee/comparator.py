@@ -60,8 +60,8 @@ def compare_assessments(
     # Conflicts and contradictions pair claims at key/type level, before exact-direction sharing.
     bases = sorted({key[:2] for key in ma} | {key[:2] for key in mb})
     for base in bases:
-        aa = [(key, value) for key, value in ma.items() if key[:2] == base]
-        bb = [(key, value) for key, value in mb.items() if key[:2] == base]
+        aa = sorted((key, value) for key, value in ma.items() if key[:2] == base)
+        bb = sorted((key, value) for key, value in mb.items() if key[:2] == base)
         for ka, ca in aa:
             for kb, cb in bb:
                 if ka in consumed_a or kb in consumed_b:
@@ -227,8 +227,8 @@ class Comparator:
             ).hexdigest()
             identity = [
                 run_id,
-                arow["assessment_id"],
-                brow["assessment_id"],
+                arow["semantic_assessment_hash"],
+                brow["semantic_assessment_hash"],
                 run["comparator_config_hash"],
             ]
             comparison_id = hashlib.sha256(
@@ -250,6 +250,14 @@ class Comparator:
             else:
                 db.execute(
                     "INSERT INTO comparison_report VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (comparison_id, *identity, *expected, utc_now()),
+                    (
+                        comparison_id,
+                        run_id,
+                        arow["assessment_id"],
+                        brow["assessment_id"],
+                        run["comparator_config_hash"],
+                        *expected,
+                        utc_now(),
+                    ),
                 )
         return {"comparison_id": comparison_id, **report, "result_hash": result_hash}

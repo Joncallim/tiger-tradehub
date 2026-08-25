@@ -120,6 +120,24 @@ class EvidencePackBuilder:
         # BEGIN pins all reads to one SQLite snapshot, including clusters.
         with self.database.connect() as db:
             db.execute("BEGIN")
+            existing = db.execute(
+                "SELECT pack_hash,body_json,body_chars FROM evidence_pack "
+                "WHERE candidate_id=? AND pack_spec_version=?",
+                (candidate_id, PACK_SPEC_VERSION),
+            ).fetchone()
+            if existing is not None:
+                body_json = existing["body_json"]
+                try:
+                    body = json.loads(body_json)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise DeterminismError("stored evidence pack is malformed") from exc
+                if (
+                    len(body_json) != existing["body_chars"]
+                    or _hash("evidence-pack-v1", body) != existing["pack_hash"]
+                    or body.get("candidate", {}).get("candidate_id") != candidate_id
+                ):
+                    raise DeterminismError("stored evidence pack failed immutable verification")
+                return EvidencePack(existing["pack_hash"], body)
             pack = self._build(db, candidate_id)
             self._persist(db, candidate_id, pack)
             return pack
@@ -165,6 +183,8 @@ class EvidencePackBuilder:
 
         ordered_ids = sorted(frozen_ids, key=lambda item: (item not in passing_ids, item))
         truncations: list[dict[str, Any]] = []
+        if len(passing_ids) > MAX_EVIDENCE_ROWS:
+            raise PackBuildError("PACK_TOO_LARGE")
         if len(ordered_ids) > MAX_EVIDENCE_ROWS:
             truncations.append(
                 {"kind": "evidence_rows", "omitted": len(ordered_ids) - MAX_EVIDENCE_ROWS}
