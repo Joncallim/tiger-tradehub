@@ -309,9 +309,11 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="create/migrate the research database")
+    init_parser.add_argument("--db")
     init_parser.set_defaults(handler=_cmd_init)
 
     check_parser = subparsers.add_parser("check", help="integrity check")
+    check_parser.add_argument("--db")
     check_parser.set_defaults(handler=_cmd_check)
 
     ingest_parser = subparsers.add_parser("ingest", help="ingest a raw provider fixture")

@@ -607,6 +607,7 @@ class PortfolioEngine:
                 decision["scored_evidence_hash"],
                 decision["signal_status"],
                 eligibility.to_state,
+                hypothetical_evidence_driven=bool(decision.get("evidence_driven")),
             )
             decision["persistence_count"] = persistence
             if persistence >= persistence_required:
@@ -1059,6 +1060,7 @@ class PortfolioEngine:
             decision["scored_evidence_hash"],
             eligibility.status,
             State.EXIT,
+            hypothetical_evidence_driven=bool(decision.get("evidence_driven")),
         )
         decision["persistence_count"] = persistence
         required = policy.persistence_required(*edge)

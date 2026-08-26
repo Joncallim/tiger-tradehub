@@ -92,11 +92,17 @@ class RiskEngine:
         self._series_cache: dict[str, Any] = {}
 
     def _query(self):
-        """Context manager yielding a connection for price queries."""
+        """Context manager yielding a connection for price queries.
+
+        A plain (read-write) connection is required: ``mode=ro`` URI
+        connections cannot see uncheckpointed WAL frames while another
+        connection holds an open write transaction, which would make the
+        ledger appear empty mid-run.
+        """
         from contextlib import nullcontext
 
         if hasattr(self.database, "connect"):
-            return self.database.connect(read_only=True)
+            return self.database.connect()
         return nullcontext(self.database)
 
     # -- history measures ---------------------------------------------------
@@ -105,7 +111,7 @@ class RiskEngine:
         key = security_id
         if key not in self._series_cache:
             if hasattr(self.database, "connect"):
-                with self.database.connect(read_only=True) as conn:
+                with self.database.connect() as conn:
                     self._series_cache[key] = total_return_series(conn, security_id, as_of)
             else:
                 self._series_cache[key] = total_return_series(self.database, security_id, as_of)

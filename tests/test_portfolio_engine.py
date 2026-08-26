@@ -314,7 +314,8 @@ def test_verified_thesis_break_bypasses_hysteresis(runtime):
                 "INSERT INTO portfolio_state_transition("
                 "transition_id,decision_id,security_id,from_state,to_state,cause,reason_codes_json,"
                 "score_snapshot_id,portfolio_snapshot_id,policy_version,persistence_count,"
-                "persistence_required,effective_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "persistence_required,effective_at,created_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     "t" * 62 + decision_id[-2:],
                     decision_id,

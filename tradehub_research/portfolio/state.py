@@ -83,13 +83,17 @@ def persistence_count(
     score_evidence_hash: str | None,
     signal_status: str,
     signal_state: State,
+    *,
+    hypothetical_evidence_driven: bool = True,
 ) -> int:
     """Consecutive qualifying evidence-driven observations ending now.
 
     Only distinct ``scored_evidence_hash`` rows with ``change_cause``
     EVIDENCE_DRIVEN under the same policy and state epoch count.  Model
     reruns, rebases, corrections, and unchanged evidence neither increment
-    nor reset.  The hypothetical current observation is included.
+    nor reset.  The hypothetical current observation is included ONLY when
+    the current observation itself is evidence-driven — a rebase with a
+    fresh hash must never masquerade as persistence.
     """
     if score_evidence_hash is None:
         return 0
@@ -111,15 +115,16 @@ def persistence_count(
         ),
     ).fetchall()
     rows: list[dict[str, Any]] = [dict(row) for row in raw]
-    rows.append(
-        {
-            "observed_at": as_of,
-            "decision_id": decision_id,
-            "scored_evidence_hash": score_evidence_hash,
-            "signal_state": signal_state.value,
-            "signal_status": signal_status,
-        }
-    )
+    if hypothetical_evidence_driven:
+        rows.append(
+            {
+                "observed_at": as_of,
+                "decision_id": decision_id,
+                "scored_evidence_hash": score_evidence_hash,
+                "signal_state": signal_state.value,
+                "signal_status": signal_status,
+            }
+        )
     rows.sort(key=lambda r: (r["observed_at"], r["decision_id"]))
     seen_hashes: set[str] = set()
     deduped: list[dict[str, Any]] = []
