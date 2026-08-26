@@ -36,6 +36,23 @@ def test_execution_boundary_requires_exact_approval_and_paper_proof():
     assert "raw-token" not in repr(result)
 
 
+def test_reconciliation_id_mismatch_is_indeterminate():
+    boundary = Phase4ExecutionBoundary(
+        preview=lambda intent: {"accepted": True, "confirmation_token": "raw-token"},
+        submit=lambda token: "broker-1",
+        reconcile=lambda ref: {"id": "broker-2", "status": "FILLED", "filled": 1},
+        prove_paper=lambda: True,
+    )
+    boundary.preview(INTENT)
+    context = boundary.render_approval(
+        INTENT, current_state="WATCH", proposed_state="ENTER", rationale="pinned reason"
+    )
+    boundary.affirm(context, exact_order=context)
+    result = boundary.reconcile_and_settle(current_quantity=0, action="BUY", proposed_state="ENTER")
+    assert result.settlement.state == SettlementState.INDETERMINATE
+    assert not result.portfolio.portfolio_mutated
+
+
 def test_execution_boundary_blocks_nonpaper_before_submit():
     calls = []
     boundary = Phase4ExecutionBoundary(

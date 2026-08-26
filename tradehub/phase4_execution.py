@@ -7,8 +7,8 @@ from typing import Any
 from tradehub_research.portfolio.execution import (
     PreviewIntent,
     SanitizedSettlement,
+    SettlementState,
     apply_fill_to_portfolio,
-    sanitize_settlement,
 )
 
 
@@ -37,6 +37,58 @@ class ExecutionResult:
     execution_ref: str
     settlement: SanitizedSettlement
     portfolio: Any
+
+
+def _sanitize_broker_order(
+    *,
+    proposal_id: str,
+    execution_ref: str,
+    order: Mapping[str, Any] | None,
+    requested_qty: float,
+) -> SanitizedSettlement:
+    if not order:
+        state = SettlementState.INDETERMINATE
+    else:
+        status = str(order.get("status", "")).upper()
+        filled = float(order.get("filled") or order.get("filled_quantity") or 0)
+        if status in {"REJECTED", "FAILED"}:
+            state = SettlementState.REJECTED
+        elif status == "EXPIRED":
+            state = SettlementState.EXPIRED
+        elif status in {"CANCELLED", "CANCELED"}:
+            state = SettlementState.CANCELLED
+        elif filled >= requested_qty and requested_qty > 0:
+            state = SettlementState.FILLED
+        elif filled > 0:
+            state = SettlementState.PARTIALLY_FILLED
+        elif status in {"HELD", "SUBMITTED", "PENDING", "OPEN", "PARTIALLY_FILLED"}:
+            state = SettlementState.OPEN
+        else:
+            state = SettlementState.INDETERMINATE
+    filled = float((order or {}).get("filled") or (order or {}).get("filled_quantity") or 0)
+    filled = max(0.0, min(filled, requested_qty))
+    return SanitizedSettlement(
+        proposal_id=proposal_id,
+        execution_ref=execution_ref,
+        broker_order_ref=None if not order else str(order.get("id")),
+        state=state,
+        requested_qty=requested_qty,
+        filled_qty=filled,
+        remaining_qty=max(0.0, requested_qty - filled),
+        avg_fill_price=(
+            None
+            if not order or order.get("avg_fill_price") is None
+            else float(order["avg_fill_price"])
+        ),
+        terminal=state
+        in {
+            SettlementState.FILLED,
+            SettlementState.CANCELLED,
+            SettlementState.EXPIRED,
+            SettlementState.REJECTED,
+        },
+        reason="execution-side broker reconciliation",
+    )
 
 
 class Phase4ExecutionBoundary:
@@ -104,7 +156,10 @@ class Phase4ExecutionBoundary:
             raise ApprovalRequired("explicit approval is required before reconciliation")
         proposal = self._previewed
         broker_order = self._reconcile(self._broker_order_ref)
-        settlement = sanitize_settlement(
+        broker_ref = None if not broker_order else broker_order.get("id")
+        if str(broker_ref) != str(self._broker_order_ref):
+            broker_order = None
+        settlement = _sanitize_broker_order(
             proposal_id=proposal.proposal_id,
             execution_ref=proposal.proposal_id,
             order=broker_order,
