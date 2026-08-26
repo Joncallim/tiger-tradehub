@@ -183,6 +183,11 @@ def test_preview_capability_cannot_submit(tmp_path):
             json=preview_payload(),
             headers={"Authorization": "Bearer preview-token-with-enough-length"},
         )
+        execution_preview = client.post(
+            "/orders/preview",
+            json=preview_payload(),
+            headers=headers(),
+        )
         submit = client.post(
             "/orders/submit",
             json={"confirmation_token": "not-a-real-token-value"},
@@ -191,6 +196,7 @@ def test_preview_capability_cannot_submit(tmp_path):
     finally:
         app.dependency_overrides.clear()
     assert preview.status_code == 200
+    assert execution_preview.status_code == 200
     assert submit.status_code == 401
 
 
