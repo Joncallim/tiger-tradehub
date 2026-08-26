@@ -210,6 +210,16 @@ def apply_fill_to_portfolio(
     if action == "SELL":
         sold = min(current_quantity, settlement.filled_qty)
         remaining = max(0.0, current_quantity - sold)
+        if settlement.filled_qty == 0 and settlement.state == SettlementState.OPEN:
+            return PortfolioSettlement(
+                proposal_id,
+                execution_ref,
+                settlement,
+                False,
+                current_quantity,
+                0.0,
+                proposed_state,
+            )
         next_state = "WATCH" if remaining == 0 else "HOLD"
         return PortfolioSettlement(
             proposal_id,

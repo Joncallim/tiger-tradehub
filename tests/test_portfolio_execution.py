@@ -118,6 +118,26 @@ def test_unfilled_enter_does_not_create_hold():
     assert result.next_state == "ENTER"
 
 
+def test_zero_fill_open_sell_remains_pending():
+    settlement = sanitize_settlement(
+        proposal_id="p4",
+        execution_ref="opaque-ref",
+        order={"status": "OPEN", "filled": 0},
+        requested_qty=1,
+    )
+    result = apply_fill_to_portfolio(
+        proposal_id="p4",
+        execution_ref="opaque-ref",
+        action="SELL",
+        proposed_state="TRIM",
+        current_quantity=1,
+        settlement=settlement,
+    )
+    assert not result.portfolio_mutated
+    assert result.owned_quantity == 1
+    assert result.next_state == "TRIM"
+
+
 def test_partial_sell_reduces_only_actual_position():
     settlement = sanitize_settlement(
         proposal_id="p2",

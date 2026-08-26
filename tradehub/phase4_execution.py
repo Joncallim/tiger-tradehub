@@ -70,7 +70,7 @@ def _sanitize_broker_order(
     return SanitizedSettlement(
         proposal_id=proposal_id,
         execution_ref=execution_ref,
-        broker_order_ref=None if not order else str(order.get("id")),
+        broker_order_ref=(None if not order else str(order.get("id") or order.get("order_id"))),
         state=state,
         requested_qty=requested_qty,
         filled_qty=filled,
@@ -156,7 +156,9 @@ class Phase4ExecutionBoundary:
             raise ApprovalRequired("explicit approval is required before reconciliation")
         proposal = self._previewed
         broker_order = self._reconcile(self._broker_order_ref)
-        broker_ref = None if not broker_order else broker_order.get("id")
+        broker_ref = (
+            None if not broker_order else (broker_order.get("id") or broker_order.get("order_id"))
+        )
         if str(broker_ref) != str(self._broker_order_ref):
             broker_order = None
         settlement = _sanitize_broker_order(
