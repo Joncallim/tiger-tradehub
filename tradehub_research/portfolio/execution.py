@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -57,6 +57,8 @@ def proposal_to_preview_intent(
     current_day_notional: float,
     max_day_count: int,
     max_day_notional: float,
+    identity_as_of: str | None = None,
+    resolve_ticker: Callable[[str, str], str | None] | None = None,
 ) -> PreviewIntent:
     """Translate only immutable typed proposal fields into an execution intent."""
     required = (
@@ -74,9 +76,16 @@ def proposal_to_preview_intent(
         raise ProposalExecutionError(f"proposal missing pinned fields: {missing}")
     if not allowlist:
         raise ProposalExecutionError("V2 execution allowlist is empty; refusing execution")
-    symbol = str(
-        proposal.get("canonical_ticker") or proposal.get("ticker") or proposal["security_id"]
-    ).upper()
+    security_id = str(proposal["security_id"])
+    as_of = identity_as_of or str(proposal.get("as_of") or proposal.get("created_at") or "")
+    if not as_of or resolve_ticker is None:
+        raise ProposalExecutionError("authoritative point-in-time identity resolution is required")
+    symbol = resolve_ticker(security_id, as_of)
+    if not symbol:
+        raise ProposalExecutionError(
+            f"no authoritative ticker for security_id {security_id!r} at {as_of!r}"
+        )
+    symbol = str(symbol).upper()
     if symbol not in {item.upper() for item in allowlist}:
         raise ProposalExecutionError(f"symbol {symbol!r} is not in the V2 execution allowlist")
     if current_day_count >= max_day_count:

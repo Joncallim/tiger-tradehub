@@ -40,6 +40,13 @@ def _proposal() -> dict[str, object]:
     }
 
 
+def _identity_kwargs() -> dict[str, object]:
+    return {
+        "identity_as_of": "2025-01-01T00:00:00Z",
+        "resolve_ticker": lambda security_id, as_of: "AAPL",
+    }
+
+
 def _intent() -> PreviewIntent:
     return proposal_to_preview_intent(
         _proposal(),
@@ -48,6 +55,7 @@ def _intent() -> PreviewIntent:
         current_day_notional=0,
         max_day_count=3,
         max_day_notional=1000,
+        **_identity_kwargs(),
     )
 
 
@@ -64,6 +72,7 @@ def ra04_02_allowlist_fail_closed(tmp: Path) -> None:
             current_day_notional=0,
             max_day_count=3,
             max_day_notional=1000,
+            **_identity_kwargs(),
         )
     except ValueError:
         return
@@ -80,6 +89,7 @@ def ra04_03_budget_revalidation(tmp: Path) -> None:
                 current_day_notional=notional,
                 max_day_count=3,
                 max_day_notional=1000,
+                **_identity_kwargs(),
             )
         except ValueError:
             continue

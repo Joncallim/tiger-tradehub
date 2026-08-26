@@ -30,8 +30,42 @@ def test_stable_security_id_uses_canonical_ticker():
         current_day_notional=0,
         max_day_count=3,
         max_day_notional=1000,
+        identity_as_of="2025-01-01T00:00:00Z",
+        resolve_ticker=lambda security_id, as_of: "AAPL",
     )
     assert intent.symbol == "AAPL"
+
+
+def test_authoritative_identity_is_required_and_allowlist_uses_resolved_ticker():
+    proposal = {**PROPOSAL, "security_id": "stable-sec", "created_at": "2025-01-01T00:00:00Z"}
+    calls = []
+
+    def resolve(security_id, as_of):
+        calls.append((security_id, as_of))
+        return "NEW"
+
+    intent = proposal_to_preview_intent(
+        proposal,
+        allowlist={"NEW"},
+        current_day_count=0,
+        current_day_notional=0,
+        max_day_count=3,
+        max_day_notional=1000,
+        resolve_ticker=resolve,
+    )
+    assert intent.symbol == "NEW"
+    assert calls == [("stable-sec", "2025-01-01T00:00:00Z")]
+
+    with pytest.raises(ProposalExecutionError, match="authoritative"):
+        proposal_to_preview_intent(
+            proposal,
+            allowlist={"stable-sec"},
+            current_day_count=0,
+            current_day_notional=0,
+            max_day_count=3,
+            max_day_notional=1000,
+            resolve_ticker=lambda *_: None,
+        )
 
 
 def test_proposal_translation_is_typed_and_deterministic():
@@ -42,6 +76,8 @@ def test_proposal_translation_is_typed_and_deterministic():
         current_day_notional=0,
         max_day_count=3,
         max_day_notional=1000,
+        identity_as_of="2025-01-01T00:00:00Z",
+        resolve_ticker=lambda security_id, as_of: "AAPL",
     )
     two = proposal_to_preview_intent(
         dict(PROPOSAL),
@@ -50,6 +86,8 @@ def test_proposal_translation_is_typed_and_deterministic():
         current_day_notional=0,
         max_day_count=3,
         max_day_notional=1000,
+        identity_as_of="2025-01-01T00:00:00Z",
+        resolve_ticker=lambda security_id, as_of: "AAPL",
     )
     assert one == two
     assert one.side == "BUY"
@@ -74,6 +112,8 @@ def test_translation_revalidates_execution_policy(kwargs, message):
         "current_day_notional": 0,
         "max_day_count": 3,
         "max_day_notional": 1000,
+        "identity_as_of": "2025-01-01T00:00:00Z",
+        "resolve_ticker": lambda security_id, as_of: "AAPL",
     }
     base.update(kwargs)
     with pytest.raises(ProposalExecutionError, match=message):
@@ -89,6 +129,8 @@ def test_translation_rejects_model_supplied_market_fields():
         current_day_notional=0,
         max_day_count=3,
         max_day_notional=1000,
+        identity_as_of="2025-01-01T00:00:00Z",
+        resolve_ticker=lambda security_id, as_of: "AAPL",
     )
     assert intent.limit_price == 150
     assert intent.quantity == 1
