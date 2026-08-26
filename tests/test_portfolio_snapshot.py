@@ -174,8 +174,12 @@ def test_signal_input_identity_and_validation():
 
 
 def test_store_equality_checked_idempotent(tmp_path):
+    from tests.portfolio_test_helpers import seed_security
+
     database = ResearchDB(tmp_path / "snapshot.db")
     database.migrate()
+    with database.connect() as db:
+        seed_security(db, "sec1", sector="Tech")
     store = SnapshotStore(database)
     snapshot = build_snapshot(
         "2025-06-01T00:00:00Z", cash_microusd=10_000_000_000, nav_microusd=10_000_000_000

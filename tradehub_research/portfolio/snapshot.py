@@ -363,7 +363,7 @@ def build_signal_input(
         raise ValueError("signal input security_id required")
     if opportunity_status is None:
         opportunity_status = "KNOWN" if remaining_opportunity_ppm is not None else "UNKNOWN"
-    _validate_status(opportunity_status, "opportunity_status", known_only=True)
+    _validate_status(opportunity_status, "opportunity_status")
     _orthogonal(remaining_opportunity_ppm, opportunity_status, "remaining_opportunity_ppm")
     if remaining_opportunity_ppm is not None and not 0 <= remaining_opportunity_ppm <= 1_000_000:
         raise ValueError("remaining_opportunity_ppm out of range")
