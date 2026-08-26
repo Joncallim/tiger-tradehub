@@ -21,6 +21,10 @@ def unit_values(name: str) -> dict[str, list[str]]:
 def test_research_unit_is_a_distinct_unprivileged_runtime():
     research = unit_values("tradehub-research.service")
     execution = unit_values("tradehub-execution.service")
+    assert execution["WorkingDirectory"] == ["/opt/tiger-tradehub"]
+    assert research["WorkingDirectory"] == ["/opt/tiger-tradehub"]
+    assert "/home" not in execution["WorkingDirectory"][0]
+    assert "/home" not in research["WorkingDirectory"][0]
     assert research["User"] == ["tradehub-research"]
     assert research["Group"] == ["tradehub-research"]
     assert execution["User"] == ["tradehub-execution"]
