@@ -348,6 +348,9 @@ def validate_spec(spec: dict[str, Any]) -> None:
     pending_max = settlement.get("pending_max_calendar_days")
     if not isinstance(pending_max, int) or isinstance(pending_max, bool) or pending_max < 0:
         raise ValueError("settlement.pending_max_calendar_days must be >= 0")
+    cadence = settlement.get("observation_cadence_calendar_days", 0)
+    if not isinstance(cadence, int) or isinstance(cadence, bool) or cadence < 0:
+        raise ValueError("settlement.observation_cadence_calendar_days must be >= 0")
 
     # --- sizing -------------------------------------------------------------
     sizing = spec["sizing"]

@@ -802,6 +802,9 @@ class PortfolioEngine:
                 decision["signal_status"],
                 eligibility.to_state,
                 hypothetical_evidence_driven=bool(decision.get("evidence_driven")),
+                min_interval_calendar_days=int(
+                    policy.settlement.get("observation_cadence_calendar_days", 0)
+                ),
             )
             decision["persistence_count"] = persistence
             if persistence >= persistence_required:
@@ -1284,6 +1287,9 @@ class PortfolioEngine:
             eligibility.status,
             State.EXIT,
             hypothetical_evidence_driven=bool(decision.get("evidence_driven")),
+            min_interval_calendar_days=int(
+                policy.settlement.get("observation_cadence_calendar_days", 0)
+            ),
         )
         decision["persistence_count"] = persistence
         required = policy.persistence_required(*edge)

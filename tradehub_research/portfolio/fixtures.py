@@ -285,6 +285,7 @@ def fixture_policy_spec() -> dict[str, Any]:
         "settlement": {
             "quantity_tolerance_microunits": 1000,
             "pending_max_calendar_days": 30,
+            "observation_cadence_calendar_days": 1,
         },
         "sizing": {
             "sizing_policy_version": FIXTURE_SIZING_VERSION,

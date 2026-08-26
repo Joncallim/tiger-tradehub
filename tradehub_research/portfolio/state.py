@@ -85,6 +85,7 @@ def persistence_count(
     signal_state: State,
     *,
     hypothetical_evidence_driven: bool = True,
+    min_interval_calendar_days: int = 0,
 ) -> int:
     """Consecutive qualifying evidence-driven observations ending now.
 
@@ -126,6 +127,16 @@ def persistence_count(
             }
         )
     rows.sort(key=lambda r: (r["observed_at"], r["decision_id"]))
+    if min_interval_calendar_days > 0:
+        # scheduled-observation cadence: at most one counted observation per
+        # interval, so rapid same-day reruns cannot manufacture persistence
+        kept: list[dict[str, Any]] = []
+        last_kept_at: str | None = None
+        for row in rows:
+            if last_kept_at is None or _calendar_gap(last_kept_at, row["observed_at"]) >= min_interval_calendar_days:
+                kept.append(row)
+                last_kept_at = row["observed_at"]
+        rows = kept
     seen_hashes: set[str] = set()
     deduped: list[dict[str, Any]] = []
     for row in rows:
@@ -142,6 +153,15 @@ def persistence_count(
         else:
             break
     return count
+
+
+def _calendar_gap(start_iso: str, end_iso: str) -> int:
+    """Whole UTC calendar days between two ISO timestamps (date difference)."""
+    from datetime import datetime
+
+    start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    return (end.date() - start.date()).days
 
 
 def pending_resolution(
