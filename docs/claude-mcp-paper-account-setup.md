@@ -242,7 +242,7 @@ Before using this with anything beyond paper testing:
 
 - Keep the service bound to `127.0.0.1`.
 - Keep your `.env` file private.
-- Use a long random `TRADEHUB_API_TOKEN`.
+- Use long random, distinct `TRADEHUB_API_TOKEN` and `TRADEHUB_PREVIEW_API_TOKEN` values.
 - Start with `TRADEHUB_DRY_RUN=true`.
 - Use a Tiger paper account first.
 - Only use USD limit orders.
@@ -255,12 +255,13 @@ If Claude does not show TradeHub tools:
 - Restart Claude Desktop.
 - Check that the `command` path is absolute.
 - Check that `tradehub` is running in a separate terminal.
-- Check that the token in Claude's config exactly matches `TRADEHUB_API_TOKEN` in `.env`.
+- Check that both `TRADEHUB_API_TOKEN` and `TRADEHUB_PREVIEW_API_TOKEN` in Claude's config exactly match the corresponding `.env` values.
 
-If TradeHub says the token is invalid:
+If TradeHub says a token is invalid:
 
-- Generate a new token with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`.
-- Put the same token in `.env` and Claude's MCP config.
+- Generate two new tokens with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`.
+- Put the execution token in `TRADEHUB_API_TOKEN` and the different preview token in `TRADEHUB_PREVIEW_API_TOKEN` in both `.env` and Claude's MCP config.
+- Never copy one token into both settings; startup requires them to differ.
 - Restart both TradeHub and Claude.
 
 If Tiger preview or submit fails:
