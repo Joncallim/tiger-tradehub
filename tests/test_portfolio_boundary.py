@@ -59,6 +59,7 @@ SANCTIONED_FILES = {
     "tests/test_telegram_bot.py",
     "tests/test_tiger_gateway.py",
     "tests/test_phase4_execution.py",
+    "tests/test_phase4_runtime.py",
     # the oracle module itself (hex-encoded terms; RA-03 repeats this pattern)
     "tests/test_portfolio_boundary.py",
 }
