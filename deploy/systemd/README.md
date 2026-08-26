@@ -9,7 +9,7 @@ of #39.
 Run as root on the host:
 
 ```bash
-install -d -o root -g root -m 0750 /etc/tradehub
+install -d -o root -g root -m 0751 /etc/tradehub
 useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin tradehub-execution
 useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin tradehub-research
 ```
