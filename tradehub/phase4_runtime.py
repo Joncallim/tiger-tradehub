@@ -64,8 +64,8 @@ class Phase4Runtime:
             day = proposal["activity_date"]
             usage = db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(max_notional_microusd),0) "
-                "FROM trade_proposal WHERE activity_date=?",
-                (day,),
+                "FROM trade_proposal WHERE activity_date=? AND proposal_id!=?",
+                (day, proposal_id),
             ).fetchone()
             identity = SecurityIdentityStore.ticker_at_connection(
                 db, str(proposal["security_id"]), str(proposal["created_at"])

@@ -19,8 +19,10 @@ def main() -> None:
     client = TradeHubClient()
     preview_client = TradeHubClient(preview_only=True)
     research_settings = ResearchSettings()
+    research_db = ResearchDB(research_settings.db_path, research_settings.busy_timeout_ms)
+    research_db.migrate()
     phase4_runtime = Phase4Runtime(
-        ResearchDB(research_settings.db_path, research_settings.busy_timeout_ms),
+        research_db,
         allowlist={
             item.strip()
             for item in os.getenv("TRADEHUB_SYMBOL_ALLOWLIST", "").split(",")
