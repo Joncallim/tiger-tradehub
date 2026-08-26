@@ -133,7 +133,10 @@ def persistence_count(
         kept: list[dict[str, Any]] = []
         last_kept_at: str | None = None
         for row in rows:
-            if last_kept_at is None or _calendar_gap(last_kept_at, row["observed_at"]) >= min_interval_calendar_days:
+            if (
+                last_kept_at is None
+                or _calendar_gap(last_kept_at, row["observed_at"]) >= min_interval_calendar_days
+            ):
                 kept.append(row)
                 last_kept_at = row["observed_at"]
         rows = kept

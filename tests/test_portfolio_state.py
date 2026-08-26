@@ -495,18 +495,35 @@ def test_pending_exit_settles_to_watch_on_zero_quantity(tmp_path):
 def test_persistence_cadence_blocks_rapid_observations(tmp_path):
     """Two evidence observations seconds apart do not satisfy a 2-day cadence."""
     db = _db(tmp_path)
-    _insert_observation(db, decision_id="d1", as_of="2025-06-01T00:00:00Z",
-                        evidence_hash="H1")
+    _insert_observation(db, decision_id="d1", as_of="2025-06-01T00:00:00Z", evidence_hash="H1")
     with db.connect() as conn:
         count = persistence_count(
-            conn, "sec1", "fixture-policy-v1", "2025-06-01T00:00:01Z",
-            State.WATCH, State.ENTER, "d2", "H2", "PASS", State.ENTER,
-            hypothetical_evidence_driven=True, min_interval_calendar_days=1,
+            conn,
+            "sec1",
+            "fixture-policy-v1",
+            "2025-06-01T00:00:01Z",
+            State.WATCH,
+            State.ENTER,
+            "d2",
+            "H2",
+            "PASS",
+            State.ENTER,
+            hypothetical_evidence_driven=True,
+            min_interval_calendar_days=1,
         )
         assert count == 1  # the hypothetical is the only counted observation
         count = persistence_count(
-            conn, "sec1", "fixture-policy-v1", "2025-06-02T00:00:00Z",
-            State.WATCH, State.ENTER, "d3", "H3", "PASS", State.ENTER,
-            hypothetical_evidence_driven=True, min_interval_calendar_days=1,
+            conn,
+            "sec1",
+            "fixture-policy-v1",
+            "2025-06-02T00:00:00Z",
+            State.WATCH,
+            State.ENTER,
+            "d3",
+            "H3",
+            "PASS",
+            State.ENTER,
+            hypothetical_evidence_driven=True,
+            min_interval_calendar_days=1,
         )
         assert count == 2  # a full calendar day later: both count
