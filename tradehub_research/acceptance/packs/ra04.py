@@ -184,6 +184,7 @@ def ra04_11_cancel_expire_reject(tmp: Path) -> None:
             execution_ref="r",
             action="BUY",
             proposed_state="ENTER",
+            prior_state="WATCH",
             current_quantity=0,
             settlement=s,
         )

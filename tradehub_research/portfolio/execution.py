@@ -201,6 +201,10 @@ def apply_fill_to_portfolio(
     if action == "BUY":
         owned = current_quantity + settlement.filled_qty
         if settlement.filled_qty == 0 and settlement.terminal:
+            if prior_state is None:
+                raise ProposalExecutionError(
+                    "prior state is required for terminal zero-fill rollback"
+                )
             return PortfolioSettlement(
                 proposal_id,
                 execution_ref,
@@ -223,6 +227,20 @@ def apply_fill_to_portfolio(
     if action == "SELL":
         sold = min(current_quantity, settlement.filled_qty)
         remaining = max(0.0, current_quantity - sold)
+        if settlement.filled_qty == 0 and settlement.terminal:
+            if prior_state is None:
+                raise ProposalExecutionError(
+                    "prior state is required for terminal zero-fill rollback"
+                )
+            return PortfolioSettlement(
+                proposal_id,
+                execution_ref,
+                settlement,
+                False,
+                current_quantity,
+                0.0,
+                prior_state,
+            )
         if settlement.filled_qty == 0 and settlement.state == SettlementState.OPEN:
             return PortfolioSettlement(
                 proposal_id,

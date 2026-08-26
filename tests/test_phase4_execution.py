@@ -43,13 +43,14 @@ def test_preview_persists_only_opaque_execution_reference():
         submit=lambda token: "broker-1",
         reconcile=lambda ref: {"id": ref, "status": "OPEN", "filled": 0},
         prove_paper=lambda: True,
-        persist_execution_link=lambda proposal_id, execution_ref: links.append(
-            (proposal_id, execution_ref)
+        persist_execution_link=lambda proposal_id, execution_ref, metadata: links.append(
+            (proposal_id, execution_ref, metadata)
         ),
     )
     result = boundary.preview(INTENT)
     assert result["execution_ref"] == "execution:p1"
-    assert links == [("p1", "execution:p1")]
+    assert links[0][0:2] == ("p1", "execution:p1")
+    assert "confirmation_token_ref" in links[0][2]
     assert "raw-token" not in repr(links)
 
 

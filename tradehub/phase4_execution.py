@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -101,14 +102,14 @@ class Phase4ExecutionBoundary:
         submit: Callable[[str], str],
         reconcile: Callable[[str], Mapping[str, Any] | None],
         prove_paper: Callable[[], bool],
-        persist_execution_link: Callable[[str, str], None] | None = None,
+        persist_execution_link: Callable[[str, str, Mapping[str, str]], None] | None = None,
     ) -> None:
         self._preview = preview
         self._submit = submit
         self._reconcile = reconcile
         self._prove_paper = prove_paper
         self._persist_execution_link = persist_execution_link or (
-            lambda proposal_id, execution_ref: None
+            lambda proposal_id, execution_ref, metadata: None
         )
         self._previewed: PreviewIntent | None = None
         self._confirmation_token: str | None = None
@@ -121,7 +122,12 @@ class Phase4ExecutionBoundary:
         self._previewed = intent
         self._confirmation_token = str(result["confirmation_token"])
         self._execution_ref = f"execution:{intent.proposal_id}"
-        self._persist_execution_link(intent.proposal_id, self._execution_ref)
+        token_ref = hashlib.sha256(self._confirmation_token.encode()).hexdigest()
+        self._persist_execution_link(
+            intent.proposal_id,
+            self._execution_ref,
+            {"confirmation_token_ref": token_ref},
+        )
         return {
             "accepted": True,
             "proposal_id": intent.proposal_id,
@@ -154,6 +160,11 @@ class Phase4ExecutionBoundary:
             raise ApprovalRequired("broker account is not positively proven PAPER")
         # The raw token is deliberately retained only in this execution object.
         self._broker_order_ref = self._submit(self._confirmation_token)
+        self._persist_execution_link(
+            self._previewed.proposal_id,
+            self._execution_ref,
+            {"broker_order_ref": str(self._broker_order_ref)},
+        )
 
     def reconcile_and_settle(
         self,
@@ -184,7 +195,7 @@ class Phase4ExecutionBoundary:
         )
         portfolio = apply_fill_to_portfolio(
             proposal_id=proposal.proposal_id,
-            execution_ref=proposal.proposal_id,
+            execution_ref=self._execution_ref,
             action=action,
             proposed_state=proposed_state,
             current_quantity=current_quantity,
