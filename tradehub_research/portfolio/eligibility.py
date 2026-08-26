@@ -126,12 +126,16 @@ def evaluate_eligibility(
     if not candidates:
         # No outgoing rule for this state: deterministic ineligibility.
         return EligibilityResult(None, current_state, None, None, "INELIGIBLE")
-    if context.get("conviction_ppm") is None and context.get("trigger_override") is None:
-        # A scored decision with no score snapshot cannot match SCORE_BAND rules.
-        if any(rule.get("trigger_kind") == TriggerKind.SCORE_BAND.value for rule in candidates):
-            return EligibilityResult(None, current_state, None, None, "UNKNOWN")
+    # Safety overrides are evaluated BEFORE score completeness: a verified
+    # thesis break (or data-integrity / policy-ineligible / risk-reduction
+    # event) must be able to act even when committee/scoring data is missing.
+    coverage_blocked = True
     for rule in sorted(candidates, key=lambda r: r["priority"]):
         trigger = rule["trigger_kind"]
+        coverage_statuses = rule.get("allowed_sector_coverage_statuses")
+        if coverage_statuses and context.get("sector_coverage_status") not in coverage_statuses:
+            continue  # coverage-rejected rule; not a match, but a coverage block candidate
+        coverage_blocked = False
         if trigger == TriggerKind.VERIFIED_THESIS_BREAK.value:
             if not context.get("verified_break_eligible"):
                 continue
@@ -187,6 +191,17 @@ def evaluate_eligibility(
                 "PASS",
                 reason_code="thesis_realised",
             )
+        if trigger == TriggerKind.OPPORTUNITY_COST.value:
+            if not context.get("opportunity_cost_trigger"):
+                continue
+            return EligibilityResult(
+                rule["rule_id"],
+                current_state,
+                State(rule["to_state"]),
+                trigger,
+                "PASS",
+                reason_code="opportunity_cost",
+            )
         # SCORE_BAND: fixed-field match
         if opportunity_blocks(rule, context):
             return EligibilityResult(
@@ -205,6 +220,12 @@ def evaluate_eligibility(
                 trigger,
                 "PASS",
             )
+    if coverage_blocked:
+        # every candidate rule disallowed the sector coverage status: this is
+        # a deterministic coverage failure (BLOCKED), not missing data
+        return EligibilityResult(
+            None, current_state, None, None, "BLOCKED", reason_code="sector_coverage_blocked"
+        )
     return EligibilityResult(None, current_state, None, None, "INELIGIBLE")
 
 
@@ -217,24 +238,37 @@ def latest_verified_break(
 ) -> dict[str, Any] | None:
     """Latest structured VERIFIED thesis break usable at ``as_of``.
 
-    Only rows with status VERIFIED, an allowed verification method, and
-    ``verified_at <= as_of`` within ``max_age_calendar_days`` qualify.
-    Condition text is never read by the engine.
+    The LATEST verification per event is authoritative regardless of status:
+    a later REJECTED verification revokes an earlier VERIFIED one.  Only the
+    latest row — when it is VERIFIED, uses an allowed method, and is within
+    ``max_age_calendar_days`` of ``as_of`` — qualifies.  Condition text is
+    never read by the engine.
     """
     rows = db.execute(
         "SELECT v.* FROM thesis_break_verification v "
         "JOIN thesis_break_event e ON e.event_id=v.event_id "
-        "WHERE e.security_id=? AND v.status=? AND v.verified_at<=? "
+        "WHERE e.security_id=? AND v.verified_at<=? "
         "ORDER BY v.verified_at DESC, v.verification_id DESC",
-        (security_id, VerificationStatus.VERIFIED.value, as_of),
+        (security_id, as_of),
     ).fetchall()
+    # latest verification per event decides that event's eligibility: a later
+    # REJECTED verification revokes the event even if an older VERIFIED row
+    # exists.  Only events whose LATEST verification is VERIFIED, method-
+    # allowed, and fresh are candidates; the most recent such event wins.
+    latest_by_event: dict[str, dict[str, Any]] = {}
     for row in rows:
+        latest_by_event.setdefault(row["event_id"], row)
+    best: dict[str, Any] | None = None
+    for row in latest_by_event.values():
         if row["verification_method"] not in allowed_methods:
+            continue
+        if row["status"] != VerificationStatus.VERIFIED.value:
             continue
         verified_at = datetime.fromisoformat(row["verified_at"].replace("Z", "+00:00"))
         if datetime.fromisoformat(as_of.replace("Z", "+00:00")) - verified_at > timedelta(
             days=max_age_calendar_days
         ):
             continue
-        return dict(row)
-    return None
+        if best is None or row["verified_at"] > best["verified_at"]:
+            best = dict(row)
+    return best

@@ -333,6 +333,10 @@ def validate_spec(spec: dict[str, Any]) -> None:
     max_age = thesis_break.get("max_age_calendar_days")
     if not isinstance(max_age, int) or isinstance(max_age, bool) or max_age <= 0:
         raise ValueError("thesis_break.max_age_calendar_days must be > 0")
+    realised_max = thesis_break.get("realised_opportunity_max_ppm", 0)
+    _ppm_field(realised_max, "thesis_break.realised_opportunity_max_ppm")
+    opportunity_cost_max = thesis_break.get("opportunity_cost_max_ppm", 0)
+    _ppm_field(opportunity_cost_max, "thesis_break.opportunity_cost_max_ppm")
 
     # --- settlement ---------------------------------------------------------
     settlement = spec["settlement"]
@@ -418,8 +422,16 @@ def validate_spec(spec: dict[str, Any]) -> None:
         raise ValueError("risk.unknown_decrease must be 'LIMITED' or 'BLOCK'")
     if risk.get("min_overlap_observations", 0) > risk.get("correlation_window_sessions", 0):
         raise ValueError("risk.min_overlap_observations cannot exceed correlation_window_sessions")
+    if risk.get("min_vol_observations", 0) < 2:
+        raise ValueError(
+            "risk.min_vol_observations must be >= 2 (1-observation variance is undefined)"
+        )
     if risk.get("min_vol_observations", 0) > risk.get("volatility_window_sessions", 0):
         raise ValueError("risk.min_vol_observations cannot exceed volatility_window_sessions")
+    if risk.get("min_return_observations", 0) < 1:
+        raise ValueError("risk.min_return_observations must be >= 1")
+    if risk.get("min_return_observations", 0) > risk.get("return_window_sessions", 0):
+        raise ValueError("risk.min_return_observations cannot exceed return_window_sessions")
     if risk.get("min_adv_observations", 0) > risk.get("adv_window_sessions", 0):
         raise ValueError("risk.min_adv_observations cannot exceed adv_window_sessions")
 
@@ -472,6 +484,14 @@ def build_policy(
             raise ValueError("PAPER policy requires approved_by and approved_at")
     elif approved_by or approved_at:
         raise ValueError("FIXTURE/PROVISIONAL policies must not carry approval fields")
+    # FIXTURE verification methods are only valid inside FIXTURE policies
+    if policy_status != PolicyStatus.FIXTURE and "FIXTURE" in spec["thesis_break"].get(
+        "allowed_verification_methods", []
+    ):
+        raise ValueError(
+            "FIXTURE thesis-break verification method is not allowed in "
+            f"{policy_status.value} policies"
+        )
     return PolicySpec(
         policy_version=policy_version,
         policy_status=policy_status,

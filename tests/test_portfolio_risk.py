@@ -28,8 +28,9 @@ def _risk_inputs(**overrides):
         mark_price_microusd=50_000_000,
         price_status="KNOWN",
         price_as_of="2025-06-01T00:00:00Z",
-        adv_microusd=1_000_000_000_000,
+        adv_microusd=51_450_000_000_000,  # matches ledger ADV (51.45 avg close x 1M vol)
         liquidity_status="KNOWN",
+        liquidity_as_of="2025-06-01T00:00:00Z",
         nav_microusd=10_000_000_000,
         cash_microusd=5_000_000_000,
         current_weight_ppm=0,
@@ -174,6 +175,9 @@ def test_factor_and_drawdown_seams_honest(runtime):
 def test_concentration_cap_clips_target(runtime):
     # holding weight 60% > max_position 10% -> risk_reduction context in engine;
     # here we verify the sector clip math via a snapshot with a big sector.
+    with runtime.connect() as db:
+        seed_security(db, "sec2", sector="Tech")
+        seed_price_bars(db, "sec2", closes=[50 + (i % 7) * 0.5 for i in range(40)])
     snapshot = _snapshot(
         holdings=[
             {
@@ -217,7 +221,8 @@ def test_correlation_blocks_correlated_book(tmp_path):
         cash=8_000_000_000,
     )
     engine = RiskEngine(runtime, _policy(), snapshot)
-    result = engine.evaluate(_risk_inputs(), "2025-06-01T00:00:00Z")
+    # ledger ADV for sec1 here: mean(60..64.75) x 1M vol
+    result = engine.evaluate(_risk_inputs(adv_microusd=62_375_000_000_000), "2025-06-01T00:00:00Z")
     assert result.status == "PASS"
     correlated = result.measures.get("correlated_book_ppm", 0)
     assert correlated >= 200000  # sec2 20% weight is correlated with sec1
@@ -248,9 +253,14 @@ def test_insufficient_overlap_correlation_is_unknown(tmp_path):
         cash=8_000_000_000,
     )
     engine = RiskEngine(runtime, _policy(), snapshot)
-    result = engine.evaluate(_risk_inputs(), "2025-06-01T00:00:00Z")
-    assert result.status == "PASS"
-    assert result.measures.get("correlated_book_ppm", 0) == 0
+    result = engine.evaluate(_risk_inputs(adv_microusd=62_375_000_000_000), "2025-06-01T00:00:00Z")
+    # fail-closed: unassessable correlation on a material holding blocks the
+    # increase — it is never silently converted to zero exposure
+    assert result.status == "BLOCKED"
+    assert "correlation_unassessable" in result.reasons
+    assert result.measures.get("unassessable_holdings") == [
+        {"security_id": "sec2", "weight_ppm": 200000, "reason": "correlation_unassessable"}
+    ]
 
 
 def test_average_dollar_volume_matches_expected():

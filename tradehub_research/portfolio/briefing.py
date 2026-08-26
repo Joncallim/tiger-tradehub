@@ -54,9 +54,21 @@ def render_briefing(
     lines.append("PORTFOLIO STATUS")
     lines.append("")
 
-    # Suppressed: unchanged WATCH/HOLD names are not spam (only surfaced when
-    # the observation changed or carries a block).
-    unchanged = {block["security_id"] for block in blocks}
+    # The BLOCKED/attention set is derived from the decisions themselves:
+    # any decision whose signal/risk/final status is blocked or unknown is
+    # surfaced here — never via a separate lossy side channel that can
+    # silently drop a budget or eligibility block.
+    blocked_ids = {
+        block["security_id"] for block in blocks if block.get("reason") or block.get("status")
+    }
+    for observation in observations:
+        statuses = (
+            str(observation.get("signal_status", "")),
+            str(observation.get("risk_status", "")),
+            str(observation.get("final_status", "")),
+        )
+        if any("BLOCK" in status.upper() or "UNKNOWN" in status.upper() for status in statuses):
+            blocked_ids.add(observation["security_id"])
     surfaced_states: list[str] = []
     for observation in observations:
         security_id = observation["security_id"]
@@ -64,13 +76,17 @@ def render_briefing(
         if hasattr(current, "value"):
             current = current.value
         signal = observation["signal_status"]
-        if current in ("WATCH", "HOLD") and signal == "PASS" and security_id not in unchanged:
+        if current in ("WATCH", "HOLD") and signal == "PASS" and security_id not in blocked_ids:
             continue
         if hasattr(observation["final_status"], "value"):
             final_status = observation["final_status"].value
         else:
             final_status = observation["final_status"]
-        if final_status == "NO_ACTION" and current in ("WATCH", "HOLD"):
+        if (
+            final_status == "NO_ACTION"
+            and current in ("WATCH", "HOLD")
+            and security_id not in blocked_ids
+        ):
             continue
         surfaced_states.append(f"- {security_id}: {current} ({signal})")
     if surfaced_states:
@@ -102,11 +118,14 @@ def render_briefing(
         lines.append("- No portfolio action recommended.")
     lines.append("")
     lines.append("BLOCKED / NEEDS ATTENTION")
-    if blocks:
-        for block in blocks:
-            lines.append(f"- {block['security_id']}: {block['reason']} ({block['status']})")
-    else:
-        lines.append("- None")
+    blocked_lines: list[str] = []
+    for block in sorted(blocks, key=lambda item: (item["security_id"], item.get("reason", ""))):
+        blocked_lines.append(
+            f"- {block['security_id']}: {block['reason']} ({block.get('status', 'BLOCKED')})"
+        )
+    if not blocked_lines:
+        blocked_lines.append("- None")
+    lines.extend(blocked_lines)
     body = "\n".join(lines) + "\n"
     body_hash = D(
         BRIEFING_TAG, C({"run_id": run_id, "format_version": FORMAT_VERSION, "body": body})

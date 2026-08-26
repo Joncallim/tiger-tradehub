@@ -2,14 +2,18 @@
 
 Usage is COUNT/SUM over ``trade_proposal`` for the UTC activity date — never a
 mutable counter.  The ``portfolio_activity_day`` row binds the date to the
-FIRST run's policy and caps (first writer wins); enforcement reads the STORED
-caps, so a policy-version change cannot reset the day's allowance.  Drafts are
+FIRST run's policy, caps, AND starting cash (first writer wins); enforcement
+reads the STORED values, so a policy-version change cannot reset the day's
+allowance and a later run cannot spend the same cash twice.  Drafts are
 admitted whole (never solver-clipped) in deterministic priority order, with a
-running cash accumulator so multiple BUYs cannot collectively exceed cash.
+running cash accumulator: remaining cash = day_start_cash - SUM(admitted BUY
+notional).  PAPER SELL proceeds are NEVER credited — an unexecuted paper
+recommendation must not fund a buy.
 """
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -32,12 +36,20 @@ class BudgetState:
     max_notional_microusd: int
     used_count: int
     used_notional_microusd: int
+    day_start_cash_microusd: int | None = None
+    used_buy_notional_microusd: int = 0
 
     def admit(self, draft_notional_microusd: int) -> bool:
         return (
             self.used_count + 1 <= self.max_actionable_count
             and self.used_notional_microusd + draft_notional_microusd <= self.max_notional_microusd
         )
+
+    @property
+    def remaining_cash_microusd(self) -> int | None:
+        if self.day_start_cash_microusd is None:
+            return None
+        return self.day_start_cash_microusd - self.used_buy_notional_microusd
 
 
 class Budget:
@@ -51,8 +63,9 @@ class Budget:
         *,
         created_at: str | None = None,
         db: Any | None = None,
+        day_start_cash_microusd: int | None = None,
     ) -> BudgetState:
-        """Bind the day to the first run's policy/caps; enforce stored caps.
+        """Bind the day to the first run's policy/caps/cash; enforce stored values.
 
         Raises ValueError when an existing day row was bound to a different
         policy version (fail closed — never silently switch the allowance).
@@ -63,7 +76,8 @@ class Budget:
         context = self.database.connect() if db is None else _nullcontext(db)
         with context as db:
             existing = db.execute(
-                "SELECT policy_version,max_actionable_count,max_notional_microusd "
+                "SELECT policy_version,max_actionable_count,max_notional_microusd,"
+                "day_start_cash_microusd "
                 "FROM portfolio_activity_day WHERE activity_date=?",
                 (activity_date,),
             ).fetchone()
@@ -77,33 +91,46 @@ class Budget:
                     int(existing["max_actionable_count"]),
                     int(existing["max_notional_microusd"]),
                 )
+                stored_cash = existing["day_start_cash_microusd"]
+                if stored_cash is not None and day_start_cash_microusd is not None:
+                    if int(stored_cash) != day_start_cash_microusd:
+                        raise ValueError(
+                            f"activity date {activity_date} already bound to day_start_cash "
+                            f"{stored_cash}, run snapshot cash is {day_start_cash_microusd}"
+                        )
+                day_cash = int(stored_cash) if stored_cash is not None else day_start_cash_microusd
             else:
                 caps = (
                     int(policy.budget["max_actionable_count"]),
                     int(policy.budget["max_notional_microusd"]),
                 )
+                day_cash = day_start_cash_microusd
                 material = {
                     "activity_date": activity_date,
                     "policy_version": policy.policy_version,
                     "max_actionable_count": caps[0],
                     "max_notional_microusd": caps[1],
+                    "day_start_cash_microusd": day_cash,
                 }
                 db.execute(
                     "INSERT INTO portfolio_activity_day("
                     "activity_date,policy_version,max_actionable_count,max_notional_microusd,"
-                    "input_hash,created_at) VALUES (?,?,?,?,?,?)",
+                    "day_start_cash_microusd,input_hash,created_at) VALUES (?,?,?,?,?,?,?)",
                     (
                         activity_date,
                         policy.policy_version,
                         caps[0],
                         caps[1],
+                        day_cash,
                         C(material),
                         created_at,
                     ),
                 )
             usage = db.execute(
                 "SELECT count(*) AS used_count,coalesce(sum(max_notional_microusd),0) "
-                "AS used_notional FROM trade_proposal WHERE activity_date=?",
+                "AS used_notional,coalesce(sum(CASE WHEN action='BUY' THEN "
+                "max_notional_microusd ELSE 0 END),0) AS used_buy_notional "
+                "FROM trade_proposal WHERE activity_date=?",
                 (activity_date,),
             ).fetchone()
         return BudgetState(
@@ -113,6 +140,8 @@ class Budget:
             max_notional_microusd=caps[1],
             used_count=int(usage["used_count"]),
             used_notional_microusd=int(usage["used_notional"]),
+            day_start_cash_microusd=day_cash,
+            used_buy_notional_microusd=int(usage["used_buy_notional"]),
         )
 
     @staticmethod
@@ -124,7 +153,14 @@ class Budget:
         category_priority = policy.budget["category_priority"]
         reason_priority = policy.budget["reason_priority"]
         category = str(draft.get("category", "score_band"))
-        reasons = list(draft.get("reason_codes", []))
+        raw_reasons = draft.get("reason_codes", draft.get("reason_codes_json", []))
+        if isinstance(raw_reasons, str):
+            try:
+                reasons = json.loads(raw_reasons)
+            except (TypeError, ValueError):
+                reasons = []
+        else:
+            reasons = list(raw_reasons)
         category_index = (
             category_priority.index(category)
             if category in category_priority
@@ -142,19 +178,23 @@ def admit_drafts(
     drafts: list[dict[str, Any]],
     policy: PolicySpec,
     *,
-    starting_cash_microusd: int | None,
+    starting_cash_microusd: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Admit drafts whole in deterministic order; returns (admitted, rejected).
 
-    ``starting_cash_microusd`` None disables the cash accumulator (unknown
-    cash can only occur for SELL-only contexts; BUY drafts with unknown cash
-    are blocked earlier by risk).
+    Cash enforcement uses the DAY-BOUND starting cash (first writer wins),
+    never the per-run snapshot: remaining = day_start_cash - SUM(admitted BUY
+    notional).  ``starting_cash_microusd`` is retained for API compatibility
+    but only applies when the day row carries no bound cash (SELL-only days).
+    PAPER SELL proceeds are never credited to the accumulator.
     """
     ordered = sorted(drafts, key=lambda draft: Budget.draft_sort_key(policy, draft))
     admitted: list[dict[str, Any]] = []
     rejected: dict[str, str] = {}
     remaining = budget
-    cash_remaining = starting_cash_microusd
+    cash_remaining = budget.remaining_cash_microusd
+    if cash_remaining is None:
+        cash_remaining = starting_cash_microusd
     for draft in ordered:
         notional = int(draft["max_notional_microusd"])
         action = draft.get("action")
@@ -173,10 +213,13 @@ def admit_drafts(
             max_notional_microusd=budget.max_notional_microusd,
             used_count=remaining.used_count + 1,
             used_notional_microusd=remaining.used_notional_microusd + notional,
+            day_start_cash_microusd=budget.day_start_cash_microusd,
+            used_buy_notional_microusd=(
+                remaining.used_buy_notional_microusd + notional
+                if action == Action.BUY.value
+                else remaining.used_buy_notional_microusd
+            ),
         )
-        if cash_remaining is not None:
-            if action == Action.BUY.value:
-                cash_remaining -= notional
-            elif action == Action.SELL.value:
-                cash_remaining += notional
+        if cash_remaining is not None and action == Action.BUY.value:
+            cash_remaining -= notional
     return admitted, rejected

@@ -102,14 +102,29 @@ def test_paper_policy_requires_approval():
     spec = fixture_policy_spec()
     with pytest.raises(ValueError):
         build_policy("paper-v1", PolicyStatus.PAPER, spec)
+    # a PAPER policy must not carry FIXTURE verification methods; strip them
+    paper_spec = json.loads(json.dumps(spec))
+    paper_spec["thesis_break"]["allowed_verification_methods"] = [
+        "OWNER_ATTESTED",
+        "DETERMINISTIC_RULE",
+    ]
     policy = build_policy(
         "paper-v1",
         PolicyStatus.PAPER,
-        spec,
+        paper_spec,
         approved_by="owner",
         approved_at="2025-01-01T00:00:00Z",
     )
     assert policy.policy_status == PolicyStatus.PAPER
+    # FIXTURE methods inside a PAPER policy are rejected
+    with pytest.raises(ValueError, match="FIXTURE"):
+        build_policy(
+            "paper-v2",
+            PolicyStatus.PAPER,
+            spec,
+            approved_by="owner",
+            approved_at="2025-01-01T00:00:00Z",
+        )
 
 
 def test_registry_register_get_and_collision(tmp_path):

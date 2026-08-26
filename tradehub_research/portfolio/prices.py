@@ -5,6 +5,19 @@ Sources: the evidence ledger (``evidence_event`` rows with ``record_type`` in
 decision ``as_of`` with supersession chains resolved.  All arithmetic is
 Decimal (precision 38, ROUND_HALF_UP); binary float never reaches a measure.
 
+Canonical PIT rules (mirrors ``EvidenceStore.historical``):
+- a record is visible only when its ``public_available_time <= as_of`` AND its
+  ``pat_provenance`` is approved (``source_reported`` / ``derived_from_index``);
+- the visible TERMINAL successor of a chain wins; if that terminal successor is
+  withdrawn, the whole chain resolves to NO record (a withdrawal never
+  resurrects the superseded record);
+- price bars additionally require ``session_date <= as_of`` date (a bar with a
+  future session date is never consumed for a past decision);
+- at most ONE canonical bar per security/session: identical duplicates collapse;
+  conflicting same-session bars make that session UNKNOWN;
+- corporate actions use one normalized effective date (``effective_date`` else
+  ``event_time``) everywhere, including ambiguity detection.
+
 Corporate-action convention (provisional, versioned): return over a window is
 ``(close_t * cum_factor + cum_dividend) / close_prev - 1`` where
 ``cum_factor`` is the product of split factors with effective date in the
@@ -25,6 +38,8 @@ from tradehub_research.portfolio.types import INT64_MAX, INT64_MIN
 DECIMAL_ZERO = Decimal(0)
 PRECISION = 38
 QUANTUM = Decimal("1e-12")
+
+APPROVED_PAT_PROVENANCE = ("source_reported", "derived_from_index")
 
 
 def _d(value: Any) -> Decimal:
@@ -56,15 +71,29 @@ class ReturnSeries:
         )
 
 
+def _session_key(record: dict[str, Any]) -> str:
+    """Normalized UTC date key for a record (YYYY-MM-DD)."""
+    return str(record["structured_fields"].get("session_date", record["event_time"]))[:10]
+
+
+def _action_date(record: dict[str, Any]) -> str:
+    """One normalized effective date for corporate actions."""
+    return str(
+        record["structured_fields"].get(
+            "effective_date", record["structured_fields"].get("session_date", record["event_time"])
+        )
+    )[:10]
+
+
 def _visible_records(db: Any, security_id: str, as_of: str) -> list[dict[str, Any]]:
     """Load evidence rows for a security and resolve supersession at as_of.
 
-    Returns the effective (non-withdrawn) record per supersession chain that
-    is publicly available at or before ``as_of``.  Bounded: one query.
+    Returns the effective (visible, non-withdrawn, approved-provenance)
+    record per supersession chain.  Bounded: one query.
     """
     rows = db.execute(
         "SELECT evidence_id,supersedes_evidence_id,withdrawn,event_time,"
-        "public_available_time,structured_fields,source_id "
+        "public_available_time,structured_fields,source_id,pat_provenance "
         "FROM evidence_event WHERE security_id=? ORDER BY event_time,evidence_id",
         (security_id,),
     ).fetchall()
@@ -94,19 +123,54 @@ def _visible_records(db: Any, security_id: str, as_of: str) -> list[dict[str, An
             current = by_id[successors[0]] if successors else None
         if not chain:
             continue
-        effective = None
+        # the latest VISIBLE chain member is the terminal; if it is withdrawn
+        # the chain resolves to NO record (a withdrawal never resurrects the
+        # superseded predecessor)
+        visible_terminal: dict[str, Any] | None = None
         for item in chain:
             pat = item["public_available_time"]
-            if pat is not None and pat <= as_of and not item["withdrawn"]:
-                effective = item
-        if effective is not None:
-            visible.append(effective)
+            if pat is not None and pat <= as_of:
+                visible_terminal = item
+        if visible_terminal is None or visible_terminal["withdrawn"]:
+            continue
+        if visible_terminal["pat_provenance"] not in APPROVED_PAT_PROVENANCE:
+            continue
+        visible.append(visible_terminal)
     return visible
 
 
-def _bar_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    bars = [r for r in records if r["structured_fields"].get("record_type") == "price_bar"]
-    return sorted(bars, key=lambda r: r["structured_fields"].get("session_date", r["event_time"]))
+def _bar_records(records: list[dict[str, Any]], as_of: str) -> list[dict[str, Any]]:
+    """Canonical bars: session cutoff, one bar per session (UNKNOWN on conflict).
+
+    Identical duplicate bars for one session collapse; distinct conflicting
+    bars for one session make that session UNKNOWN (excluded).  Bars with a
+    session date after ``as_of`` are never consumed.
+    """
+    cutoff_date = as_of[:10]
+    bars = [
+        r
+        for r in records
+        if r["structured_fields"].get("record_type") == "price_bar"
+        and _session_key(r) <= cutoff_date
+    ]
+    bars.sort(key=lambda r: (_session_key(r), r["evidence_id"]))
+    canonical: list[dict[str, Any]] = []
+    index = 0
+    while index < len(bars):
+        session = _session_key(bars[index])
+        group: list[dict[str, Any]] = []
+        while index < len(bars) and _session_key(bars[index]) == session:
+            group.append(bars[index])
+            index += 1
+        if len(group) == 1:
+            canonical.append(group[0])
+            continue
+        # multiple records for one session: collapse byte-identical dups
+        serialized = {json.dumps(r["structured_fields"], sort_keys=True) for r in group}
+        if len(serialized) == 1:
+            canonical.append(group[0])
+        # conflicting same-session bars -> session is UNKNOWN, excluded
+    return canonical
 
 
 def _action_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -122,48 +186,33 @@ def _cumulative_adjustments(
 
     Returns (None, None) when the adjustment chain is ambiguous.
     """
-    window_actions = [
-        r
-        for r in actions
-        if window_start
-        < r["structured_fields"].get("effective_date", r["event_time"])
-        <= window_end
-    ]
+    window_actions = [r for r in actions if window_start < _action_date(r) <= window_end[:10]]
     if not window_actions:
         return Decimal(1), Decimal(0)
-    same_day = [r for r in window_actions if r["structured_fields"].get("record_type") == "split"]
-    same_day_dividends = [
+    splits = [r for r in window_actions if r["structured_fields"].get("record_type") == "split"]
+    dividends = [
         r for r in window_actions if r["structured_fields"].get("record_type") == "dividend"
     ]
-    for split in same_day:
-        for dividend in same_day_dividends:
-            if split["structured_fields"].get("effective_date") == dividend[
-                "structured_fields"
-            ].get("effective_date"):
+    for split in splits:
+        for dividend in dividends:
+            if _action_date(split) == _action_date(dividend):
                 return None, None  # ambiguous same-day split+dividend
     cum_factor = Decimal(1)
-    splits: list[tuple[str, Decimal]] = []
-    for split in sorted(
-        (r for r in window_actions if r["structured_fields"].get("record_type") == "split"),
-        key=lambda r: r["structured_fields"].get("effective_date", r["event_time"]),
-    ):
+    split_dates: list[tuple[str, Decimal]] = []
+    for split in sorted(splits, key=_action_date):
         factor = _d(split["structured_fields"].get("factor", 1))
         if factor <= 0:
             return None, None
         cum_factor *= factor
-        splits.append(
-            (split["structured_fields"].get("effective_date", split["event_time"]), factor)
-        )
+        split_dates.append((_action_date(split), factor))
     cum_dividend = Decimal(0)
-    for dividend in window_actions:
-        if dividend["structured_fields"].get("record_type") != "dividend":
-            continue
+    for dividend in dividends:
         cash = _d(dividend["structured_fields"].get("cash", 0))
         if cash < 0:
             return None, None
-        effective = dividend["structured_fields"].get("effective_date", dividend["event_time"])
+        effective = _action_date(dividend)
         multiplier = Decimal(1)
-        for split_date, factor in splits:
+        for split_date, factor in split_dates:
             if split_date <= effective:
                 multiplier *= factor
         cum_dividend += cash * multiplier
@@ -175,9 +224,9 @@ def total_return_series(
     security_id: str,
     as_of: str,
 ) -> ReturnSeries:
-    """Daily total-return series from PIT-visible bars and corporate actions."""
+    """Daily total-return series from PIT-visible canonical bars and actions."""
     records = _visible_records(db, security_id, as_of)
-    bars = _bar_records(records)
+    bars = _bar_records(records, as_of)
     actions = _action_records(records)
     dates: list[str] = []
     returns: list[Decimal] = []
@@ -186,14 +235,14 @@ def total_return_series(
     for bar in bars:
         fields = bar["structured_fields"]
         close = fields.get("close")
-        session_date = fields.get("session_date", bar["event_time"])
+        session_date = _session_key(bar)
         if close is None or _d(close) <= 0:
             previous = None
             continue  # zero/invalid price breaks the return chain
         if previous is not None:
             previous_fields = previous["structured_fields"]
             previous_close = previous_fields.get("close")
-            previous_session = previous_fields.get("session_date", previous["event_time"])
+            previous_session = _session_key(previous)
             if previous_close is not None and _d(previous_close) > 0:
                 adjustments = _cumulative_adjustments(actions, previous_session, session_date)
                 if adjustments == (None, None):
@@ -208,13 +257,20 @@ def total_return_series(
                 daily_return = _q(numerator / denominator - Decimal(1))
                 dates.append(session_date)
                 returns.append(daily_return)
-                evidence_ids.append(bar["evidence_id"])
+                # lineage: both endpoint bars plus every action in the window
+                dependency_ids = [previous["evidence_id"], bar["evidence_id"]]
+                for action in actions:
+                    if previous_session < _action_date(action) <= session_date:
+                        dependency_ids.append(action["evidence_id"])
+                evidence_ids.append(",".join(sorted(set(dependency_ids))))
         previous = bar
     return ReturnSeries(tuple(dates), tuple(returns), tuple(evidence_ids))
 
 
 def sample_volatility(series: ReturnSeries, window: int, min_observations: int) -> Decimal | None:
-    """Annualized sample volatility (Decimal, daily stdev * sqrt(sessions))."""
+    """Daily sample volatility (Decimal, stdev); None when unusable."""
+    if min_observations < 2:
+        min_observations = 2  # a 1-observation variance is undefined
     tail = series.tail(window) if len(series) > window else series
     if len(tail) < min_observations:
         return None
@@ -263,12 +319,15 @@ def paired_correlation(
 def average_dollar_volume(
     db: Any, security_id: str, as_of: str, window: int, min_observations: int
 ) -> int | None:
-    """Arithmetic mean of close*volume over the trailing window, in micro-USD."""
+    """Arithmetic mean of close*volume over the trailing window, in micro-USD.
+
+    Counts distinct sessions (canonical bars), never duplicate rows.
+    """
     records = _visible_records(db, security_id, as_of)
-    bars = _bar_records(records)[-window:]
+    bars = _bar_records(records, as_of)[-window:]
     if len(bars) < min_observations:
         return None
-    total = 0
+    total = Decimal(0)
     for bar in bars:
         fields = bar["structured_fields"]
         close = fields.get("close")
@@ -284,9 +343,9 @@ def average_dollar_volume(
 
 
 def latest_close_microusd(db: Any, security_id: str, as_of: str) -> tuple[int | None, str | None]:
-    """Most recent PIT-visible close (micro-USD) and its session date."""
+    """Most recent PIT-visible canonical close (micro-USD) and its session date."""
     records = _visible_records(db, security_id, as_of)
-    bars = _bar_records(records)
+    bars = _bar_records(records, as_of)
     if not bars:
         return None, None
     bar = bars[-1]
@@ -294,4 +353,4 @@ def latest_close_microusd(db: Any, security_id: str, as_of: str) -> tuple[int | 
     if close is None or _d(close) <= 0:
         return None, None
     micro = (_d(close) * Decimal(1_000_000)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
-    return int(micro), bar["structured_fields"].get("session_date", bar["event_time"])
+    return int(micro), _session_key(bar)

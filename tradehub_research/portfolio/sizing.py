@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from tradehub_research.portfolio.policy import PolicySpec
-from tradehub_research.portfolio.types import Action, assert_int64
+from tradehub_research.portfolio.types import Action, State, assert_int64
 
 PPM = 1_000_000
 
@@ -30,6 +30,7 @@ class SizingResult:
     action: Action | None
     reason: str
     detail: dict[str, Any]
+    effective_state: State | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -41,6 +42,7 @@ class SizingResult:
             "action": self.action.value if self.action else None,
             "reason": self.reason,
             "detail": dict(self.detail),
+            "effective_state": self.effective_state.value if self.effective_state else None,
         }
 
 
@@ -264,19 +266,38 @@ def size_sell(
         )
     if full_exit and sell_quantity < current_quantity_microunits:
         # Infeasible full EXIT (not enough trusted sellable capacity): degrade
-        # deterministically to a TRIM proposal.
-        return size_sell(
-            policy,
+        # deterministically to a TRIM proposal AND carry the effective state —
+        # the ledger must record HOLD->TRIM, never HOLD->EXIT with a residual.
+        # The TRIM sells the capped sellable quantity and derives the target
+        # weight from it (a target-delta trim would under-sell the capacity).
+        degraded_quantity = sell_quantity
+        degraded_notional = max_notional
+        degraded_target = max(
+            0,
+            current_weight_ppm
+            - (degraded_quantity * mark_price_microusd * PPM) // (nav_microusd * PPM),
+        )
+        if degraded_quantity <= 0 or degraded_notional <= 0:
+            return SizingResult(
+                target_weight_ppm=current_weight_ppm,
+                current_weight_ppm=current_weight_ppm,
+                max_quantity_microunits=0,
+                completion_quantity_microunits=current_quantity_microunits,
+                max_notional_microusd=0,
+                action=None,
+                reason="no_action_zero_sell",
+                detail=detail,
+            )
+        return SizingResult(
+            target_weight_ppm=degraded_target,
             current_weight_ppm=current_weight_ppm,
-            current_quantity_microunits=current_quantity_microunits,
-            sellable_quantity_microunits=sell_quantity,
-            mark_price_microusd=mark_price_microusd,
-            nav_microusd=nav_microusd,
-            quantity_increment_microunits=quantity_increment_microunits,
-            full_exit=False,
-            min_action_notional_microusd=min_action_notional_microusd,
-            adv_microusd=adv_microusd,
-            max_adv_participation_ppm=max_adv_participation_ppm,
+            max_quantity_microunits=degraded_quantity,
+            completion_quantity_microunits=current_quantity_microunits - degraded_quantity,
+            max_notional_microusd=degraded_notional,
+            action=Action.SELL,
+            reason="exit_degraded_to_trim",
+            detail={**detail, "mode": "trim", "full_exit_degraded": True},
+            effective_state=State.TRIM,
         )
     completion = current_quantity_microunits - sell_quantity
     assert_int64(sell_quantity, "max_quantity_microunits")

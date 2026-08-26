@@ -41,6 +41,24 @@ def _validate_status(value: Any, path: str, *, known_only: bool = False) -> Valu
     return ValueStatus(value)
 
 
+def _validate_security_id(value: Any, path: str) -> str:
+    """Strict one-line identifier grammar: no control characters, bounded.
+
+    Rendered identifiers (briefings, JSON) must never carry newlines or
+    control characters: a poisoned security_id must not be able to inject
+    fake sections or instructions into human-facing output.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{path} must be a non-empty string")
+    if len(value) > 64:
+        raise ValueError(f"{path} exceeds 64 characters")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError(f"{path} contains control characters")
+    if "\n" in value or "\r" in value:
+        raise ValueError(f"{path} must be a single line")
+    return value
+
+
 def _orthogonal(value: Any, status: str, path: str) -> None:
     """Value presence must match status: KNOWN/STALE => value, UNKNOWN => None."""
     if status == "UNKNOWN":
@@ -179,10 +197,19 @@ def build_snapshot(
     _validate_status(holdings_status, "holdings_status")
     _orthogonal(cash_microusd, cash_status, "cash_microusd")
     _orthogonal(nav_microusd, valuation_status, "nav_microusd")
-    if cash_microusd is not None and cash_microusd < 0:
-        raise ValueError("cash_microusd cannot be negative")
-    if nav_microusd is not None and nav_microusd <= 0:
-        raise ValueError("nav_microusd must be positive")
+    if cash_microusd is not None and (
+        not isinstance(cash_microusd, int) or isinstance(cash_microusd, bool) or cash_microusd < 0
+    ):
+        raise ValueError("cash_microusd must be a non-negative integer")
+    if nav_microusd is not None and (
+        not isinstance(nav_microusd, int) or isinstance(nav_microusd, bool) or nav_microusd <= 0
+    ):
+        raise ValueError("nav_microusd must be a positive integer")
+    if holdings_status == "UNKNOWN" and holdings:
+        raise ValueError(
+            "holdings_status=UNKNOWN cannot carry child holding rows: unknown "
+            "holdings must never be trusted as an empty book"
+        )
     if provenance is None:
         provenance = {"kind": "fixture"}
     if not isinstance(provenance, dict):
@@ -190,15 +217,20 @@ def build_snapshot(
 
     seen: set[str] = set()
     for row in holdings:
-        security_id = row.get("security_id")
-        if not isinstance(security_id, str) or not security_id:
-            raise ValueError("holding security_id required")
+        security_id = _validate_security_id(row.get("security_id"), "holding security_id")
         if security_id in seen:
             raise ValueError(f"duplicate holding {security_id!r}")
         seen.add(security_id)
         quantity = row.get("quantity_microunits")
         if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 0:
             raise ValueError(f"holding {security_id} quantity_microunits invalid")
+        quantity_status = _validate_status(
+            row.get("quantity_status", "KNOWN"), f"holding {security_id}.quantity_status"
+        )
+        if quantity_status != "KNOWN" and quantity != 0:
+            raise ValueError(
+                f"holding {security_id} quantity must be zero when quantity_status is not KNOWN"
+            )
         sellable_status = _validate_status(
             row.get("sellable_status", "KNOWN"), f"holding {security_id}.sellable_status"
         )
@@ -206,6 +238,8 @@ def build_snapshot(
         _orthogonal(
             sellable, sellable_status.value, f"holding {security_id}.sellable_quantity_microunits"
         )
+        if sellable is not None and (not isinstance(sellable, int) or isinstance(sellable, bool)):
+            raise ValueError(f"holding {security_id} sellable_quantity must be an integer")
         if sellable is not None and not 0 <= sellable <= quantity:
             raise ValueError(f"holding {security_id} sellable quantity outside [0, quantity]")
         valuation = _validate_status(
@@ -213,6 +247,10 @@ def build_snapshot(
         )
         market_value = row.get("market_value_microusd")
         _orthogonal(market_value, valuation.value, f"holding {security_id}.market_value_microusd")
+        if market_value is not None and (
+            not isinstance(market_value, int) or isinstance(market_value, bool)
+        ):
+            raise ValueError(f"holding {security_id} market_value must be an integer")
         if market_value is not None and market_value < 0:
             raise ValueError(f"holding {security_id} market_value cannot be negative")
         sector_status = _validate_status(
@@ -227,9 +265,7 @@ def build_snapshot(
 
     seen_market: set[str] = set()
     for row in market_inputs:
-        security_id = row.get("security_id")
-        if not isinstance(security_id, str) or not security_id:
-            raise ValueError("market input security_id required")
+        security_id = _validate_security_id(row.get("security_id"), "market input security_id")
         if security_id in seen_market:
             raise ValueError(f"duplicate market input {security_id!r}")
         seen_market.add(security_id)
@@ -240,8 +276,8 @@ def build_snapshot(
         price_as_of = row.get("price_as_of")
         _orthogonal(mark, price_status.value, f"market {security_id}.mark_price_microusd")
         _orthogonal(price_as_of, price_status.value, f"market {security_id}.price_as_of")
-        if mark is not None and mark <= 0:
-            raise ValueError(f"market {security_id} mark_price must be positive")
+        if mark is not None and (not isinstance(mark, int) or isinstance(mark, bool) or mark <= 0):
+            raise ValueError(f"market {security_id} mark_price must be a positive integer")
         liquidity_status = _validate_status(
             row.get("liquidity_status", "KNOWN"), f"market {security_id}.liquidity_status"
         )
@@ -251,8 +287,10 @@ def build_snapshot(
         _orthogonal(
             liquidity_as_of, liquidity_status.value, f"market {security_id}.liquidity_as_of"
         )
-        if adv is not None and adv < 0:
-            raise ValueError(f"market {security_id} avg_dollar_volume cannot be negative")
+        if adv is not None and (not isinstance(adv, int) or isinstance(adv, bool) or adv < 0):
+            raise ValueError(
+                f"market {security_id} avg_dollar_volume must be a non-negative integer"
+            )
         evidence_ids = row.get("evidence_ids", [])
         if not isinstance(evidence_ids, list) or any(
             not isinstance(item, str) for item in evidence_ids
@@ -290,8 +328,16 @@ def build_snapshot(
     )
     input_hash = C(material)
     snapshot_id = D(SNAPSHOT_TAG, input_hash)
-    normalized_holdings = tuple(_normalize_holding(row) for row in holdings)
-    normalized_market = tuple(_normalize_market_input(row) for row in market_inputs)
+    # Storage order is canonicalized by security_id so identity and iteration
+    # order can never diverge (a reordered input yields the same snapshot AND
+    # the same briefing/correlation iteration order).
+    normalized_holdings = tuple(
+        _normalize_holding(row) for row in sorted(holdings, key=lambda item: item["security_id"])
+    )
+    normalized_market = tuple(
+        _normalize_market_input(row)
+        for row in sorted(market_inputs, key=lambda item: item["security_id"])
+    )
     return PortfolioSnapshot(
         snapshot_id=snapshot_id,
         input_hash=input_hash,
@@ -311,6 +357,7 @@ def build_snapshot(
 def _normalize_holding(row: dict[str, Any]) -> dict[str, Any]:
     """Rewrite a holding row with explicit status fields (KNOWN when present)."""
     normalized = dict(row)
+    normalized.setdefault("quantity_status", "KNOWN")
     if (
         normalized.get("market_value_microusd") is None
         and normalized.get("valuation_status") is None
@@ -359,8 +406,7 @@ def build_signal_input(
     evidence_ids: list[str] | None = None,
 ) -> SignalInput:
     """Validate a signal input and derive its deterministic identity."""
-    if not isinstance(security_id, str) or not security_id:
-        raise ValueError("signal input security_id required")
+    security_id = _validate_security_id(security_id, "signal input security_id")
     if opportunity_status is None:
         opportunity_status = "KNOWN" if remaining_opportunity_ppm is not None else "UNKNOWN"
     _validate_status(opportunity_status, "opportunity_status")
@@ -420,6 +466,7 @@ class SnapshotStore:
                 if existing["input_hash"] != snapshot.input_hash:
                     raise ValueError("snapshot_id exists with different content (byte mismatch)")
                 return snapshot.snapshot_id
+            self._validate_evidence_references(db, snapshot)
             db.execute(
                 "INSERT INTO portfolio_snapshot("
                 "snapshot_id,as_of,currency,cash_microusd,cash_status,nav_microusd,"
@@ -477,6 +524,57 @@ class SnapshotStore:
                     ),
                 )
         return snapshot.snapshot_id
+
+    def _validate_evidence_references(self, db: Any, snapshot: PortfolioSnapshot) -> None:
+        """Every referenced evidence ID must exist, match the security, and be
+        a price/action record — an unauthenticated citation must not be able to
+        underpin KNOWN market inputs."""
+        import json as _json
+
+        references: list[tuple[str, str]] = []  # (security_id, evidence_id)
+        for row in snapshot.market_inputs:
+            for evidence_id in row.get("evidence_ids", []):
+                references.append((row["security_id"], evidence_id))
+        if not references:
+            return
+        for security_id, evidence_id in references:
+            record = db.execute(
+                "SELECT security_id,structured_fields,withdrawn,pat_provenance,"
+                "public_available_time FROM evidence_event WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchone()
+            if record is None:
+                raise ValueError(
+                    f"market input for {security_id} references unknown evidence {evidence_id!r}"
+                )
+            if record["security_id"] != security_id:
+                raise ValueError(
+                    f"market input for {security_id} references evidence of "
+                    f"another security {record['security_id']!r}"
+                )
+            fields = _json.loads(record["structured_fields"])
+            if fields.get("record_type") not in ("price_bar", "split", "dividend"):
+                raise ValueError(
+                    f"market input for {security_id} references non-price evidence "
+                    f"{evidence_id!r} (record_type={fields.get('record_type')!r})"
+                )
+            if record["withdrawn"]:
+                raise ValueError(
+                    f"market input for {security_id} references withdrawn evidence {evidence_id!r}"
+                )
+            if record["pat_provenance"] not in ("source_reported", "derived_from_index"):
+                raise ValueError(
+                    f"market input for {security_id} references evidence {evidence_id!r} "
+                    f"with non-approved provenance {record['pat_provenance']!r}"
+                )
+            if (
+                record["public_available_time"] is not None
+                and record["public_available_time"] > snapshot.as_of
+            ):
+                raise ValueError(
+                    f"market input for {security_id} references future evidence {evidence_id!r} "
+                    f"(PAT {record['public_available_time']} > snapshot {snapshot.as_of})"
+                )
 
     def save_signal_input(
         self, signal: SignalInput, *, recorded_at: str | None = None, db: Any | None = None

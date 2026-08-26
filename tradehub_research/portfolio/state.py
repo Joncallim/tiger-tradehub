@@ -152,16 +152,21 @@ def pending_resolution(
     as_of: str,
     quantity_tolerance_microunits: int,
     pending_max_calendar_days: int,
+    quantity_status: str = "KNOWN",
 ) -> tuple[str, bool, str | None]:
     """Resolve a pending recommendation state against a trusted snapshot.
 
     Returns (outcome, satisfied, reason) where outcome is one of:
       SETTLE_HOLD / SETTLE_WATCH / TRIM_EXIT_CANDIDATE / PENDING_STALE /
       STILL_PENDING.  ``satisfied`` means the fill quantity test passed.
+    A pending state is never settled from an UNKNOWN/STALE holding quantity:
+    that would let stale data manufacture a state change.
     """
     state = current["state"]
     if state not in PENDING_STATES:
         return "NOT_PENDING", False, None
+    if quantity_status != "KNOWN":
+        return "STILL_PENDING", False, "quantity_status_not_known"
     decision_id = current["decision_id"]
     proposal = None
     if decision_id is not None:

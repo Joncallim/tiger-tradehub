@@ -55,8 +55,19 @@ def build_proposal(
     quantity_increment_microunits: int,
     limit_only: bool,
     created_at: str,
+    current_quantity_microunits: int | None = None,
+    sellable_quantity_microunits: int | None = None,
+    mark_price_microusd: int | None = None,
 ) -> dict[str, Any]:
-    """Build a validated trade_proposal row dict (no DB writes)."""
+    """Build a validated trade_proposal row dict (no DB writes).
+
+    ``current_quantity_microunits`` / ``sellable_quantity_microunits`` /
+    ``mark_price_microusd`` are the holdings-boundedness contract: when
+    supplied, SELL proposals must not exceed sellable (and never exceed
+    current quantity), and the notional must reconcile with quantity x mark
+    (within one micro-unit of rounding).  These are enforced here AND in the
+    schema trigger.
+    """
     if not reason_codes:
         raise ProposalError("proposal requires at least one reason code")
     if action == Action.BUY:
@@ -84,6 +95,25 @@ def build_proposal(
         invalid = [reason for reason in reason_codes if reason not in SELL_REASONS]
         if invalid:
             raise ProposalError(f"invalid SELL reason codes: {invalid}")
+        if proposed_state == State.EXIT and completion_quantity_microunits != 0:
+            raise ProposalError(
+                "EXIT proposal requires zero completion quantity (a residual "
+                "holding must be a TRIM, never an EXIT)"
+            )
+        if sellable_quantity_microunits is not None:
+            if max_quantity_microunits > sellable_quantity_microunits:
+                raise ProposalError(
+                    "SELL proposal exceeds trusted sellable quantity "
+                    f"({max_quantity_microunits} > {sellable_quantity_microunits})"
+                )
+            if (
+                current_quantity_microunits is not None
+                and sellable_quantity_microunits > current_quantity_microunits
+            ):
+                raise ProposalError(
+                    "sellable quantity exceeds current quantity "
+                    f"({sellable_quantity_microunits} > {current_quantity_microunits})"
+                )
     else:
         raise ProposalError(f"unknown action {action!r}")
     if not (0 <= conviction_ppm <= 1_000_000):
@@ -98,6 +128,15 @@ def build_proposal(
         raise ProposalError("completion_quantity_microunits cannot be negative")
     if max_notional_microusd <= 0:
         raise ProposalError("max_notional_microusd must be positive")
+    if mark_price_microusd is not None:
+        if mark_price_microusd <= 0:
+            raise ProposalError("mark_price_microusd must be positive")
+        implied_notional = max_quantity_microunits * mark_price_microusd // 1_000_000
+        if max_notional_microusd > implied_notional:
+            raise ProposalError(
+                "max_notional_microusd exceeds quantity x mark "
+                f"({max_notional_microusd} > {implied_notional})"
+            )
     order_constraints = {
         "paper_only": True,
         "long_only": True,

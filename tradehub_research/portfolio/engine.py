@@ -23,6 +23,7 @@ from tradehub_research.portfolio.budget import Budget
 from tradehub_research.portfolio.eligibility import evaluate_eligibility, latest_verified_break
 from tradehub_research.portfolio.policy import PolicyRegistry, PolicySpec
 from tradehub_research.portfolio.proposal import build_proposal
+from tradehub_research.portfolio.risk import KNOWN as KNOWN_STATUS
 from tradehub_research.portfolio.risk import RiskEngine, RiskInputs
 from tradehub_research.portfolio.sizing import size_buy, size_sell
 from tradehub_research.portfolio.snapshot import (
@@ -126,39 +127,128 @@ class PortfolioEngine:
             raise ValueError(f"policy {policy_version!r} is FIXTURE; not acceptable for this run")
         if policy.policy_status == PolicyStatus.PROVISIONAL and not allow_provisional:
             raise ValueError(f"policy {policy_version!r} is PROVISIONAL; pass --allow-provisional")
+        # PIT discipline: no input may be dated after the decision moment.
+        if snapshot.as_of > as_of:
+            raise ValueError(f"snapshot as_of {snapshot.as_of!r} is after decision_as_of {as_of!r}")
         signals = signals or []
-        signal_ids = sorted(signal.signal_input_id for signal in signals)
-        signal_set_hash = C(signal_ids)
-        invocation_key = D(
-            INVOCATION_TAG,
-            C(
-                {
-                    "pipeline_run_id": pipeline_run_id,
-                    "policy_version": policy_version,
-                    "snapshot_id": snapshot.snapshot_id,
-                    "signal_set_hash": signal_set_hash,
-                    "decision_as_of": as_of,
-                }
-            ),
+        signal_by_id: dict[str, SignalInput] = {}
+        for signal in signals:
+            if signal.as_of > as_of:
+                raise ValueError(
+                    f"signal {signal.security_id!r} as_of {signal.as_of!r} is after "
+                    f"decision_as_of {as_of!r}"
+                )
+            if signal.security_id in signal_by_id:
+                raise ValueError(
+                    f"more than one signal input for security {signal.security_id!r}; "
+                    "exactly one signal per security is required"
+                )
+            signal_by_id[signal.security_id] = signal
+        signal_mapping_hash = C(
+            sorted((f"{sid}:{signal.signal_input_id}" for sid, signal in signal_by_id.items()))
         )
 
         with self.database.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+
+            # Resolve the decision-driving world state BEFORE any idempotency
+            # lookup: scores, state head, observations, verified breaks,
+            # market evidence, and budget prestate all bind the invocation.
+            score_rows = self._pinned_scores(db, pipeline_run_id, as_of)
+            score_by_security: dict[str, dict[str, Any]] = {}
+            for row in score_rows:
+                security_id = row["security_id"]
+                if security_id in score_by_security:
+                    raise ValueError(
+                        f"multiple pinned score snapshots for security {security_id!r} in "
+                        f"pipeline run {pipeline_run_id!r}; exactly one terminal score per "
+                        "security is required (fail closed)"
+                    )
+                score_by_security[security_id] = row
+            candidate_ids = self._candidate_set(db, snapshot, score_by_security, as_of)
+            self._require_known_securities(db, candidate_ids)
+            self._reconcile_holding_valuations(policy, snapshot)
+
+            activity_date = as_of[:10]
+            state_prestate_hash = self._state_prestate_hash(db, candidate_ids, as_of)
+            observation_prestate_hash = self._observation_prestate_hash(
+                db, candidate_ids, policy, as_of
+            )
+            thesis_prestate_hash = self._thesis_prestate_hash(db, candidate_ids, as_of)
+            market_prestate_hash = self._market_prestate_hash(db, candidate_ids, as_of)
+            budget_prestate = self._budget_prestate(db, activity_date, policy, as_of)
+            budget_prestate_hash = C(budget_prestate)
+
+            score_ids = sorted({row["snapshot_id"] for row in score_rows})
+            score_set_hash = C(score_ids)
+            candidate_set_hash = C(sorted(candidate_ids))
+            invocation_key = D(
+                INVOCATION_TAG,
+                C(
+                    {
+                        "pipeline_run_id": pipeline_run_id,
+                        "policy_version": policy_version,
+                        "snapshot_id": snapshot.snapshot_id,
+                        "signal_mapping_hash": signal_mapping_hash,
+                        "score_set_hash": score_set_hash,
+                        "state_prestate_hash": state_prestate_hash,
+                        "observation_prestate_hash": observation_prestate_hash,
+                        "thesis_prestate_hash": thesis_prestate_hash,
+                        "market_data_prestate_hash": market_prestate_hash,
+                        "budget_prestate_hash": budget_prestate_hash,
+                        "decision_as_of": as_of,
+                    }
+                ),
+            )
             existing_run = db.execute(
                 "SELECT * FROM portfolio_run WHERE invocation_key=?", (invocation_key,)
             ).fetchone()
             if existing_run is not None:
+                stored_input_hash = existing_run["input_hash"]
+                input_hash = C(
+                    {
+                        "invocation_key": invocation_key,
+                        "state_prestate_hash": state_prestate_hash,
+                        "observation_prestate_hash": observation_prestate_hash,
+                        "thesis_prestate_hash": thesis_prestate_hash,
+                        "market_data_prestate_hash": market_prestate_hash,
+                        "budget_prestate_hash": budget_prestate_hash,
+                        "policy_spec_hash": policy.spec_hash,
+                        "score_set_hash": score_set_hash,
+                        "signal_mapping_hash": signal_mapping_hash,
+                        "candidate_set_hash": candidate_set_hash,
+                    }
+                )
+                if stored_input_hash != input_hash:
+                    raise ValueError(
+                        "portfolio run exists for this invocation but its input hash differs; "
+                        "world state changed under the same invocation — use a new decision_as_of"
+                    )
                 briefing = db.execute(
                     "SELECT body_text,body_hash FROM portfolio_briefing WHERE run_id=?",
                     (existing_run["run_id"],),
                 ).fetchone()
+                observation_count = db.execute(
+                    "SELECT count(*) FROM portfolio_state_observation WHERE run_id=?",
+                    (existing_run["run_id"],),
+                ).fetchone()[0]
+                transition_count = db.execute(
+                    "SELECT count(*) FROM portfolio_state_transition WHERE decision_id IN "
+                    "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
+                    (existing_run["run_id"],),
+                ).fetchone()[0]
+                proposal_count = db.execute(
+                    "SELECT count(*) FROM trade_proposal WHERE decision_id IN "
+                    "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
+                    (existing_run["run_id"],),
+                ).fetchone()[0]
                 return RunSummary(
                     run_id=existing_run["run_id"],
                     invocation_key=invocation_key,
                     status="REUSED",
-                    observation_count=0,
-                    transition_count=0,
-                    proposal_count=0,
+                    observation_count=observation_count,
+                    transition_count=transition_count,
+                    proposal_count=proposal_count,
                     briefing=briefing["body_text"] if briefing else "",
                     briefing_hash=briefing["body_hash"] if briefing else "",
                     reused=True,
@@ -166,36 +256,20 @@ class PortfolioEngine:
 
             # Equality-insert immutable inputs inside this transaction.
             self.snapshots.save_snapshot(snapshot, recorded_at=created_at, db=db)
-            signal_by_id: dict[str, SignalInput] = {}
             for signal in signals:
                 self.snapshots.save_signal_input(signal, recorded_at=created_at, db=db)
-                signal_by_id[signal.security_id] = signal
 
-            score_rows = self._pinned_scores(db, pipeline_run_id)
-            score_by_security: dict[str, dict[str, Any]] = {}
-            for row in score_rows:
-                score_by_security.setdefault(row["security_id"], row)
-            candidate_ids = self._candidate_set(db, snapshot, score_by_security, as_of)
-            self._require_known_securities(db, candidate_ids)
-
-            activity_date = as_of[:10]
-            state_prestate_hash = self._state_prestate_hash(db, candidate_ids, as_of)
-            market_prestate_hash = self._market_prestate_hash(db, candidate_ids, as_of)
-            budget_prestate = self._budget_prestate(db, activity_date, policy)
-            budget_prestate_hash = C(budget_prestate)
-
-            score_ids = sorted({row["snapshot_id"] for row in score_rows})
-            score_set_hash = C(score_ids)
-            candidate_set_hash = C(sorted(candidate_ids))
             input_hash = C(
                 {
                     "invocation_key": invocation_key,
                     "state_prestate_hash": state_prestate_hash,
+                    "observation_prestate_hash": observation_prestate_hash,
+                    "thesis_prestate_hash": thesis_prestate_hash,
                     "market_data_prestate_hash": market_prestate_hash,
                     "budget_prestate_hash": budget_prestate_hash,
                     "policy_spec_hash": policy.spec_hash,
                     "score_set_hash": score_set_hash,
-                    "signal_set_hash": signal_set_hash,
+                    "signal_mapping_hash": signal_mapping_hash,
                     "candidate_set_hash": candidate_set_hash,
                 }
             )
@@ -213,7 +287,7 @@ class PortfolioEngine:
                     snapshot.snapshot_id,
                     policy.policy_version,
                     score_set_hash,
-                    signal_set_hash,
+                    signal_mapping_hash,
                     candidate_set_hash,
                     invocation_key,
                     state_prestate_hash,
@@ -228,7 +302,11 @@ class PortfolioEngine:
             # --- per-security decisions (in memory; nothing written yet) ----
             risk_engine = RiskEngine(db, policy, snapshot)
             budget_state = Budget(self.database).bind_day(
-                activity_date, policy, created_at=created_at, db=db
+                activity_date,
+                policy,
+                created_at=created_at,
+                db=db,
+                day_start_cash_microusd=snapshot.cash_microusd,
             )
             decisions: list[dict[str, Any]] = []
             for security_id in sorted(candidate_ids):
@@ -254,7 +332,6 @@ class PortfolioEngine:
                 budget_state,
                 drafts,
                 policy,
-                starting_cash_microusd=snapshot.cash_microusd,
             )
             admitted_by_security = {draft["security_id"]: draft for draft in admitted_drafts}
 
@@ -270,6 +347,13 @@ class PortfolioEngine:
                     reason = rejected.get(security_id, "daily_budget_exhausted")
                     decision["final_status"] = FinalStatus.BLOCKED
                     decision["reason_codes"] = sorted(set(decision["reason_codes"] + [reason]))
+                    decision["blocks"].append(
+                        {
+                            "security_id": security_id,
+                            "state": decision["current_state"].value,
+                            "reason": reason,
+                        }
+                    )
 
             # Phase B: observations.
             observations = [self._observation_row(decision) for decision in decisions]
@@ -358,19 +442,54 @@ class PortfolioEngine:
     # input helpers
     # ------------------------------------------------------------------
 
-    def _pinned_scores(self, db: Any, pipeline_run_id: str) -> list[dict[str, Any]]:
+    def _pinned_scores(self, db: Any, pipeline_run_id: str, as_of: str) -> list[dict[str, Any]]:
         rows = db.execute(
             "SELECT s.snapshot_id,s.candidate_id,c.security_id,s.conviction,s.data_quality,"
             "s.committee_agreement,s.trajectory_label,s.change_cause,s.material_change_time,"
             "s.prior_conviction,s.conviction_delta,s.scored_evidence_hash,s.score_input_hash,"
-            "s.reason_codes_json,s.scoring_config_hash "
+            "s.reason_codes_json,s.scoring_config_hash,s.computed_at "
             "FROM score_snapshot s JOIN committee_run r ON r.committee_run_id=s.committee_run_id "
             "JOIN candidate c ON c.candidate_id=s.candidate_id "
-            "WHERE r.pipeline_run_id=? "
-            "ORDER BY c.security_id,s.material_change_time,s.snapshot_id",
-            (pipeline_run_id,),
+            "WHERE r.pipeline_run_id=? AND s.computed_at<=? "
+            "ORDER BY c.security_id,s.computed_at DESC,s.material_change_time DESC,s.snapshot_id",
+            (pipeline_run_id, as_of),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def _reconcile_holding_valuations(
+        self, policy: PolicySpec, snapshot: PortfolioSnapshot
+    ) -> None:
+        """Quantity x mark must reconcile with the claimed holding market value.
+
+        A snapshot whose market value understates quantity x mark bypasses
+        concentration caps and can manufacture ADD proposals.  Divergence
+        beyond ``snapshot_tolerance_ppm`` blocks the run (fail closed).
+        """
+        tolerance = int(policy.risk.get("snapshot_tolerance_ppm", 0))
+        for holding in snapshot.holdings:
+            security_id = holding["security_id"]
+            quantity = holding.get("quantity_microunits")
+            market_value = holding.get("market_value_microusd")
+            market_input = snapshot.market_input(security_id)
+            mark = market_input.get("mark_price_microusd") if market_input else None
+            if (
+                quantity is None
+                or market_value is None
+                or mark is None
+                or holding.get("valuation_status", "KNOWN") != "KNOWN"
+                or market_input.get("price_status", "KNOWN") != "KNOWN"
+            ):
+                continue
+            implied = quantity * mark // 1_000_000
+            if implied == 0:
+                continue
+            divergence = abs(market_value - implied) * 1_000_000 // implied
+            if divergence > tolerance:
+                raise ValueError(
+                    f"holding {security_id} market value {market_value} does not reconcile "
+                    f"with quantity x mark {implied} (divergence {divergence} ppm > "
+                    f"snapshot_tolerance_ppm {tolerance})"
+                )
 
     def _candidate_set(
         self,
@@ -403,11 +522,62 @@ class PortfolioEngine:
             raise ValueError(f"candidate securities missing from security table: {missing}")
 
     def _state_prestate_hash(self, db: Any, candidate_ids: set[str], as_of: str) -> str:
+        """State head STRICTLY BEFORE as_of.
+
+        The run's own writes carry ``effective_at == as_of``; strict-before
+        semantics keep the prestate byte-identical across an idempotent rerun
+        while still capturing every prior transition.
+        """
         pinned: list[str] = []
         for security_id in sorted(candidate_ids):
-            state = current_state(db, security_id, as_of)
-            if state["transition_id"] is not None:
-                pinned.append(f"{security_id}:{state['transition_id']}")
+            head = db.execute(
+                "SELECT transition_id FROM portfolio_state_transition "
+                "WHERE security_id=? AND effective_at<? "
+                "ORDER BY effective_at DESC,created_at DESC LIMIT 1",
+                (security_id, as_of),
+            ).fetchone()
+            if head is not None:
+                pinned.append(f"{security_id}:{head['transition_id']}")
+        return C(pinned)
+
+    def _observation_prestate_hash(
+        self, db: Any, candidate_ids: set[str], policy: PolicySpec, as_of: str
+    ) -> str:
+        """Persistence-driving observation history STRICTLY BEFORE as_of.
+
+        The current run's hypothetical observation (at ``as_of``) is excluded;
+        it is fully determined by inputs already bound into the invocation.
+        """
+        pinned: list[str] = []
+        for security_id in sorted(candidate_ids):
+            rows = db.execute(
+                "SELECT decision_id,observed_at,scored_evidence_hash,signal_status,signal_state "
+                "FROM portfolio_state_observation "
+                "WHERE security_id=? AND policy_version=? AND evidence_driven=1 AND observed_at<? "
+                "ORDER BY observed_at,decision_id",
+                (security_id, policy.policy_version, as_of),
+            ).fetchall()
+            pinned.extend(
+                f"{security_id}:{row['decision_id']}:{row['observed_at']}:"
+                f"{row['scored_evidence_hash']}:{row['signal_status']}:{row['signal_state']}"
+                for row in rows
+            )
+        return C(pinned)
+
+    def _thesis_prestate_hash(self, db: Any, candidate_ids: set[str], as_of: str) -> str:
+        """Verified thesis-break rows are part of the run identity."""
+        pinned: list[str] = []
+        for security_id in sorted(candidate_ids):
+            rows = db.execute(
+                "SELECT verification_id,status,verified_at FROM thesis_break_verification "
+                "WHERE event_id IN (SELECT event_id FROM thesis_break_event WHERE security_id=?) "
+                "AND verified_at<=? ORDER BY verified_at,verification_id",
+                (security_id, as_of),
+            ).fetchall()
+            pinned.extend(
+                f"{security_id}:{row['verification_id']}:{row['status']}:{row['verified_at']}"
+                for row in rows
+            )
         return C(pinned)
 
     def _market_prestate_hash(self, db: Any, candidate_ids: set[str], as_of: str) -> str:
@@ -422,10 +592,13 @@ class PortfolioEngine:
             )
         return C(sorted(set(ids)))
 
-    def _budget_prestate(self, db: Any, activity_date: str, policy: PolicySpec) -> dict[str, Any]:
+    def _budget_prestate(
+        self, db: Any, activity_date: str, policy: PolicySpec, as_of: str
+    ) -> dict[str, Any]:
         prior = db.execute(
-            "SELECT proposal_id,max_notional_microusd FROM trade_proposal WHERE activity_date=?",
-            (activity_date,),
+            "SELECT proposal_id,max_notional_microusd FROM trade_proposal "
+            "WHERE activity_date=? AND created_at<?",
+            (activity_date, as_of),
         ).fetchall()
         return {
             "activity_date": activity_date,
@@ -518,6 +691,9 @@ class PortfolioEngine:
                 as_of,
                 int(policy.settlement["quantity_tolerance_microunits"]),
                 int(policy.settlement["pending_max_calendar_days"]),
+                quantity_status=(
+                    holding.get("quantity_status", KNOWN_STATUS) if holding else KNOWN_STATUS
+                ),
             )
             if outcome != "STILL_PENDING" and outcome != "NOT_PENDING":
                 self._settle(
@@ -564,7 +740,15 @@ class PortfolioEngine:
             if eligibility.opportunity_blocked:
                 decision["reason_codes"] = ["opportunity_unknown"]
             elif eligibility.status == "BLOCKED":
-                decision["reason_codes"] = ["policy_ineligible"]
+                decision["reason_codes"] = [eligibility.reason_code or "policy_ineligible"]
+            if eligibility.status == "BLOCKED":
+                decision["blocks"].append(
+                    {
+                        "security_id": security_id,
+                        "state": current_state_value.value,
+                        "reason": decision["reason_codes"][0],
+                    }
+                )
             return decision
 
         edge = (current_state_value, eligibility.to_state)
@@ -590,8 +774,18 @@ class PortfolioEngine:
                 transition_ok = True
                 cause = "VERIFIED_THESIS_BREAK"
                 decision["thesis_verification_id"] = verification["verification_id"]
+                if decision.get("score_snapshot_id") is None:
+                    # a verified break acts even without a current score: the
+                    # transition lineage falls back to the break's own
+                    # detection score snapshot (schema requires lineage)
+                    decision["score_snapshot_id"] = verification.get("score_snapshot_id")
 
-        if not transition_ok and eligibility.trigger_kind == "SCORE_BAND":
+        # Every other trigger (SCORE_BAND, RISK_REDUCTION, DATA_INTEGRITY,
+        # POLICY_INELIGIBLE, THESIS_REALISED, OPPORTUNITY_COST) must satisfy
+        # cooldown AND evidence persistence — only the verified-break bypass
+        # is exempt.  This centralizes hysteresis: no trigger kind may skip
+        # persistence, and no reason is dead configuration.
+        if not transition_ok:
             if not cooldown_ok:
                 decision["final_status"] = FinalStatus.NO_ACTION
                 decision["reason_codes"] = ["cooldown_active"]
@@ -690,13 +884,16 @@ class PortfolioEngine:
             decision["reason_codes"] = [sizing_result.reason]
             return decision
 
+        # The effective proposed state may differ from the eligibility state:
+        # an infeasible full EXIT degrades to TRIM (sizing carries the truth).
+        effective_state = sizing_result.effective_state or eligibility.to_state
         transition = self._transition_row(
             decision,
             policy,
             snapshot,
             security_id,
             current_state_value,
-            eligibility.to_state,
+            effective_state,
             cause,
             as_of,
             created_at,
@@ -708,7 +905,7 @@ class PortfolioEngine:
             policy,
             snapshot,
             security_id,
-            eligibility.to_state,
+            effective_state,
             sizing_result,
             reason_code,
             activity_date,
@@ -754,8 +951,12 @@ class PortfolioEngine:
         context["sector_coverage_status"] = security["sector_coverage_status"] if security else None
         if security and security["delisted_at"] is not None and security["delisted_at"] <= as_of:
             context["policy_ineligible"] = True
-        if opportunity is not None and opportunity == 0:
+        realised_max = int(policy.thesis_break.get("realised_opportunity_max_ppm", 0))
+        if opportunity is not None and opportunity <= realised_max:
             context["thesis_realised"] = True
+        opportunity_cost_max = int(policy.thesis_break.get("opportunity_cost_max_ppm", 0))
+        if opportunity is not None and opportunity <= opportunity_cost_max:
+            context["opportunity_cost_trigger"] = True
         verified = latest_verified_break(
             db,
             security_id,
@@ -829,9 +1030,15 @@ class PortfolioEngine:
             current_state=current_state_value,
             position_present=position_present,
             trusted_quantity_microunits=holding.get("quantity_microunits") if holding else None,
+            quantity_status=holding.get("quantity_status", KNOWN_STATUS)
+            if holding
+            else KNOWN_STATUS,
             sellable_quantity_microunits=holding.get("sellable_quantity_microunits")
             if holding
             else None,
+            sellable_status=holding.get("sellable_status", KNOWN_STATUS)
+            if holding
+            else KNOWN_STATUS,
             mark_price_microusd=market_input.get("mark_price_microusd") if market_input else None,
             price_status=market_input.get("price_status", "UNKNOWN") if market_input else "UNKNOWN",
             price_as_of=market_input.get("price_as_of") if market_input else None,
@@ -839,8 +1046,13 @@ class PortfolioEngine:
             liquidity_status=market_input.get("liquidity_status", "UNKNOWN")
             if market_input
             else "UNKNOWN",
+            liquidity_as_of=market_input.get("liquidity_as_of") if market_input else None,
             nav_microusd=snapshot.nav_microusd,
+            nav_status=snapshot.valuation_status.value,
             cash_microusd=snapshot.cash_microusd,
+            cash_status=snapshot.cash_status.value,
+            holdings_status=snapshot.holdings_status.value,
+            holding_valuation_status=snapshot.valuation_status.value,
             current_weight_ppm=current_weight_ppm,
             direction=direction,
         )
@@ -861,10 +1073,13 @@ class PortfolioEngine:
         delta = score.get("conviction_delta")
         if delta is None:
             return False
+        # conviction_delta is stored in 0-100 score points (Phase 2 scale);
+        # the policy threshold is expressed in ppm.  Convert before comparing.
+        delta_ppm = int(delta) * 10_000
         threshold = int(policy.material_change["conviction_delta_ppm"])
-        if direction == "UP" and delta >= threshold:
+        if direction == "UP" and delta_ppm >= threshold:
             pass
-        elif direction == "DOWN" and delta <= -threshold:
+        elif direction == "DOWN" and delta_ppm <= -threshold:
             pass
         else:
             return False
@@ -997,8 +1212,8 @@ class PortfolioEngine:
         current: dict[str, Any],
         decision: dict[str, Any],
     ) -> str:
-        if decision.get("score_snapshot_id") is not None:
-            return decision["score_snapshot_id"]
+        # Settlement continues the ORIGINATING proposal's lineage: the score
+        # that authorized the pending action, never a newer unrelated score.
         if current["decision_id"] is not None:
             row = db.execute(
                 "SELECT score_snapshot_id FROM trade_proposal WHERE decision_id=?",
@@ -1006,6 +1221,8 @@ class PortfolioEngine:
             ).fetchone()
             if row is not None:
                 return row["score_snapshot_id"]
+        if decision.get("score_snapshot_id") is not None:
+            return decision["score_snapshot_id"]
         row = db.execute(
             "SELECT snapshot_id FROM score_snapshot s JOIN candidate c "
             "ON c.candidate_id=s.candidate_id "
@@ -1047,8 +1264,14 @@ class PortfolioEngine:
                 decision["thesis_verification_id"] = verification["verification_id"]
                 return True, "VERIFIED_THESIS_BREAK"
             return False, None
-        if eligibility.trigger_kind != "SCORE_BAND":
-            return True, "RULE_PERSISTED"
+        # Same centralization as the normal path: every non-verified trigger
+        # requires cooldown AND evidence persistence.
+        cooldown_ok = cooldown_satisfied(
+            decision.get("state_effective_at"), as_of, policy.cooldown_days(*edge)
+        )
+        decision["cooldown_satisfied"] = int(cooldown_ok)
+        if not cooldown_ok:
+            return False, None
         persistence = persistence_count(
             db,
             security_id,
@@ -1127,6 +1350,27 @@ class PortfolioEngine:
         }
 
     def _write_transition(self, db: Any, transition: dict[str, Any]) -> None:
+        # Chain continuity: effective_at must strictly advance and the latest
+        # ledger state must equal this transition's from_state — a backdated or
+        # forking write would silently corrupt the derived current state.
+        prior = db.execute(
+            "SELECT effective_at,to_state FROM portfolio_state_transition "
+            "WHERE security_id=? ORDER BY effective_at DESC,created_at DESC LIMIT 1",
+            (transition["security_id"],),
+        ).fetchone()
+        if prior is not None:
+            if transition["effective_at"] <= prior["effective_at"]:
+                raise ValueError(
+                    f"backdated transition for {transition['security_id']}: "
+                    f"new effective_at {transition['effective_at']} is not after "
+                    f"latest {prior['effective_at']}"
+                )
+            if prior["to_state"] != transition["from_state"]:
+                raise ValueError(
+                    f"transition chain discontinuity for {transition['security_id']}: "
+                    f"ledger head is {prior['to_state']} but new transition starts from "
+                    f"{transition['from_state']}"
+                )
         db.execute(
             "INSERT INTO portfolio_state_transition("
             "transition_id,decision_id,security_id,from_state,to_state,cause,reason_codes_json,"
@@ -1169,6 +1413,17 @@ class PortfolioEngine:
         created_at: str,
     ) -> dict[str, Any]:
         score = decision["score"]
+        # a scoreless decision (verified thesis break without a current score)
+        # carries neutral score-derived fields: conviction is not what
+        # authorized the action, the verified break is
+        conviction_ppm = round(score["conviction"] * 10_000) if score else 0
+        data_quality_ppm = round(score["data_quality"] * 1_000_000) if score else 0
+        agreement_ppm = (
+            round(score["committee_agreement"] * 1_000_000)
+            if score and score.get("committee_agreement") is not None
+            else 0
+        )
+        trajectory = score["trajectory_label"] if score else "STABLE"  # neutral label
         proposal = build_proposal(
             decision_id=decision["decision_id"],
             transition_id=transition["transition_id"],
@@ -1178,12 +1433,10 @@ class PortfolioEngine:
             proposed_state=proposed_state,
             action=sizing_result.action,
             reason_codes=decision["reason_codes"] or [reason_code],
-            conviction_ppm=round(score["conviction"] * 10_000),
-            data_quality_ppm=round(score["data_quality"] * 1_000_000),
-            agreement_ppm=round(score["committee_agreement"] * 1_000_000)
-            if score.get("committee_agreement") is not None
-            else 0,
-            trajectory=score["trajectory_label"],
+            conviction_ppm=conviction_ppm,
+            data_quality_ppm=data_quality_ppm,
+            agreement_ppm=agreement_ppm,
+            trajectory=trajectory,
             current_weight_ppm=sizing_result.current_weight_ppm,
             target_weight_ppm=sizing_result.target_weight_ppm,
             max_quantity_microunits=sizing_result.max_quantity_microunits,
@@ -1198,6 +1451,17 @@ class PortfolioEngine:
             ),
             limit_only=bool(policy.order_constraints["limit_only"]),
             created_at=created_at,
+            current_quantity_microunits=decision["holding"].get("quantity_microunits")
+            if decision["holding"]
+            else None,
+            sellable_quantity_microunits=decision["holding"].get("sellable_quantity_microunits")
+            if decision["holding"]
+            else None,
+            mark_price_microusd=(
+                snapshot.market_input(security_id).get("mark_price_microusd")
+                if snapshot.market_input(security_id)
+                else None
+            ),
         )
         category = (
             "verified_break"

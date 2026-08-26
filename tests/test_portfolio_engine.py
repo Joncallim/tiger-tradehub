@@ -84,7 +84,7 @@ class Runtime:
                     "security_id": "sec1",
                     "mark_price_microusd": 50_000_000,
                     "price_as_of": as_of,
-                    "avg_dollar_volume_microusd": 2_000_000_000_000,
+                    "avg_dollar_volume_microusd": 51_450_000_000_000,
                     "liquidity_as_of": as_of,
                     "evidence_ids": [f"sec1:bar:{i:03d}" for i in range(40)],
                 }
@@ -112,8 +112,10 @@ def runtime(tmp_path):
 
 
 def _holding(
-    security_id="sec1", quantity=1_000_000, value=5_000_000_000, sector="Tech", sellable=None
+    security_id="sec1", quantity=1_000_000, value=50_000_000, sector="Tech", sellable=None
 ):
+    # default value is consistent with quantity x mark (1,000,000 micro-shares
+    # at $50 = $50 = 50,000,000 micro-USD)
     return {
         "security_id": security_id,
         "quantity_microunits": quantity,
@@ -363,7 +365,7 @@ def test_verified_thesis_break_bypasses_hysteresis(runtime):
                 "security_id": "sec1",
                 "mark_price_microusd": 50_000_000,
                 "price_as_of": "2025-06-04T00:00:00Z",
-                "avg_dollar_volume_microusd": 2_000_000_000_000,
+                "avg_dollar_volume_microusd": 51_450_000_000_000,
                 "liquidity_as_of": "2025-06-04T00:00:00Z",
                 "evidence_ids": [f"sec1:bar:{i:03d}" for i in range(40)],
             }
@@ -412,7 +414,7 @@ def test_unverified_thesis_break_does_not_bypass(runtime):
     )
     snap = runtime.snapshot(
         "2025-06-03T00:00:00Z",
-        cash=5_000_000_000,
+        cash=9_950_000_000,
         nav=10_000_000_000,
         holdings=[_holding()],
         market=[
@@ -420,7 +422,7 @@ def test_unverified_thesis_break_does_not_bypass(runtime):
                 "security_id": "sec1",
                 "mark_price_microusd": 50_000_000,
                 "price_as_of": "2025-06-03T00:00:00Z",
-                "avg_dollar_volume_microusd": 2_000_000_000_000,
+                "avg_dollar_volume_microusd": 51_450_000_000_000,
                 "liquidity_as_of": "2025-06-03T00:00:00Z",
                 "evidence_ids": [f"sec1:bar:{i:03d}" for i in range(40)],
             }
@@ -575,7 +577,7 @@ def test_daily_budget_count_cap_blocks_overflow(runtime):
                     "security_id": sec,
                     "mark_price_microusd": 50_000_000,
                     "price_as_of": as_of,
-                    "avg_dollar_volume_microusd": 2_000_000_000_000,
+                    "avg_dollar_volume_microusd": 51_450_000_000_000,
                     "liquidity_as_of": as_of,
                     "evidence_ids": [f"{sec}:bar:{i:03d}" for i in range(40)],
                 }

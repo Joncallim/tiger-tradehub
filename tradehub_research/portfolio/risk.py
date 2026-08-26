@@ -1,12 +1,16 @@
 """Portfolio risk checks: concentration, sector, correlation, volatility, liquidity.
 
 BUY/ADD requires trusted holdings, NAV, cash, sector, mark, price history,
-volatility, correlation, and liquidity; any critical UNKNOWN blocks
-(``unknown_increase`` is always BLOCK).  SELL requires trusted quantity,
-sellable quantity, valuation/mark, and liquidity; unknown concentration/
-correlation/volatility is retained as LIMITED (exposure decreases), never
+volatility, correlation, and liquidity; any critical UNKNOWN or STALE input
+blocks (``unknown_increase`` is always BLOCK).  SELL requires trusted quantity,
+sellable quantity, valuation/mark, NAV, and liquidity; unknown concentration/
+correlation/volatility follows ``unknown_decrease`` (LIMITED or BLOCK), never
 relabelled PASS.  Factor and drawdown seams report NOT_AVAILABLE; a required
 seam blocks the decision — no fake exposure is ever fabricated.
+
+Correlation is fail-closed for increases: a material holding whose pairwise
+correlation cannot be computed (insufficient overlap, zero variance, missing
+history) blocks the BUY rather than silently counting as zero exposure.
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ from tradehub_research.portfolio.prices import (
 from tradehub_research.portfolio.snapshot import PortfolioSnapshot
 from tradehub_research.portfolio.types import Action, State, json_roundtrip
 
+KNOWN = "KNOWN"
+
 
 @dataclass(frozen=True)
 class RiskInputs:
@@ -34,7 +40,10 @@ class RiskInputs:
 
     ``direction`` is the PROPOSED action (BUY for ENTER/ADD, SELL for
     TRIM/EXIT); it is set from eligibility, never from the current state
-    (a HOLD security can be evaluated for either direction).
+    (a HOLD security can be evaluated for either direction).  Every
+    portfolio status (cash/NAV/holdings/valuation/quantity/sellable/
+    liquidity) is carried through so UNKNOWN/STALE can never silently
+    become trusted.
     """
 
     security_id: str
@@ -43,15 +52,22 @@ class RiskInputs:
     current_state: State
     position_present: bool
     trusted_quantity_microunits: int | None
-    sellable_quantity_microunits: int | None
-    mark_price_microusd: int | None
-    price_status: str
-    price_as_of: str | None
-    adv_microusd: int | None
-    liquidity_status: str
-    nav_microusd: int | None
-    cash_microusd: int | None
-    current_weight_ppm: int
+    quantity_status: str = KNOWN
+    sellable_quantity_microunits: int | None = None
+    sellable_status: str = KNOWN
+    mark_price_microusd: int | None = None
+    price_status: str = KNOWN
+    price_as_of: str | None = None
+    adv_microusd: int | None = None
+    liquidity_status: str = KNOWN
+    liquidity_as_of: str | None = None
+    nav_microusd: int | None = None
+    nav_status: str = KNOWN
+    cash_microusd: int | None = None
+    cash_status: str = KNOWN
+    holdings_status: str = KNOWN
+    holding_valuation_status: str = KNOWN
+    current_weight_ppm: int = 0
     direction: Action | None = None
 
 
@@ -147,16 +163,20 @@ class RiskEngine:
 
     def _correlation_with_holdings(
         self, security_id: str, as_of: str
-    ) -> tuple[dict[str, Any], list[str]]:
+    ) -> tuple[dict[str, Any], list[str], list[str]]:
         """Correlation of the candidate against each correlated holding.
 
-        Date-aligned overlapping-return Pearson; returns a dict
-        ``correlated_holdings`` (list of {security_id, weight_ppm,
-        correlation_ppm}) plus ``correlated_book_ppm``.
+        Date-aligned overlapping-return Pearson.  Returns
+        ``correlated_holdings``, ``correlated_book_ppm``, and
+        ``unassessable_holdings`` — holdings above the material-weight
+        threshold whose correlation could not be computed (insufficient
+        overlap, zero variance, or missing history).  Fail-closed callers
+        treat unassessable holdings as UNKNOWN, never as zero exposure.
         """
         risk = self.risk
         candidate_series = self._series(security_id, as_of)
         correlated: list[dict[str, Any]] = []
+        unassessable: list[dict[str, Any]] = []
         correlated_book = 0
         threshold = int(risk["correlation_threshold_ppm"])
         min_holding_weight = int(risk["min_correlated_holding_ppm"])
@@ -175,6 +195,13 @@ class RiskEngine:
             other_series = self._series(holding["security_id"], as_of)
             correlation = paired_correlation(candidate_series, other_series, window, min_overlap)
             if correlation is None:
+                unassessable.append(
+                    {
+                        "security_id": holding["security_id"],
+                        "weight_ppm": weight_ppm,
+                        "reason": "correlation_unassessable",
+                    }
+                )
                 continue
             correlation_ppm = _ppm_from_decimal(correlation)
             if correlation_ppm >= threshold:
@@ -186,7 +213,15 @@ class RiskEngine:
                     }
                 )
                 correlated_book += weight_ppm
-        return {"correlated_holdings": correlated, "correlated_book_ppm": correlated_book}, []
+        return (
+            {
+                "correlated_holdings": correlated,
+                "correlated_book_ppm": correlated_book,
+                "unassessable_holdings": unassessable,
+            },
+            [],
+            [h["security_id"] for h in unassessable],
+        )
 
     # -- composition ----------------------------------------------------------
 
@@ -203,42 +238,70 @@ class RiskEngine:
         is_sell = inputs.direction == Action.SELL
 
         # Factor / drawdown seams: honest NOT_AVAILABLE, block when required.
-        factor_available = False
-        drawdown_available = False
         if risk["factor_required"]:
             return RiskResult("BLOCKED", reasons=["factor_seam_required_unavailable"])
         if risk["drawdown_required"]:
             return RiskResult("BLOCKED", reasons=["drawdown_seam_required_unavailable"])
-        measures["factor_available"] = factor_available
-        measures["drawdown_available"] = drawdown_available
+        measures["factor_available"] = False
+        measures["drawdown_available"] = False
 
         history_measures, history_ids = self._history_measures(inputs.security_id, as_of)
         measures.update(history_measures)
         evidence_ids.extend(history_ids)
 
         if is_buy:
-            # Every critical input must be trusted for a position increase.
-            if inputs.nav_microusd is None:
+            # Every critical input must be trusted and current for an increase.
+            if inputs.nav_microusd is None or inputs.nav_status != KNOWN:
                 reasons.append("nav_unknown")
-            if inputs.cash_microusd is None:
+            if inputs.cash_microusd is None or inputs.cash_status != KNOWN:
                 reasons.append("cash_unknown")
             if inputs.sector is None:
                 reasons.append("sector_unknown")
+            if inputs.holdings_status != KNOWN:
+                reasons.append("holdings_unknown")
             if inputs.mark_price_microusd is None or inputs.price_status == "UNKNOWN":
                 reasons.append("mark_unknown")
-            if inputs.adv_microusd is None or inputs.liquidity_status == "UNKNOWN":
+            elif inputs.price_status == "STALE":
+                reasons.append("mark_stale")
+            if (
+                inputs.adv_microusd is None
+                or inputs.liquidity_status == "UNKNOWN"
+                or inputs.liquidity_as_of is None
+            ):
                 reasons.append("liquidity_unknown")
-            if inputs.position_present and inputs.trusted_quantity_microunits is None:
+            elif inputs.liquidity_status == "STALE":
+                reasons.append("liquidity_stale")
+            if inputs.position_present and (
+                inputs.trusted_quantity_microunits is None or inputs.quantity_status != KNOWN
+            ):
                 reasons.append("quantity_unknown")
             if measures.get("annualized_vol_ppm") is None:
                 reasons.append("volatility_unknown")
+            if int(measures.get("return_count", 0)) < int(risk["min_return_observations"]):
+                reasons.append("return_history_insufficient")
             if reasons:
                 return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
-            if inputs.price_status == "STALE" or _is_stale(
-                inputs.price_as_of, as_of, int(risk["price_stale_calendar_days"])
-            ):
+            if _is_stale(inputs.price_as_of, as_of, int(risk["price_stale_calendar_days"])):
                 reasons.append("mark_stale")
                 return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
+            if _is_stale(inputs.liquidity_as_of, as_of, int(risk["price_stale_calendar_days"])):
+                reasons.append("liquidity_stale")
+                return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
+            # ledger ADV is authoritative: missing or contradictory ledger
+            # liquidity blocks an increase
+            ledger_adv = measures.get("ledger_adv_microusd")
+            if ledger_adv is None:
+                reasons.append("liquidity_history_insufficient")
+                return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
+            tolerance = int(risk["snapshot_tolerance_ppm"])
+            if tolerance > 0 and inputs.adv_microusd is not None:
+                if ledger_adv == 0:
+                    reasons.append("liquidity_reconciliation_failed")
+                    return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
+                divergence = abs(inputs.adv_microusd - ledger_adv) * 1_000_000 // ledger_adv
+                if divergence > tolerance:
+                    reasons.append("liquidity_reconciliation_failed")
+                    return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
             status = "PASS"
             # --- clips (target exposure reductions, not hard blocks) ----
             nav = inputs.nav_microusd
@@ -251,8 +314,15 @@ class RiskEngine:
                 0,
                 int(risk["max_active_signal_book_ppm"]) - self._active_book_ppm(inputs.security_id),
             )
-            correlation_measures, _ = self._correlation_with_holdings(inputs.security_id, as_of)
+            correlation_measures, _, unassessable = self._correlation_with_holdings(
+                inputs.security_id, as_of
+            )
             measures.update(correlation_measures)
+            if unassessable:
+                # correlation is fail-closed for increases
+                reasons.append("correlation_unassessable")
+                measures["correlation_unassessable"] = sorted(unassessable)
+                return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
             clips["correlation"] = max(
                 0,
                 int(risk["max_correlated_book_ppm"])
@@ -282,27 +352,50 @@ class RiskEngine:
             )
 
         if is_sell:
-            # SELL requires trusted quantity/sellable/valuation/liquidity.
-            if inputs.trusted_quantity_microunits is None:
+            # SELL requires trusted quantity/sellable/valuation/NAV/liquidity.
+            if inputs.trusted_quantity_microunits is None or inputs.quantity_status != KNOWN:
                 reasons.append("quantity_unknown")
-            if inputs.sellable_quantity_microunits is None:
+            if inputs.sellable_quantity_microunits is None or inputs.sellable_status != KNOWN:
                 reasons.append("sellable_unknown")
             if inputs.mark_price_microusd is None or inputs.price_status == "UNKNOWN":
                 reasons.append("mark_unknown")
-            if inputs.adv_microusd is None or inputs.liquidity_status == "UNKNOWN":
+            elif inputs.price_status == "STALE":
+                reasons.append("mark_stale")
+            if inputs.holding_valuation_status != KNOWN:
+                reasons.append("valuation_unknown")
+            if (
+                inputs.adv_microusd is None
+                or inputs.liquidity_status == "UNKNOWN"
+                or inputs.liquidity_as_of is None
+            ):
                 reasons.append("liquidity_unknown")
+            elif inputs.liquidity_status == "STALE":
+                reasons.append("liquidity_stale")
+            if inputs.nav_microusd is None or inputs.nav_status != KNOWN:
+                reasons.append("nav_unknown")
             if reasons:
                 return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
-            if inputs.price_status == "STALE" or _is_stale(
-                inputs.price_as_of, as_of, int(risk["price_stale_calendar_days"])
-            ):
+            if _is_stale(inputs.price_as_of, as_of, int(risk["price_stale_calendar_days"])):
                 reasons.append("mark_stale")
                 return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
-            # Exposure decreases: unknown correlation/volatility is LIMITED at most.
+            if _is_stale(inputs.liquidity_as_of, as_of, int(risk["price_stale_calendar_days"])):
+                reasons.append("liquidity_stale")
+                return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
+            # Exposure decreases: unknown measures follow the policy's
+            # unknown_decrease composition (LIMITED at most, or BLOCK).
             status = "PASS"
+            unknown_measures: list[str] = []
             if measures.get("annualized_vol_ppm") is None:
+                unknown_measures.append("volatility_unknown")
+            correlation_measures, _, _ = self._correlation_with_holdings(inputs.security_id, as_of)
+            measures.update(correlation_measures)
+            if correlation_measures.get("unassessable_holdings"):
+                unknown_measures.append("correlation_unassessable")
+            if unknown_measures:
+                reasons.extend(unknown_measures)
+                if risk["unknown_decrease"] == "BLOCK":
+                    return RiskResult("BLOCKED", reasons=sorted(set(reasons)), measures=measures)
                 status = "LIMITED"
-                reasons.append("volatility_unknown")
             clips["sellable"] = int(inputs.sellable_quantity_microunits)
             return RiskResult(
                 status, clips=clips, measures=measures, reasons=reasons, evidence_ids=evidence_ids
@@ -335,7 +428,10 @@ def _is_stale(price_as_of: str | None, as_of: str, max_days: int) -> bool:
         moment = datetime.fromisoformat(normalize_ts(as_of).replace("Z", "+00:00"))
     except ValueError:
         return True
-    return (moment - price_time).days > max_days
+    age = moment - price_time
+    if age.days < 0:
+        return True  # a future timestamp is never fresh
+    return age.days > max_days
 
 
 def encode_risk_json(result: RiskResult) -> str:

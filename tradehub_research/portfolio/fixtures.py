@@ -279,6 +279,8 @@ def fixture_policy_spec() -> dict[str, Any]:
         "thesis_break": {
             "allowed_verification_methods": ["OWNER_ATTESTED", "DETERMINISTIC_RULE", "FIXTURE"],
             "max_age_calendar_days": 3,
+            "realised_opportunity_max_ppm": 0,
+            "opportunity_cost_max_ppm": 0,
         },
         "settlement": {
             "quantity_tolerance_microunits": 1000,
@@ -324,7 +326,7 @@ def fixture_policy_spec() -> dict[str, Any]:
             "annualization_sessions": 252,
             "max_annualized_vol_ppm": 600000,
             "correlation_window_sessions": 60,
-            "min_overlap_observations": 40,
+            "min_overlap_observations": 30,
             "correlation_threshold_ppm": 700000,
             "max_correlated_book_ppm": 150000,
             "min_correlated_holding_ppm": 20000,

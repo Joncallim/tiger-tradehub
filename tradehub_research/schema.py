@@ -888,6 +888,7 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             policy_version TEXT NOT NULL REFERENCES portfolio_policy(policy_version),
             max_actionable_count INTEGER NOT NULL CHECK(max_actionable_count>=0),
             max_notional_microusd INTEGER NOT NULL CHECK(max_notional_microusd>=0),
+            day_start_cash_microusd INTEGER CHECK(day_start_cash_microusd IS NULL OR day_start_cash_microusd>=0),
             input_hash TEXT NOT NULL UNIQUE CHECK(length(input_hash)=64),
             created_at TEXT NOT NULL
         );
@@ -949,6 +950,21 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             WHERE value NOT IN ('thesis_broken','thesis_realised','opportunity_cost','risk_reduction','data_integrity','policy_ineligible')
         )
         BEGIN SELECT RAISE(ABORT, 'invalid SELL reason'); END;
+        CREATE TRIGGER trade_proposal_sell_bounds_guard BEFORE INSERT ON trade_proposal
+        WHEN NEW.action='SELL' AND (
+            (NEW.completion_quantity_microunits <> 0 AND NEW.proposed_state='EXIT')
+            OR EXISTS (
+                SELECT 1 FROM portfolio_holding h JOIN portfolio_market_input m
+                ON m.snapshot_id=h.snapshot_id AND m.security_id=h.security_id
+                WHERE h.snapshot_id=NEW.portfolio_snapshot_id AND h.security_id=NEW.security_id
+                  AND h.sellable_status='KNOWN'
+                  AND (NEW.max_quantity_microunits > h.sellable_quantity_microunits
+                       OR h.sellable_quantity_microunits > h.quantity_microunits
+                       OR (m.price_status='KNOWN' AND NEW.max_notional_microusd >
+                           NEW.max_quantity_microunits * m.mark_price_microusd / 1000000))
+            )
+        )
+        BEGIN SELECT RAISE(ABORT, 'SELL proposal violates holdings bounds (sellable/exit completion/notional)'); END;
         CREATE TRIGGER portfolio_policy_no_update BEFORE UPDATE ON portfolio_policy BEGIN SELECT RAISE(ABORT, 'portfolio_policy is append-only'); END;
         CREATE TRIGGER portfolio_policy_no_delete BEFORE DELETE ON portfolio_policy BEGIN SELECT RAISE(ABORT, 'portfolio_policy is append-only'); END;
         CREATE TRIGGER portfolio_snapshot_no_update BEFORE UPDATE ON portfolio_snapshot BEGIN SELECT RAISE(ABORT, 'portfolio_snapshot is append-only'); END;

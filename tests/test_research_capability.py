@@ -231,7 +231,7 @@ def test_ra03_registry_prefix_and_assertion_coverage():
     from tradehub_research.acceptance.packs.ra03 import ASSERTIONS as RA03_ASSERTIONS
 
     assert PACK_REGISTRY["RA-03"] == RA03_ASSERTIONS
-    assert len(RA03_ASSERTIONS) == 26
+    assert len(RA03_ASSERTIONS) == 34
     result = run_pack("RA-03")
     assert result.run_id.startswith("ra03-")
     assert result.status.value == "PASS"

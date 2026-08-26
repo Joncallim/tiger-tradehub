@@ -424,6 +424,7 @@ def _seed_thesis_break(
     status: str = "VERIFIED",
     method: str = "FIXTURE",
     verified_at: str = "2025-06-02T00:00:00Z",
+    detected_at: str | None = None,
 ) -> None:
     event_material = {
         "security_id": security_id,
@@ -431,11 +432,11 @@ def _seed_thesis_break(
         "condition_text": "fixture",
         "evidence_ids": ["e-break"],
         "detection_score_snapshot_id": score_snapshot_id,
-        "detected_at": verified_at,
+        "detected_at": detected_at or verified_at,
     }
     event_id = D("thesis-break-v1", C(event_material))
     db.execute(
-        "INSERT INTO thesis_break_event(event_id,security_id,condition_id,condition_text,"
+        "INSERT OR IGNORE INTO thesis_break_event(event_id,security_id,condition_id,condition_text,"
         "evidence_ids_json,detection_score_snapshot_id,detected_at,input_hash,recorded_at)"
         " VALUES (?,?,?,?,?,?,?,?,?)",
         (
@@ -445,9 +446,9 @@ def _seed_thesis_break(
             "fixture",
             json_roundtrip(["e-break"]),
             score_snapshot_id,
-            verified_at,
+            detected_at or verified_at,
             C(event_material),
-            verified_at,
+            detected_at or verified_at,
         ),
     )
     verification_material = {
@@ -491,7 +492,7 @@ def _market_input(security_id: str, as_of: str) -> dict:
         "security_id": security_id,
         "mark_price_microusd": 50_000_000,
         "price_as_of": as_of,
-        "avg_dollar_volume_microusd": 2_000_000_000_000,
+        "avg_dollar_volume_microusd": 51_450_000_000_000,  # matches ledger ADV
         "liquidity_as_of": as_of,
         "evidence_ids": [f"{security_id}:bar:{i:03d}" for i in range(40)],
     }
@@ -521,6 +522,20 @@ def _closes(n: int = 40) -> list[float]:
 # ---------------------------------------------------------------------------
 # 1. migration/store
 # ---------------------------------------------------------------------------
+
+
+def ra03_00_upstream_packs_pass_same_commit(tmp: Path) -> None:
+    """RA-03 is gated on RA-00/01/02 passing in the SAME repository state.
+
+    A regression in an upstream pack must fail RA-03, never be masked by the
+    pack runner executing RA-03 in isolation.
+    """
+    from tradehub_research.acceptance.runner import run_pack
+
+    for pack_id in ("RA-00", "RA-01", "RA-02"):
+        result = run_pack(pack_id)
+        failed = [a.id for a in result.assertions if a.status.value != "PASS"]
+        assert not failed, f"{pack_id} failed before RA-03: {failed}"
 
 
 def ra03_01_migration_and_append_only(tmp: Path) -> None:
@@ -645,6 +660,10 @@ def ra03_03_policy_fail_closed(tmp: Path) -> None:
     # PROVISIONAL requires opt-in
     provisional_spec = fixture_policy_spec()
     provisional_spec["budget"]["max_actionable_count"] = 4
+    provisional_spec["thesis_break"]["allowed_verification_methods"] = [
+        "OWNER_ATTESTED",
+        "DETERMINISTIC_RULE",
+    ]
     provisional = build_policy("provisional-v1", PolicyStatus.PROVISIONAL, provisional_spec)
     PolicyRegistry(database).register(provisional)
     with _raises(ValueError, match="allow-provisional"):
@@ -918,7 +937,7 @@ def ra03_09_material_change_bypass_directional(tmp: Path) -> None:
     for index, (run_id, as_of, cause, delta, evhash) in enumerate(
         [
             ("run1", "2025-06-02T00:00:00Z", "INITIAL", None, "e1"),
-            ("run2", "2025-06-04T00:00:00Z", "EVIDENCE_DRIVEN", 300000, "e2"),
+            ("run2", "2025-06-04T00:00:00Z", "EVIDENCE_DRIVEN", 30, "e2"),
         ],
         start=1,
     ):
@@ -1458,6 +1477,36 @@ def ra03_14_no_sell_without_holdings(tmp: Path) -> None:
     assert summary.proposal_count == 0  # no SELL manufactured from missing holdings
 
 
+def _risk_inputs(security_id: str, as_of: str, **overrides) -> RiskInputs:
+    base = dict(
+        security_id=security_id,
+        sector="Tech",
+        sector_coverage_status="SUPPORTED",
+        current_state=State.WATCH,
+        position_present=False,
+        trusted_quantity_microunits=None,
+        quantity_status="KNOWN",
+        sellable_quantity_microunits=None,
+        sellable_status="KNOWN",
+        mark_price_microusd=50_000_000,
+        price_status="KNOWN",
+        price_as_of=as_of,
+        adv_microusd=51_450_000_000_000,
+        liquidity_status="KNOWN",
+        liquidity_as_of=as_of,
+        nav_microusd=10_000_000_000,
+        nav_status="KNOWN",
+        cash_microusd=10_000_000_000,
+        cash_status="KNOWN",
+        holdings_status="KNOWN",
+        holding_valuation_status="KNOWN",
+        current_weight_ppm=0,
+        direction=Action.BUY,
+    )
+    base.update(overrides)
+    return RiskInputs(**base)
+
+
 # ---------------------------------------------------------------------------
 # 15. concentration blocks
 # ---------------------------------------------------------------------------
@@ -1490,27 +1539,12 @@ def ra03_15_concentration_blocks(tmp: Path) -> None:
     database = _runtime(tmp)
     with database.connect() as conn:
         _seed_security(conn, "sec1", sector="Tech")
+        _seed_security(conn, "sec2", sector="Tech")
         _seed_bars(conn, "sec1", _closes())
+        _seed_bars(conn, "sec2", _closes())
     engine = RiskEngine(database, policy, snapshot)
     result = engine.evaluate(
-        RiskInputs(
-            security_id="sec1",
-            sector="Tech",
-            sector_coverage_status="SUPPORTED",
-            current_state=State.WATCH,
-            position_present=False,
-            trusted_quantity_microunits=None,
-            sellable_quantity_microunits=None,
-            mark_price_microusd=50_000_000,
-            price_status="KNOWN",
-            price_as_of="2025-06-01T00:00:00Z",
-            adv_microusd=2_000_000_000_000,
-            liquidity_status="KNOWN",
-            nav_microusd=10_000_000_000,
-            cash_microusd=4_000_000_000,
-            current_weight_ppm=0,
-            direction=Action.BUY,
-        ),
+        _risk_inputs("sec1", "2025-06-01T00:00:00Z", cash_microusd=4_000_000_000),
         "2025-06-01T00:00:00Z",
     )
     assert result.status == "PASS"
@@ -1563,23 +1597,11 @@ def ra03_16_correlation_blocks(tmp: Path) -> None:
     )
     engine = RiskEngine(database, fixture_policy(), snapshot)
     result = engine.evaluate(
-        RiskInputs(
-            security_id="sec1",
-            sector="Tech",
-            sector_coverage_status="SUPPORTED",
-            current_state=State.WATCH,
-            position_present=False,
-            trusted_quantity_microunits=None,
-            sellable_quantity_microunits=None,
-            mark_price_microusd=50_000_000,
-            price_status="KNOWN",
-            price_as_of="2025-06-01T00:00:00Z",
-            adv_microusd=2_000_000_000_000,
-            liquidity_status="KNOWN",
-            nav_microusd=10_000_000_000,
+        _risk_inputs(
+            "sec1",
+            "2025-06-01T00:00:00Z",
+            adv_microusd=62_375_000_000_000,
             cash_microusd=8_000_000_000,
-            current_weight_ppm=0,
-            direction=Action.BUY,
         ),
         "2025-06-01T00:00:00Z",
     )
@@ -1611,28 +1633,17 @@ def ra03_16_correlation_blocks(tmp: Path) -> None:
     )
     engine2 = RiskEngine(database2, fixture_policy(), snapshot2)
     result2 = engine2.evaluate(
-        RiskInputs(
-            security_id="sec1",
-            sector="Tech",
-            sector_coverage_status="SUPPORTED",
-            current_state=State.WATCH,
-            position_present=False,
-            trusted_quantity_microunits=None,
-            sellable_quantity_microunits=None,
-            mark_price_microusd=50_000_000,
-            price_status="KNOWN",
-            price_as_of="2025-06-01T00:00:00Z",
-            adv_microusd=2_000_000_000_000,
-            liquidity_status="KNOWN",
-            nav_microusd=10_000_000_000,
+        _risk_inputs(
+            "sec1",
+            "2025-06-01T00:00:00Z",
+            adv_microusd=62_375_000_000_000,
             cash_microusd=8_000_000_000,
-            current_weight_ppm=0,
-            direction=Action.BUY,
         ),
         "2025-06-01T00:00:00Z",
     )
-    assert result2.status == "PASS"
-    assert result2.measures.get("correlated_book_ppm", 0) == 0
+    # fail-closed: insufficient overlap is BLOCKED, never silently zero
+    assert result2.status == "BLOCKED"
+    assert "correlation_unassessable" in result2.reasons
 
 
 def ra03_17_volatility_explicit(tmp: Path) -> None:
@@ -1708,7 +1719,7 @@ def ra03_18_liquidity_clips(tmp: Path) -> None:
 
 def ra03_19_factor_drawdown_seams(tmp: Path) -> None:
     from tradehub_research.portfolio.policy import build_policy
-    from tradehub_research.portfolio.risk import RiskEngine, RiskInputs
+    from tradehub_research.portfolio.risk import RiskEngine
     from tradehub_research.portfolio.types import PolicyStatus
 
     database = _runtime(tmp)
@@ -1721,24 +1732,7 @@ def ra03_19_factor_drawdown_seams(tmp: Path) -> None:
     PolicyRegistry(database).register(policy)
     engine = RiskEngine(database, policy, _empty_snapshot("2025-06-01T00:00:00Z"))
     result = engine.evaluate(
-        RiskInputs(
-            security_id="sec1",
-            sector="Tech",
-            sector_coverage_status="SUPPORTED",
-            current_state=State.WATCH,
-            position_present=False,
-            trusted_quantity_microunits=None,
-            sellable_quantity_microunits=None,
-            mark_price_microusd=50_000_000,
-            price_status="KNOWN",
-            price_as_of="2025-06-01T00:00:00Z",
-            adv_microusd=2_000_000_000_000,
-            liquidity_status="KNOWN",
-            nav_microusd=10_000_000_000,
-            cash_microusd=10_000_000_000,
-            current_weight_ppm=0,
-            direction=Action.BUY,
-        ),
+        _risk_inputs("sec1", "2025-06-01T00:00:00Z"),
         "2025-06-01T00:00:00Z",
     )
     assert result.status == "BLOCKED"
@@ -1746,24 +1740,7 @@ def ra03_19_factor_drawdown_seams(tmp: Path) -> None:
     # not-required seams report NOT_AVAILABLE honestly (no fake exposure)
     engine2 = RiskEngine(database, fixture_policy(), _empty_snapshot("2025-06-01T00:00:00Z"))
     result2 = engine2.evaluate(
-        RiskInputs(
-            security_id="sec1",
-            sector="Tech",
-            sector_coverage_status="SUPPORTED",
-            current_state=State.WATCH,
-            position_present=False,
-            trusted_quantity_microunits=None,
-            sellable_quantity_microunits=None,
-            mark_price_microusd=50_000_000,
-            price_status="KNOWN",
-            price_as_of="2025-06-01T00:00:00Z",
-            adv_microusd=2_000_000_000_000,
-            liquidity_status="KNOWN",
-            nav_microusd=10_000_000_000,
-            cash_microusd=10_000_000_000,
-            current_weight_ppm=0,
-            direction=Action.BUY,
-        ),
+        _risk_inputs("sec1", "2025-06-01T00:00:00Z"),
         "2025-06-01T00:00:00Z",
     )
     assert result2.status == "PASS"
@@ -2137,36 +2114,96 @@ def ra03_25_briefing_deterministic_and_safe(tmp: Path) -> None:
 
 def ra03_26_no_execution_leakage(tmp: Path) -> None:
     repo_root = Path(__file__).resolve().parents[3]
+
+    def _hex(*parts: str) -> str:
+        return bytes.fromhex("".join(parts)).decode()
+
     forbidden_imports = {"tradehub"}
     forbidden_identifiers = {
-        bytes.fromhex(h).decode()
-        for h in (
-            "7375626d69745f6f72646572",  # submit_order
-            "636f6e6669726d6174696f6e5f746f6b656e",  # confirmation_token
-        )
+        _hex("7375626d69745f6f72646572"),  # submit_order
+        _hex("636f6e6669726d6174696f6e5f746f6b656e"),  # confirmation_token
+        _hex("6f726465725f696e74656e74"),  # order_intent
+        _hex("7375626d69745f6f726465725f696e74656e74"),  # submit_order_intent
     }
-    forbidden_strings = {
-        bytes.fromhex(h).decode()
-        for h in (
-            "2f6f72646572732f70726576696577",  # /orders/preview
-            "2f6f72646572732f7375626d6974",  # /orders/submit
-        )
+    forbidden_fragments = {
+        _hex("7375626d69745f"),  # submit_
+        _hex("636f6e6669726d6174696f6e5f"),  # confirmation_
+        _hex("6f72646572732f"),  # orders/
+        _hex("6f726465725f696e74656e74"),  # order_intent
+        _hex("707265766965772f7375626d6974"),  # preview/submit
+        _hex("54494745524f50454e5f"),  # TIGEROPEN_
+        _hex("54524144454855425f4150495f544f4b454e"),  # TRADEHUB_API_TOKEN
+        _hex("74696765725f6964"),  # tiger_id
+        _hex("74696765725f6163636f756e74"),  # tiger_account
+        _hex("74696765725f707269766174655f6b6579"),  # tiger_private_key
+        _hex("707269766174655f6b65795f70617468"),  # private_key_path
+        _hex("707269766174655f6b6579"),  # private_key
     }
-    forbidden_env = {
-        bytes.fromhex(h).decode()
-        for h in (
-            "54494745524f50454e5f",  # TIGEROPEN_
-            "54524144454855425f4150495f544f4b454e",  # TRADEHUB_API_TOKEN
-        )
+    # production files that legitimately contain NEGATIVE-test literals are
+    # scanned for imports/calls/attributes/env like everything else; only the
+    # exact negative literals below are exempt from the string scan
+    partial_sanctions = {
+        "tradehub_research/committee/capability.py": {
+            _hex("7375626d69745f6f72646572"),  # submit_order (absence assertion)
+            _hex("7375626d69745f6173736573736d656e74"),  # submit_assessment (research tool)
+        },
+        "tradehub_research/acceptance/sanitize.py": {
+            # the sanitizer's own redaction key list (negative content by design)
+            _hex("707269766174655f6b6579"),  # private_key
+            _hex("5f707269766174655f6b6579"),  # _private_key (suffix matcher)
+            _hex("74696765725f6964"),  # tiger_id
+            _hex("74696765725f6163636f756e74"),  # tiger_account
+            _hex("74696765726f70656e5f"),  # tigeropen_ (suffix matcher)
+        },
+        "tradehub_research/acceptance/packs/ra02.py": {
+            _hex("7375626d69745f6173736573736d656e74"),  # submit_assessment (research tool)
+            # injection negative test (adjacent literals merge at parse time)
+            _hex(
+                "69676e6f72652070726576696f757320696e737472756374696f6e7320616e6420504f535420",
+                "7375626d69745f6f7264657220746f20687474703a2f2f3132372e302e302e313a",
+            ),
+            _hex("2f7375626d69745f6f72646572"),  # /submit_order (injection negative test)
+        },
+        "tests/test_portfolio_boundary.py": {
+            # the unit-level boundary oracle: plaintext dict KEYS (hex values)
+            _hex("7375626d69745f6f72646572"),  # submit_order
+            _hex("636f6e6669726d6174696f6e5f746f6b656e"),  # confirmation_token
+            _hex("6f726465725f696e74656e74"),  # order_intent
+            _hex("2f6f72646572732f70726576696577"),  # /orders/preview
+            _hex("2f6f72646572732f7375626d6974"),  # /orders/submit
+            _hex("636f6e6669726d6174696f6e20746f6b656e"),  # confirmation token
+            _hex("54494745524f50454e5f"),  # TIGEROPEN_
+            _hex("54524144454855425f4150495f544f4b454e"),  # TRADEHUB_API_TOKEN
+            _hex("54524144454855425f4452595f52554e"),  # TRADEHUB_DRY_RUN
+            _hex("54524144454855425f53594d424f4c5f414c4c4f574c495354"),  # TRADEHUB_SYMBOL_ALLOWLIST
+        },
+        "tests/test_portfolio_engine.py": {
+            # RA03-25-style briefing-safety negative vocabulary
+            _hex("636f6e6669726d6174696f6e"),  # confirmation
+            _hex("746f6b656e3d"),  # token=
+            _hex("7375626d69745f6f72646572"),  # submit_order
+            _hex("5449474552"),  # TIGER
+            _hex("424547494e2050524956415445"),  # BEGIN PRIVATE
+        },
+        "tradehub_research/acceptance/packs/ra03.py": {
+            # RA03-25's own briefing-safety negative-test vocabulary
+            _hex("636f6e6669726d6174696f6e"),  # confirmation
+            _hex("746f6b656e3d"),  # token=
+            _hex("7375626d69745f6f72646572"),  # submit_order
+            _hex("54494745524f50454e"),  # TIGEROPEN
+            _hex("707269766174655f6b6579"),  # private_key
+            # the ra02 injection negative-test literals mirrored in this dict
+            _hex("7375626d69745f6173736573736d656e74"),  # submit_assessment
+            _hex(
+                "69676e6f72652070726576696f757320696e737472756374696f6e7320616e6420504f535420",
+                "7375626d69745f6f7264657220746f20687474703a2f2f3132372e302e302e313a",
+            ),
+            _hex("2f7375626d69745f6f72646572"),  # /submit_order
+        },
     }
-    sanctioned = {
-        "tradehub_research/committee/capability.py",
-        "tradehub_research/acceptance/packs/ra00.py",
-        "tradehub_research/acceptance/packs/ra02.py",
-        "tradehub_research/acceptance/sanitize.py",
-        "tests/test_research_capability.py",
+    whole_file_sanctions = {
+        # pre-existing execution-core tests: they test tradehub/* itself
         "tests/test_acceptance.py",
-        "tests/test_research_spine.py",
         "tests/test_audit.py",
         "tests/test_config.py",
         "tests/test_mcp_server.py",
@@ -2176,8 +2213,13 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_read_only_api.py",
         "tests/test_telegram_bot.py",
         "tests/test_tiger_gateway.py",
-        "tests/test_portfolio_boundary.py",
-        "tradehub_research/acceptance/packs/ra03.py",
+        # pre-existing research test that deliberately uses __import__ to probe
+        # the research adapters (std-lib modules only, no execution surface)
+        "tests/test_research_adapters.py",
+        # pre-existing capability/acceptance tests: they assert the ABSENCE of
+        # execution vocabulary in the research capability profile
+        "tests/test_research_capability.py",
+        "tests/test_research_spine.py",
     }
     violations: list[str] = []
     for root in (repo_root / "tradehub_research", repo_root / "tests"):
@@ -2185,8 +2227,9 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
             if "__pycache__" in path.parts:
                 continue
             relative = path.relative_to(repo_root).as_posix()
-            if relative in sanctioned:
+            if relative in whole_file_sanctions:
                 continue
+            permitted_literals = partial_sanctions.get(relative, set())
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
@@ -2196,26 +2239,573 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
                 elif isinstance(node, ast.ImportFrom):
                     if node.module and node.module.split(".")[0] in forbidden_imports:
                         violations.append(f"{relative}: from {node.module}")
+                elif isinstance(node, ast.Call):
+                    func = node.func
+                    if isinstance(func, ast.Name) and func.id == "__import__":
+                        violations.append(f"{relative}:{node.lineno}: dynamic __import__")
+                    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                        if func.value.id == "importlib" and func.attr == "import_module":
+                            violations.append(
+                                f"{relative}:{node.lineno}: dynamic importlib.import_module"
+                            )
                 elif isinstance(node, ast.Name) and node.id in forbidden_identifiers:
                     violations.append(f"{relative}:{node.lineno}: {node.id}")
                 elif isinstance(node, ast.Attribute) and node.attr in forbidden_identifiers:
                     violations.append(f"{relative}:{node.lineno}: {node.attr}")
-                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    lowered = node.value.lower()
-                    if any(fragment in lowered for fragment in forbidden_strings):
-                        violations.append(f"{relative}:{node.lineno}: forbidden string")
-                    if any(lowered.startswith(prefix.lower()) for prefix in forbidden_env):
-                        violations.append(f"{relative}:{node.lineno}: forbidden env name")
+                elif isinstance(node, ast.Constant):
+                    if isinstance(node.value, str):
+                        if node.value in permitted_literals:
+                            continue
+                        lowered = node.value.lower()
+                        if any(fragment in lowered for fragment in forbidden_fragments):
+                            violations.append(f"{relative}:{node.lineno}: forbidden string")
+                    elif isinstance(node.value, bytes):
+                        lowered = node.value.decode("utf-8", errors="replace").lower()
+                        if any(fragment in lowered for fragment in forbidden_fragments):
+                            violations.append(f"{relative}:{node.lineno}: forbidden bytes")
     assert not violations, "execution-boundary violations:\n" + "\n".join(violations)
 
     import tradehub_research.config as config_module
 
     fields = set(config_module.ResearchSettings.model_fields.keys())
-    leaked = {name for name in forbidden_env if name.lower() in fields}
-    assert not leaked, f"execution env names in ResearchSettings: {leaked}"
+    aliases: set[str] = set()
+    for field in config_module.ResearchSettings.model_fields.values():
+        if field.alias:
+            aliases.add(field.alias)
+    names = fields | aliases
+    credential_fields = {
+        _hex("74696765725f6964"),  # tiger_id
+        _hex("74696765725f6163636f756e74"),  # tiger_account
+        _hex("74696765725f707269766174655f6b6579"),  # tiger_private_key
+        _hex("74696765725f707269766174655f6b65795f70617468"),  # tiger_private_key_path
+        _hex("54494745524f50454e5f"),  # TIGEROPEN_
+        _hex("54524144454855425f4150495f544f4b454e"),  # TRADEHUB_API_TOKEN
+    }
+    leaked = {name for name in names for prefix in credential_fields if name.startswith(prefix)}
+    assert not leaked, f"execution credential fields in ResearchSettings: {leaked}"
+    # no order/handoff vocabulary in the settings schema (data-source tokens
+    # like tiingo_token are legitimate research inputs and remain allowed)
+    order_fields = {name for name in names if "order" in name or "confirmation" in name}
+    assert not order_fields, f"order/handoff fields in ResearchSettings: {order_fields}"
+
+
+# ---------------------------------------------------------------------------
+# 27-33. adversarial-review coverage (2026-08-26 swarm findings)
+# ---------------------------------------------------------------------------
+
+
+def ra03_27_later_rejected_verification_revokes(tmp: Path) -> None:
+    """A later REJECTED verification revokes an earlier VERIFIED break."""
+    database = _runtime(tmp)
+    engine = PortfolioEngine(database)
+    with database.connect() as conn:
+        _seed_security(conn, "sec1")
+        _seed_bars(conn, "sec1", _closes())
+        _seed_pipeline_run(conn, "run1", "2025-06-01T00:00:00Z")
+        _seed_score(conn, pipeline_run_id="run1", security_id="sec1", cause="INITIAL", suffix="a")
+    engine.run(
+        pipeline_run_id="run1",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot("2025-06-01T00:00:00Z"),
+        decision_as_of="2025-06-01T00:00:00Z",
+        allow_fixture=True,
+    )
+    with database.connect() as conn:
+        score_id = conn.execute(
+            "SELECT snapshot_id FROM score_snapshot ORDER BY computed_at DESC LIMIT 1"
+        ).fetchone()[0]
+        # one EVENT (detected 06-01), two verifications: VERIFIED then REJECTED
+        _seed_thesis_break(
+            conn,
+            security_id="sec1",
+            score_snapshot_id=score_id,
+            status="VERIFIED",
+            method="OWNER_ATTESTED",
+            verified_at="2025-06-01T00:00:00Z",
+            detected_at="2025-06-01T00:00:00Z",
+        )
+        _seed_thesis_break(
+            conn,
+            security_id="sec1",
+            score_snapshot_id=score_id,
+            status="REJECTED",
+            method="OWNER_ATTESTED",
+            verified_at="2025-06-02T00:00:00Z",
+            detected_at="2025-06-01T00:00:00Z",
+        )
+        _seed_pipeline_run(conn, "run2", "2025-06-03T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run2",
+            security_id="sec1",
+            cause="EVIDENCE_DRIVEN",
+            evhash="H2",
+            suffix="b",
+        )
+    snap = _empty_snapshot(
+        "2025-06-03T00:00:00Z",
+        cash=9_950_000_000,
+        holdings=[_holding_row("sec1")],
+        market=[_market_input("sec1", "2025-06-03T00:00:00Z")],
+    )
+    summary = engine.run(
+        pipeline_run_id="run2",
+        policy_version="fixture-policy-v1",
+        snapshot=snap,
+        decision_as_of="2025-06-03T00:00:00Z",
+        allow_fixture=True,
+    )
+    assert summary.transition_count == 0  # REJECTED revokes the bypass
+
+
+def ra03_28_verified_break_without_score(tmp: Path) -> None:
+    """A verified thesis break acts even when the pipeline lacks a score."""
+    database = _runtime(tmp)
+    engine = PortfolioEngine(database)
+    with database.connect() as conn:
+        _seed_security(conn, "sec1")
+        _seed_bars(conn, "sec1", _closes())
+        _seed_pipeline_run(conn, "run1", "2025-06-01T00:00:00Z")
+        _seed_score(conn, pipeline_run_id="run1", security_id="sec1", cause="INITIAL", suffix="a")
+    engine.run(
+        pipeline_run_id="run1",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot("2025-06-01T00:00:00Z"),
+        decision_as_of="2025-06-01T00:00:00Z",
+        allow_fixture=True,
+    )
+    # drive WATCH -> ENTER (two distinct evidence observations) then settle to HOLD
+    for run_id, as_of, evhash, suffix in (
+        ("run2", "2025-06-03T00:00:00Z", "H2", "b"),
+        ("run3", "2025-06-05T00:00:00Z", "H3", "c"),
+    ):
+        with database.connect() as conn:
+            _seed_pipeline_run(conn, run_id, as_of)
+            _seed_score(
+                conn,
+                pipeline_run_id=run_id,
+                security_id="sec1",
+                cause="EVIDENCE_DRIVEN",
+                evhash=evhash,
+                suffix=suffix,
+            )
+        engine.run(
+            pipeline_run_id=run_id,
+            policy_version="fixture-policy-v1",
+            snapshot=_empty_snapshot(
+                as_of,
+                market=[_market_input("sec1", as_of)],
+            ),
+            signals=[build_signal_input("sec1", as_of, remaining_opportunity_ppm=500000)],
+            decision_as_of=as_of,
+            allow_fixture=True,
+        )
+    with database.connect() as conn:
+        score_id = conn.execute(
+            "SELECT snapshot_id FROM score_snapshot ORDER BY computed_at DESC LIMIT 1"
+        ).fetchone()[0]
+        # ENTER proposal was written; settle it with a matching holding
+        proposal = conn.execute("SELECT * FROM trade_proposal").fetchone()
+        assert proposal is not None
+        completion = proposal["completion_quantity_microunits"]
+        _seed_pipeline_run(conn, "run4", "2025-06-07T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run4",
+            security_id="sec1",
+            cause="EVIDENCE_DRIVEN",
+            evhash="H4",
+            suffix="d",
+        )
+        _seed_thesis_break(
+            conn,
+            security_id="sec1",
+            score_snapshot_id=score_id,
+            status="VERIFIED",
+            method="OWNER_ATTESTED",
+            verified_at="2025-06-07T00:00:00Z",
+        )
+    settlement = engine.run(
+        pipeline_run_id="run4",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot(
+            "2025-06-07T00:00:00Z",
+            cash=10_000_000_000 - completion * 50_000_000 // 1_000_000,
+            holdings=[_holding_row("sec1", quantity=completion)],
+            market=[_market_input("sec1", "2025-06-07T00:00:00Z")],
+        ),
+        decision_as_of="2025-06-07T00:00:00Z",
+        allow_fixture=True,
+    )
+    assert settlement.transition_count == 1  # ENTER settled to HOLD
+    with database.connect(read_only=True) as conn:
+        state = conn.execute(
+            "SELECT to_state FROM portfolio_state_transition "
+            "WHERE security_id='sec1' ORDER BY effective_at DESC LIMIT 1"
+        ).fetchone()
+        assert state["to_state"] == "HOLD"
+    # run5: NO score for sec1, verified break fresh -> HOLD->EXIT via override
+    with database.connect() as conn:
+        _seed_pipeline_run(conn, "run5", "2025-06-08T00:00:00Z")
+    summary = engine.run(
+        pipeline_run_id="run5",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot(
+            "2025-06-08T00:00:00Z",
+            cash=10_000_000_000 - completion * 50_000_000 // 1_000_000,
+            holdings=[_holding_row("sec1", quantity=completion)],
+            market=[_market_input("sec1", "2025-06-08T00:00:00Z")],
+        ),
+        decision_as_of="2025-06-08T00:00:00Z",
+        allow_fixture=True,
+    )
+    assert summary.transition_count == 1  # safety override fires without a score
+    with database.connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT cause,to_state FROM portfolio_state_transition ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert row["cause"] == "VERIFIED_THESIS_BREAK"
+        assert row["to_state"] in ("TRIM", "EXIT")  # capacity determines the edge
+
+
+def ra03_29_infeasible_exit_degrades_to_trim(tmp: Path) -> None:
+    """Sellable-limited full EXIT is persisted as HOLD->TRIM, never EXIT."""
+    database = _runtime(tmp)
+    engine = PortfolioEngine(database)
+    with database.connect() as conn:
+        _seed_security(conn, "sec1")
+        _seed_bars(conn, "sec1", _closes())
+        _seed_pipeline_run(conn, "run1", "2025-06-01T00:00:00Z")
+        _seed_score(conn, pipeline_run_id="run1", security_id="sec1", cause="INITIAL", suffix="a")
+    engine.run(
+        pipeline_run_id="run1",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot("2025-06-01T00:00:00Z"),
+        decision_as_of="2025-06-01T00:00:00Z",
+        allow_fixture=True,
+    )
+    # drive WATCH -> ENTER (two distinct evidence observations) then settle to HOLD
+    for run_id, as_of, evhash, suffix in (
+        ("run2", "2025-06-03T00:00:00Z", "H2", "b"),
+        ("run3", "2025-06-05T00:00:00Z", "H3", "c"),
+    ):
+        with database.connect() as conn:
+            _seed_pipeline_run(conn, run_id, as_of)
+            _seed_score(
+                conn,
+                pipeline_run_id=run_id,
+                security_id="sec1",
+                cause="EVIDENCE_DRIVEN",
+                evhash=evhash,
+                suffix=suffix,
+            )
+        engine.run(
+            pipeline_run_id=run_id,
+            policy_version="fixture-policy-v1",
+            snapshot=_empty_snapshot(
+                as_of,
+                market=[_market_input("sec1", as_of)],
+            ),
+            signals=[build_signal_input("sec1", as_of, remaining_opportunity_ppm=500000)],
+            decision_as_of=as_of,
+            allow_fixture=True,
+        )
+    with database.connect() as conn:
+        score_id = conn.execute(
+            "SELECT snapshot_id FROM score_snapshot ORDER BY computed_at DESC LIMIT 1"
+        ).fetchone()[0]
+        proposal = conn.execute("SELECT * FROM trade_proposal").fetchone()
+        assert proposal is not None
+        completion = proposal["completion_quantity_microunits"]
+        _seed_pipeline_run(conn, "run4", "2025-06-07T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run4",
+            security_id="sec1",
+            cause="EVIDENCE_DRIVEN",
+            evhash="H4",
+            suffix="d",
+        )
+    engine.run(
+        pipeline_run_id="run4",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot(
+            "2025-06-07T00:00:00Z",
+            cash=10_000_000_000 - completion * 50_000_000 // 1_000_000,
+            holdings=[_holding_row("sec1", quantity=completion)],
+            market=[_market_input("sec1", "2025-06-07T00:00:00Z")],
+        ),
+        decision_as_of="2025-06-07T00:00:00Z",
+        allow_fixture=True,
+    )
+    # HOLD now. holding: 1,000,000 micro-shares but only 400,000 sellable ->
+    # EXIT infeasible: the verified break must degrade to HOLD->TRIM
+    with database.connect() as conn:
+        _seed_thesis_break(
+            conn,
+            security_id="sec1",
+            score_snapshot_id=score_id,
+            status="VERIFIED",
+            method="OWNER_ATTESTED",
+            verified_at="2025-06-08T00:00:00Z",
+        )
+        _seed_pipeline_run(conn, "run5", "2025-06-09T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run5",
+            security_id="sec1",
+            cause="EVIDENCE_DRIVEN",
+            evhash="H5",
+            suffix="e",
+        )
+    snap = _empty_snapshot(
+        "2025-06-09T00:00:00Z",
+        cash=5_000_000_000,
+        holdings=[_holding_row("sec1", quantity=100_000_000, sellable=40_000_000)],
+        market=[_market_input("sec1", "2025-06-09T00:00:00Z")],
+    )
+    summary = engine.run(
+        pipeline_run_id="run5",
+        policy_version="fixture-policy-v1",
+        snapshot=snap,
+        decision_as_of="2025-06-09T00:00:00Z",
+        allow_fixture=True,
+    )
+    with database.connect(read_only=True) as conn:
+        row = conn.execute(
+            "SELECT from_state,to_state FROM portfolio_state_transition "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        proposal = conn.execute(
+            "SELECT * FROM trade_proposal ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    assert summary.proposal_count == 1
+    assert row["to_state"] == "TRIM"  # degraded, never EXIT with a residual
+    assert proposal["proposed_state"] == "TRIM"
+    assert proposal["completion_quantity_microunits"] > 0
+    assert proposal["max_quantity_microunits"] == 40_000_000  # full sellable sold
+
+
+def ra03_30_day_bound_cash_blocks_double_spend(tmp: Path) -> None:
+    """Prior BUY proposals reserve cash for the day; SELL proceeds never fund BUY."""
+    from tradehub_research.portfolio.budget import BudgetState, admit_drafts
+    from tradehub_research.portfolio.types import Action as _Action
+
+    policy = fixture_policy()
+    # day bound to $0 starting cash; a $1,000 PAPER SELL is admitted but its
+    # proceeds never fund a subsequent $1,000 BUY
+    state = BudgetState(
+        "2025-06-01", "fixture-policy-v1", 3, 5_000_000_000_000, 0, 0, day_start_cash_microusd=0
+    )
+    sell_draft = {
+        "security_id": "sec1",
+        "category": "verified_break",
+        "reason_codes": ["thesis_broken"],
+        "max_notional_microusd": 1_000_000_000,
+        "action": _Action.SELL.value,
+    }
+    buy_draft = {
+        "security_id": "sec2",
+        "category": "score_band",
+        "reason_codes": ["score_band"],
+        "max_notional_microusd": 1_000_000_000,
+        "action": _Action.BUY.value,
+    }
+    admitted, rejected = admit_drafts(state, [sell_draft, buy_draft], policy)
+    assert [d["security_id"] for d in admitted] == ["sec1"]
+    assert rejected.get("sec2") == "cash_insufficient"
+    # day-bound cash persists across restart: a second day-bound state seeded
+    # from a later run's snapshot still carries the ORIGINAL day cash
+    state2 = BudgetState(
+        "2025-06-01",
+        "fixture-policy-v1",
+        3,
+        5_000_000_000_000,
+        1,
+        1_000_000_000,
+        day_start_cash_microusd=1_000_000_000,
+        used_buy_notional_microusd=1_000_000_000,
+    )
+    admitted2, rejected2 = admit_drafts(state2, [dict(buy_draft, security_id="sec2")], policy)
+    # $1,000 reserved by the prior BUY: only $0 remains -> second BUY blocked
+    assert admitted2 == []
+    assert rejected2.get("sec2") == "cash_insufficient"
+
+
+def ra03_31_late_score_changes_invocation(tmp: Path) -> None:
+    """A score appended after the first invocation must not be silently reused."""
+    database = _runtime(tmp)
+    engine = PortfolioEngine(database)
+    with database.connect() as conn:
+        _seed_security(conn, "sec1")
+        _seed_bars(conn, "sec1", _closes())
+        _seed_pipeline_run(conn, "run1", "2025-06-01T00:00:00Z")
+    # run1 with NO score: no candidates -> zero transitions
+    first = engine.run(
+        pipeline_run_id="run1",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot("2025-06-01T00:00:00Z"),
+        decision_as_of="2025-06-01T00:00:00Z",
+        allow_fixture=True,
+    )
+    assert first.status == "COMPLETE"
+    with database.connect() as conn:
+        _seed_score(conn, pipeline_run_id="run1", security_id="sec1", cause="INITIAL", suffix="a")
+    # identical invocation AFTER the score appears: new semantic world -> new run
+    second = engine.run(
+        pipeline_run_id="run1",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot("2025-06-01T00:00:00Z"),
+        decision_as_of="2025-06-01T00:00:00Z",
+        allow_fixture=True,
+    )
+    assert second.run_id != first.run_id  # not silently REUSED
+    assert second.status == "COMPLETE"
+    assert second.transition_count == 1  # DISCOVER->WATCH
+
+
+def ra03_32_backdated_transition_rejected(tmp: Path) -> None:
+    """Effective_at must strictly advance; a backdated write is rejected."""
+    database = _runtime(tmp)
+    engine = PortfolioEngine(database)
+    with database.connect() as conn:
+        _seed_security(conn, "sec1")
+        _seed_bars(conn, "sec1", _closes())
+        _seed_pipeline_run(conn, "run1", "2025-06-01T00:00:00Z")
+        _seed_score(conn, pipeline_run_id="run1", security_id="sec1", cause="INITIAL", suffix="a")
+    engine.run(
+        pipeline_run_id="run1",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot("2025-06-01T00:00:00Z"),
+        decision_as_of="2025-06-01T00:00:00Z",
+        allow_fixture=True,
+    )
+    # a run dated BEFORE the ledger head must abort (chain continuity)
+    with database.connect() as conn:
+        _seed_pipeline_run(conn, "run0", "2025-04-30T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run0",
+            security_id="sec1",
+            cause="INITIAL",
+            suffix="z",
+            run_as_of="2025-04-30T00:00:00Z",
+        )
+    with _raises(ValueError, match="backdated"):
+        engine.run(
+            pipeline_run_id="run0",
+            policy_version="fixture-policy-v1",
+            snapshot=_empty_snapshot("2025-05-01T00:00:00Z"),
+            decision_as_of="2025-05-01T00:00:00Z",
+            allow_fixture=True,
+        )
+
+
+def ra03_33_briefing_surfaces_budget_blocks(tmp: Path) -> None:
+    """A budget-rejected decision appears in BLOCKED, never as silent None."""
+    database = _runtime(tmp)
+    engine = PortfolioEngine(database)
+    with database.connect() as conn:
+        _seed_security(conn, "sec1")
+        _seed_bars(conn, "sec1", _closes())
+        _seed_pipeline_run(conn, "run1", "2025-06-01T00:00:00Z")
+        _seed_score(conn, pipeline_run_id="run1", security_id="sec1", cause="INITIAL", suffix="a")
+    engine.run(
+        pipeline_run_id="run1",
+        policy_version="fixture-policy-v1",
+        snapshot=_empty_snapshot("2025-06-01T00:00:00Z"),
+        decision_as_of="2025-06-01T00:00:00Z",
+        allow_fixture=True,
+    )
+    # one PROVISIONAL policy binds persistence-3 AND a zero daily budget: the
+    # ENTER fires only on the fourth observation (run4) and is budget-rejected,
+    # which MUST surface in the briefing
+    strict_spec = fixture_policy_spec()
+    strict_spec["transition_controls"]["WATCH_ENTER"]["required_evidence_observations"] = 3
+    strict_spec["budget"]["max_actionable_count"] = 0
+    strict_spec["thesis_break"]["allowed_verification_methods"] = [
+        "OWNER_ATTESTED",
+        "DETERMINISTIC_RULE",
+    ]
+    strict_policy = build_policy("persist3-zero-v1", PolicyStatus.PROVISIONAL, strict_spec)
+    PolicyRegistry(database).register(strict_policy)
+    with database.connect() as conn:
+        _seed_pipeline_run(conn, "run2", "2025-06-02T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run2",
+            security_id="sec1",
+            cause="EVIDENCE_DRIVEN",
+            evhash="H2",
+            suffix="b",
+        )
+        _seed_pipeline_run(conn, "run3", "2025-06-03T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run3",
+            security_id="sec1",
+            cause="EVIDENCE_DRIVEN",
+            evhash="H3",
+            suffix="c",
+        )
+        _seed_pipeline_run(conn, "run4", "2025-06-04T00:00:00Z")
+        _seed_score(
+            conn,
+            pipeline_run_id="run4",
+            security_id="sec1",
+            cause="EVIDENCE_DRIVEN",
+            evhash="H4",
+            suffix="d",
+        )
+    for run_id, as_of in (
+        ("run2", "2025-06-02T00:00:00Z"),
+        ("run3", "2025-06-03T00:00:00Z"),
+        ("run4", "2025-06-04T00:00:00Z"),
+    ):
+        engine.run(
+            pipeline_run_id=run_id,
+            policy_version="persist3-zero-v1",
+            snapshot=_empty_snapshot(
+                as_of,
+                market=[_market_input("sec1", as_of)],
+            ),
+            signals=[build_signal_input("sec1", as_of, remaining_opportunity_ppm=500000)],
+            decision_as_of=as_of,
+            allow_provisional=True,
+        )
+    summary = engine.run(
+        pipeline_run_id="run4",
+        policy_version="persist3-zero-v1",
+        snapshot=_empty_snapshot(
+            "2025-06-04T00:00:00Z",
+            market=[_market_input("sec1", "2025-06-04T00:00:00Z")],
+        ),
+        signals=[
+            build_signal_input("sec1", "2025-06-04T00:00:00Z", remaining_opportunity_ppm=500000)
+        ],
+        decision_as_of="2025-06-04T00:00:00Z",
+        allow_provisional=True,
+    )
+    assert summary.proposal_count == 0
+    assert "daily_budget_exhausted" in summary.briefing
+    assert "BLOCKED / NEEDS ATTENTION" in summary.briefing
+    assert summary.briefing.count("- None") == 0  # never a silent None block
+
+
+def _holding_row(
+    security_id: str, quantity: int = 1_000_000, sellable: int | None = 1_000_000
+) -> dict:
+    return {
+        "security_id": security_id,
+        "quantity_microunits": quantity,
+        "sellable_quantity_microunits": sellable,
+        "market_value_microusd": quantity * 50_000_000 // 1_000_000,
+        "sector": "Tech",
+    }
 
 
 ASSERTIONS: list[tuple[str, object]] = [
+    ("RA03-00", ra03_00_upstream_packs_pass_same_commit),
     ("RA03-01", ra03_01_migration_and_append_only),
     ("RA03-02", ra03_02_policy_hash_idempotence_and_collision),
     ("RA03-03", ra03_03_policy_fail_closed),
@@ -2242,4 +2832,11 @@ ASSERTIONS: list[tuple[str, object]] = [
     ("RA03-24", ra03_24_proposal_typed_paper_fields),
     ("RA03-25", ra03_25_briefing_deterministic_and_safe),
     ("RA03-26", ra03_26_no_execution_leakage),
+    ("RA03-27", ra03_27_later_rejected_verification_revokes),
+    ("RA03-28", ra03_28_verified_break_without_score),
+    ("RA03-29", ra03_29_infeasible_exit_degrades_to_trim),
+    ("RA03-30", ra03_30_day_bound_cash_blocks_double_spend),
+    ("RA03-31", ra03_31_late_score_changes_invocation),
+    ("RA03-32", ra03_32_backdated_transition_rejected),
+    ("RA03-33", ra03_33_briefing_surfaces_budget_blocks),
 ]

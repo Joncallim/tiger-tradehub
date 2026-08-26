@@ -161,27 +161,31 @@ def _load_signals_file(path: Path | None, as_of: str) -> list:
 
 
 def _cmd_portfolio_policy_register(args: argparse.Namespace) -> int:
-    from tradehub_research.portfolio.policy import PolicyRegistry, load_policy_from_json
+    from tradehub_research.portfolio.policy import PolicyRegistry, build_policy
     from tradehub_research.portfolio.types import PolicyStatus
 
     database = _database(args)
     raw = args.file.read_text(encoding="utf-8")
     status = PolicyStatus(args.status)
-    policy = load_policy_from_json(args.version, status, raw)
+    # Parse JSON once and build the policy ONCE, with approval metadata present
+    # for PAPER status — the earlier two-call flow raised before approvals.
+    import json as _json
+
+    spec = _json.loads(raw)
+    approved_by = None
+    approved_at = None
     if status == PolicyStatus.PAPER:
         if not args.approved_by or not args.approved_at:
             raise SystemExit("PAPER policy registration requires --approved-by and --approved-at")
-        import json as _json
-
-        from tradehub_research.portfolio.policy import build_policy
-
-        policy = build_policy(
-            args.version,
-            status,
-            _json.loads(raw),
-            approved_by=args.approved_by,
-            approved_at=args.approved_at,
-        )
+        approved_by = args.approved_by
+        approved_at = args.approved_at
+    policy = build_policy(
+        args.version,
+        status,
+        spec,
+        approved_by=approved_by,
+        approved_at=approved_at,
+    )
     PolicyRegistry(database).register(policy)
     print(
         json.dumps(
@@ -212,9 +216,11 @@ def _cmd_portfolio_run(args: argparse.Namespace) -> int:
         decision_as_of=args.as_of,
         signals=signals,
         allow_provisional=args.allow_provisional,
-        allow_fixture=args.allow_fixture,
+        allow_fixture=False,  # FIXTURE policies are never acceptable via the CLI
     )
-    print(json.dumps(summary.as_dict(), indent=2))
+    from tradehub_research.acceptance.sanitize import sanitize
+
+    print(json.dumps(sanitize(summary.as_dict()), indent=2))
     return 0
 
 
@@ -299,7 +305,9 @@ def _cmd_portfolio_briefing(args: argparse.Namespace) -> int:
             raise SystemExit("briefing requires --run-id or --latest")
         if row is None:
             raise SystemExit("no briefing found")
-    print(row["body_text"], end="")
+    from tradehub_research.acceptance.sanitize import sanitize
+
+    print(sanitize(row["body_text"]), end="")
     return 0
 
 
@@ -357,7 +365,6 @@ def main(argv: list[str] | None = None) -> int:
     portfolio_run.add_argument("--signals", type=Path)
     portfolio_run.add_argument("--as-of", required=True)
     portfolio_run.add_argument("--allow-provisional", action="store_true")
-    portfolio_run.add_argument("--allow-fixture", action="store_true")
     portfolio_run.set_defaults(handler=_cmd_portfolio_run)
 
     replay_parser = portfolio_sub.add_parser("replay", help="verify a stored run's reproducibility")
