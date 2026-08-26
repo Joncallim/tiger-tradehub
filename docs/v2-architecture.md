@@ -449,6 +449,15 @@ proposals), and (b) enforce a **daily aggregate notional + order-count budget** 
 plane, because V2's §10 funnel (40–60 candidates, M/W/F) replaces the human-paced premise under
 which threat-model T7 accepted aggregate-exposure risk — tokens are now generated in bulk.
 
+**IMPLEMENTED (2026-08-26, Epic #36):** this section shipped as `tradehub_research/portfolio/`
+(state machine, versioned policy contract, eligibility, risk, sizing, budget, proposals, briefing)
+with schema migration 10 and acceptance pack RA-03 (26 assertions). Deterministic engine semantics
+are authoritative over this prose: current state is derived from the immutable transition ledger;
+persistence requires distinct evidence-driven observations; verified thesis breaks carry structured
+lineage; the daily aggregate budget is derived from the proposal ledger and survives restarts;
+sizing is integer band math with cash/no-action first-class. See `docs/threat-model.md` T13/T15/T16
+and the RA-03 pack for the qualification record.
+
 ## 14. Execution Handoff — the only place V2 touches the execution core, and it touches it as a client
 
 `trade_proposal` (§6) is the complete contract from the brief:

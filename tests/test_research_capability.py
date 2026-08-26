@@ -225,3 +225,17 @@ def test_ra02_registry_prefix_and_assertion_coverage():
     result = run_pack("RA-02")
     assert result.run_id.startswith("ra02-")
     assert result.status.value == "PASS"
+
+
+def test_ra03_registry_prefix_and_assertion_coverage():
+    from tradehub_research.acceptance.packs.ra03 import ASSERTIONS as RA03_ASSERTIONS
+
+    assert PACK_REGISTRY["RA-03"] == RA03_ASSERTIONS
+    assert len(RA03_ASSERTIONS) == 34
+    result = run_pack("RA-03")
+    assert result.run_id.startswith("ra03-")
+    assert result.status.value == "PASS"
+    for assertion in result.assertions:
+        assert assertion.status.value in {"PASS", "BLOCKED", "ESCALATE"}, (
+            f"{assertion.assertion_id}: {assertion.status.value}"
+        )

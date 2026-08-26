@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-PHASE_0_SCHEMA_VERSION = 9
+PHASE_0_SCHEMA_VERSION = 10
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -702,6 +702,295 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         BEGIN
           SELECT RAISE(ABORT, 'neutral providers must differ');
         END;
+        """,
+    ),
+    (
+        10,
+        "Phase 3 portfolio state machine, policy registry, and paper proposals",
+        """
+        CREATE TABLE portfolio_policy (
+            policy_version TEXT PRIMARY KEY CHECK(length(trim(policy_version))>0),
+            policy_status TEXT NOT NULL CHECK(policy_status IN ('FIXTURE','PROVISIONAL','PAPER')),
+            sizing_policy_version TEXT NOT NULL CHECK(length(trim(sizing_policy_version))>0),
+            spec_json TEXT NOT NULL CHECK(json_valid(spec_json) AND json_type(spec_json)='object'),
+            spec_hash TEXT NOT NULL UNIQUE CHECK(length(spec_hash)=64),
+            approved_by TEXT, approved_at TEXT, created_at TEXT NOT NULL,
+            -- composite UNIQUE is the FK target for trade_proposal; policy_version PK
+            -- uniqueness makes it trivially satisfied for the registry itself.
+            UNIQUE(policy_version, sizing_policy_version),
+            CHECK(
+                (policy_status='PAPER' AND approved_by IS NOT NULL AND approved_at IS NOT NULL)
+                OR (policy_status IN ('FIXTURE','PROVISIONAL') AND approved_by IS NULL AND approved_at IS NULL)
+            )
+        );
+        CREATE TABLE portfolio_snapshot (
+            snapshot_id TEXT PRIMARY KEY CHECK(length(snapshot_id)=64),
+            as_of TEXT NOT NULL,
+            currency TEXT NOT NULL CHECK(currency='USD'),
+            cash_microusd INTEGER, cash_status TEXT NOT NULL CHECK(cash_status IN ('KNOWN','STALE','UNKNOWN')),
+            nav_microusd INTEGER, valuation_status TEXT NOT NULL CHECK(valuation_status IN ('KNOWN','STALE','UNKNOWN')),
+            holdings_status TEXT NOT NULL CHECK(holdings_status IN ('KNOWN','STALE','UNKNOWN')),
+            provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json) AND json_type(provenance_json)='object'),
+            input_hash TEXT NOT NULL UNIQUE CHECK(length(input_hash)=64),
+            recorded_at TEXT NOT NULL,
+            CHECK(cash_microusd IS NULL OR cash_microusd>=0),
+            CHECK(nav_microusd IS NULL OR nav_microusd>0),
+            CHECK((cash_status='UNKNOWN')=(cash_microusd IS NULL)),
+            CHECK((valuation_status='UNKNOWN')=(nav_microusd IS NULL))
+        );
+        CREATE TABLE portfolio_holding (
+            snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshot(snapshot_id),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            quantity_microunits INTEGER NOT NULL CHECK(quantity_microunits>=0),
+            sellable_quantity_microunits INTEGER,
+            sellable_status TEXT NOT NULL CHECK(sellable_status IN ('KNOWN','STALE','UNKNOWN')),
+            market_value_microusd INTEGER,
+            valuation_status TEXT NOT NULL CHECK(valuation_status IN ('KNOWN','STALE','UNKNOWN')),
+            sector TEXT, sector_status TEXT NOT NULL CHECK(sector_status IN ('KNOWN','UNKNOWN')),
+            provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json) AND json_type(provenance_json)='object'),
+            PRIMARY KEY (snapshot_id, security_id),
+            CHECK(sellable_quantity_microunits IS NULL OR sellable_quantity_microunits BETWEEN 0 AND quantity_microunits),
+            CHECK((sellable_status='UNKNOWN')=(sellable_quantity_microunits IS NULL)),
+            CHECK(market_value_microusd IS NULL OR market_value_microusd>=0),
+            CHECK((valuation_status='UNKNOWN')=(market_value_microusd IS NULL)),
+            CHECK((sector_status='UNKNOWN')=(sector IS NULL)),
+            CHECK(sector IS NULL OR length(trim(sector))>0)
+        );
+        CREATE TABLE portfolio_market_input (
+            snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshot(snapshot_id),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            mark_price_microusd INTEGER, price_as_of TEXT, price_status TEXT NOT NULL CHECK(price_status IN ('KNOWN','STALE','UNKNOWN')),
+            avg_dollar_volume_microusd INTEGER, liquidity_as_of TEXT, liquidity_status TEXT NOT NULL CHECK(liquidity_status IN ('KNOWN','STALE','UNKNOWN')),
+            evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json) AND json_type(evidence_ids_json)='array'),
+            PRIMARY KEY (snapshot_id, security_id),
+            CHECK(mark_price_microusd IS NULL OR mark_price_microusd>0),
+            CHECK((price_status='UNKNOWN')=(mark_price_microusd IS NULL)),
+            CHECK((price_status='UNKNOWN')=(price_as_of IS NULL)),
+            CHECK(avg_dollar_volume_microusd IS NULL OR avg_dollar_volume_microusd>=0),
+            CHECK((liquidity_status='UNKNOWN')=(avg_dollar_volume_microusd IS NULL)),
+            CHECK((liquidity_status='UNKNOWN')=(liquidity_as_of IS NULL))
+        );
+        CREATE TABLE portfolio_signal_input (
+            signal_input_id TEXT PRIMARY KEY CHECK(length(signal_input_id)=64),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            as_of TEXT NOT NULL,
+            remaining_opportunity_ppm INTEGER,
+            opportunity_status TEXT NOT NULL CHECK(opportunity_status IN ('KNOWN','UNKNOWN')),
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('FIXTURE','COMMITTEE_STRUCTURED','DETERMINISTIC_METRIC','OWNER_ATTESTED')),
+            evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json) AND json_type(evidence_ids_json)='array'),
+            input_hash TEXT NOT NULL UNIQUE CHECK(length(input_hash)=64),
+            recorded_at TEXT NOT NULL,
+            CHECK(remaining_opportunity_ppm IS NULL OR remaining_opportunity_ppm BETWEEN 0 AND 1000000),
+            CHECK((opportunity_status='UNKNOWN')=(remaining_opportunity_ppm IS NULL))
+        );
+        CREATE TABLE thesis_break_event (
+            event_id TEXT PRIMARY KEY CHECK(length(event_id)=64),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            condition_id TEXT NOT NULL CHECK(length(trim(condition_id))>0),
+            condition_text TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json) AND json_type(evidence_ids_json)='array' AND json_array_length(evidence_ids_json)>0),
+            detection_score_snapshot_id TEXT NOT NULL REFERENCES score_snapshot(snapshot_id),
+            detected_at TEXT NOT NULL,
+            input_hash TEXT NOT NULL UNIQUE CHECK(length(input_hash)=64),
+            recorded_at TEXT NOT NULL
+        );
+        CREATE TABLE thesis_break_verification (
+            verification_id TEXT PRIMARY KEY CHECK(length(verification_id)=64),
+            event_id TEXT NOT NULL REFERENCES thesis_break_event(event_id),
+            status TEXT NOT NULL CHECK(status IN ('VERIFIED','REJECTED')),
+            verification_method TEXT NOT NULL CHECK(verification_method IN ('OWNER_ATTESTED','DETERMINISTIC_RULE','FIXTURE')),
+            verified_at TEXT NOT NULL,
+            score_snapshot_id TEXT NOT NULL REFERENCES score_snapshot(snapshot_id),
+            evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json) AND json_type(evidence_ids_json)='array' AND json_array_length(evidence_ids_json)>0),
+            verifier_ref TEXT NOT NULL CHECK(length(trim(verifier_ref))>0),
+            input_hash TEXT NOT NULL UNIQUE CHECK(length(input_hash)=64),
+            recorded_at TEXT NOT NULL
+        );
+        CREATE TABLE portfolio_run (
+            run_id TEXT PRIMARY KEY CHECK(length(run_id)=64),
+            pipeline_run_id TEXT NOT NULL REFERENCES pipeline_run(run_id),
+            decision_as_of TEXT NOT NULL,
+            portfolio_snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshot(snapshot_id),
+            policy_version TEXT NOT NULL REFERENCES portfolio_policy(policy_version),
+            score_set_hash TEXT NOT NULL CHECK(length(score_set_hash)=64),
+            signal_set_hash TEXT NOT NULL CHECK(length(signal_set_hash)=64),
+            candidate_set_hash TEXT NOT NULL CHECK(length(candidate_set_hash)=64),
+            invocation_key TEXT NOT NULL UNIQUE CHECK(length(invocation_key)=64),
+            state_prestate_hash TEXT NOT NULL CHECK(length(state_prestate_hash)=64),
+            market_data_prestate_hash TEXT NOT NULL CHECK(length(market_data_prestate_hash)=64),
+            budget_prestate_hash TEXT NOT NULL CHECK(length(budget_prestate_hash)=64),
+            input_hash TEXT NOT NULL UNIQUE CHECK(length(input_hash)=64),
+            expected_security_count INTEGER NOT NULL CHECK(expected_security_count>=0),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE portfolio_state_observation (
+            decision_id TEXT PRIMARY KEY CHECK(length(decision_id)=64),
+            run_id TEXT NOT NULL REFERENCES portfolio_run(run_id),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            current_state TEXT NOT NULL CHECK(current_state IN ('DISCOVER','WATCH','ENTER','HOLD','ADD','TRIM','EXIT')),
+            signal_state TEXT NOT NULL CHECK(signal_state IN ('DISCOVER','WATCH','ENTER','HOLD','ADD','TRIM','EXIT')),
+            proposed_state TEXT NOT NULL CHECK(proposed_state IN ('DISCOVER','WATCH','ENTER','HOLD','ADD','TRIM','EXIT')),
+            score_snapshot_id TEXT REFERENCES score_snapshot(snapshot_id),
+            signal_input_id TEXT REFERENCES portfolio_signal_input(signal_input_id),
+            portfolio_snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshot(snapshot_id),
+            policy_version TEXT NOT NULL REFERENCES portfolio_policy(policy_version),
+            scored_evidence_hash TEXT,
+            change_cause TEXT CHECK(change_cause IS NULL OR change_cause IN (
+                'INITIAL','EVIDENCE_DRIVEN','CORRECTION_RESTATEMENT','SCORING_VERSION_CHANGE',
+                'SCREEN_METHODOLOGY_CHANGE','MODEL_REASSESSMENT')),
+            evidence_driven INTEGER NOT NULL CHECK(evidence_driven IN (0,1)),
+            signal_status TEXT NOT NULL CHECK(signal_status IN ('PASS','INELIGIBLE','UNKNOWN','BLOCKED')),
+            persistence_count_at_decision INTEGER NOT NULL CHECK(persistence_count_at_decision>=0),
+            persistence_required INTEGER NOT NULL CHECK(persistence_required>=0),
+            material_change_satisfied INTEGER NOT NULL CHECK(material_change_satisfied IN (0,1)),
+            cooldown_satisfied INTEGER NOT NULL CHECK(cooldown_satisfied IN (0,1)),
+            risk_status TEXT NOT NULL CHECK(risk_status IN ('PASS','LIMITED','UNKNOWN','BLOCKED','NOT_RUN')),
+            final_status TEXT NOT NULL CHECK(final_status IN ('TRANSITIONED','PROPOSED','NO_ACTION','BLOCKED')),
+            reason_codes_json TEXT NOT NULL CHECK(json_valid(reason_codes_json) AND json_type(reason_codes_json)='array'),
+            risk_json TEXT NOT NULL CHECK(json_valid(risk_json) AND json_type(risk_json)='object'),
+            sizing_json TEXT NOT NULL CHECK(json_valid(sizing_json) AND json_type(sizing_json)='object'),
+            decision_input_hash TEXT NOT NULL CHECK(length(decision_input_hash)=64),
+            observed_at TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE TABLE portfolio_state_transition (
+            transition_id TEXT PRIMARY KEY CHECK(length(transition_id)=64),
+            decision_id TEXT NOT NULL UNIQUE REFERENCES portfolio_state_observation(decision_id),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            from_state TEXT NOT NULL CHECK(from_state IN ('DISCOVER','WATCH','ENTER','HOLD','ADD','TRIM','EXIT')),
+            to_state TEXT NOT NULL CHECK(to_state IN ('DISCOVER','WATCH','ENTER','HOLD','ADD','TRIM','EXIT')),
+            cause TEXT NOT NULL CHECK(cause IN ('RULE_PERSISTED','MATERIAL_CHANGE','VERIFIED_THESIS_BREAK','SETTLEMENT','COOLDOWN')),
+            reason_codes_json TEXT NOT NULL CHECK(json_valid(reason_codes_json) AND json_type(reason_codes_json)='array'),
+            score_snapshot_id TEXT NOT NULL REFERENCES score_snapshot(snapshot_id),
+            portfolio_snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshot(snapshot_id),
+            policy_version TEXT NOT NULL REFERENCES portfolio_policy(policy_version),
+            thesis_break_verification_id TEXT REFERENCES thesis_break_verification(verification_id),
+            persistence_count INTEGER NOT NULL CHECK(persistence_count>=0),
+            persistence_required INTEGER NOT NULL CHECK(persistence_required>=0),
+            effective_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            -- intentional single-writer semantics: at most one portfolio decision per
+            -- security per effective moment; concurrent same-as_of runs are serialized.
+            UNIQUE(security_id, effective_at),
+            CHECK(
+                (from_state='DISCOVER' AND to_state='WATCH')
+                OR (from_state='WATCH' AND to_state IN ('DISCOVER','ENTER'))
+                OR (from_state='ENTER' AND to_state='HOLD')
+                OR (from_state='ADD' AND to_state='HOLD')
+                OR (from_state='HOLD' AND to_state IN ('ADD','TRIM','EXIT'))
+                OR (from_state='TRIM' AND to_state IN ('HOLD','EXIT'))
+                OR (from_state='EXIT' AND to_state='WATCH')
+            ),
+            CHECK((cause='VERIFIED_THESIS_BREAK')=(thesis_break_verification_id IS NOT NULL))
+        );
+        CREATE TABLE portfolio_activity_day (
+            activity_date TEXT PRIMARY KEY CHECK(length(activity_date)=10),
+            policy_version TEXT NOT NULL REFERENCES portfolio_policy(policy_version),
+            max_actionable_count INTEGER NOT NULL CHECK(max_actionable_count>=0),
+            max_notional_microusd INTEGER NOT NULL CHECK(max_notional_microusd>=0),
+            day_start_cash_microusd INTEGER CHECK(day_start_cash_microusd IS NULL OR day_start_cash_microusd>=0),
+            input_hash TEXT NOT NULL UNIQUE CHECK(length(input_hash)=64),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE trade_proposal (
+            proposal_id TEXT PRIMARY KEY CHECK(length(proposal_id)=64),
+            decision_id TEXT NOT NULL UNIQUE REFERENCES portfolio_state_observation(decision_id),
+            transition_id TEXT NOT NULL UNIQUE REFERENCES portfolio_state_transition(transition_id),
+            activity_date TEXT NOT NULL REFERENCES portfolio_activity_day(activity_date),
+            security_id TEXT NOT NULL REFERENCES security(security_id),
+            current_state TEXT NOT NULL,
+            proposed_state TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('BUY','SELL')),
+            reason_codes_json TEXT NOT NULL CHECK(json_valid(reason_codes_json) AND json_type(reason_codes_json)='array' AND json_array_length(reason_codes_json)>0),
+            conviction_ppm INTEGER NOT NULL CHECK(conviction_ppm BETWEEN 0 AND 1000000),
+            data_quality_ppm INTEGER NOT NULL CHECK(data_quality_ppm BETWEEN 0 AND 1000000),
+            agreement_ppm INTEGER NOT NULL CHECK(agreement_ppm BETWEEN 0 AND 1000000),
+            trajectory TEXT NOT NULL CHECK(trajectory IN ('INITIAL','RISING','FALLING','STABLE','REBASED')),
+            current_weight_ppm INTEGER NOT NULL CHECK(current_weight_ppm BETWEEN 0 AND 1000000),
+            target_weight_ppm INTEGER NOT NULL CHECK(target_weight_ppm BETWEEN 0 AND 1000000),
+            max_quantity_microunits INTEGER NOT NULL CHECK(max_quantity_microunits>0),
+            completion_quantity_microunits INTEGER NOT NULL CHECK(completion_quantity_microunits>=0),
+            max_notional_microusd INTEGER NOT NULL CHECK(max_notional_microusd>0),
+            order_constraints_json TEXT NOT NULL CHECK(json_valid(order_constraints_json) AND json_type(order_constraints_json)='object'),
+            score_snapshot_id TEXT NOT NULL REFERENCES score_snapshot(snapshot_id),
+            portfolio_snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshot(snapshot_id),
+            policy_version TEXT NOT NULL,
+            sizing_policy_version TEXT NOT NULL,
+            proposal_mode TEXT NOT NULL CHECK(proposal_mode='PAPER'),
+            requires_human_approval INTEGER NOT NULL CHECK(requires_human_approval=1),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(policy_version, sizing_policy_version)
+                REFERENCES portfolio_policy(policy_version, sizing_policy_version),
+            CHECK(
+                (action='BUY' AND target_weight_ppm>current_weight_ppm
+                 AND ((current_state='WATCH' AND proposed_state='ENTER')
+                      OR (current_state='HOLD' AND proposed_state='ADD')))
+                OR (action='SELL' AND target_weight_ppm<current_weight_ppm
+                    AND ((current_state='HOLD' AND proposed_state IN ('TRIM','EXIT'))
+                         OR (current_state='TRIM' AND proposed_state='EXIT')))
+            )
+        );
+        CREATE TABLE portfolio_briefing (
+            briefing_id TEXT PRIMARY KEY CHECK(length(briefing_id)=64),
+            run_id TEXT NOT NULL REFERENCES portfolio_run(run_id),
+            format_version TEXT NOT NULL CHECK(format_version='MWF_V1'),
+            body_text TEXT NOT NULL,
+            body_hash TEXT NOT NULL CHECK(length(body_hash)=64),
+            created_at TEXT NOT NULL,
+            UNIQUE(run_id, format_version)
+        );
+        CREATE INDEX portfolio_obs_persistence_idx ON portfolio_state_observation(
+            security_id, policy_version, evidence_driven, observed_at);
+        CREATE INDEX portfolio_transition_security_idx ON portfolio_state_transition(
+            security_id, effective_at);
+        CREATE INDEX portfolio_proposal_date_idx ON trade_proposal(activity_date);
+        CREATE TRIGGER trade_proposal_sell_reason_guard BEFORE INSERT ON trade_proposal
+        WHEN NEW.action='SELL' AND EXISTS(
+            SELECT 1 FROM json_each(NEW.reason_codes_json)
+            WHERE value NOT IN ('thesis_broken','thesis_realised','opportunity_cost','risk_reduction','data_integrity','policy_ineligible')
+        )
+        BEGIN SELECT RAISE(ABORT, 'invalid SELL reason'); END;
+        CREATE TRIGGER trade_proposal_sell_bounds_guard BEFORE INSERT ON trade_proposal
+        WHEN NEW.action='SELL' AND (
+            (NEW.completion_quantity_microunits <> 0 AND NEW.proposed_state='EXIT')
+            OR EXISTS (
+                SELECT 1 FROM portfolio_holding h LEFT JOIN portfolio_market_input m
+                ON m.snapshot_id=h.snapshot_id AND m.security_id=h.security_id
+                WHERE h.snapshot_id=NEW.portfolio_snapshot_id AND h.security_id=NEW.security_id
+                  AND h.sellable_status='KNOWN'
+                  AND (NEW.max_quantity_microunits > h.sellable_quantity_microunits
+                       OR h.sellable_quantity_microunits > h.quantity_microunits
+                       OR (m.price_status='KNOWN' AND NEW.max_notional_microusd >
+                           NEW.max_quantity_microunits * m.mark_price_microusd / 1000000))
+            )
+        )
+        BEGIN SELECT RAISE(ABORT, 'SELL proposal violates holdings bounds (sellable/exit completion/notional)'); END;
+        CREATE TRIGGER portfolio_policy_no_update BEFORE UPDATE ON portfolio_policy BEGIN SELECT RAISE(ABORT, 'portfolio_policy is append-only'); END;
+        CREATE TRIGGER portfolio_policy_no_delete BEFORE DELETE ON portfolio_policy BEGIN SELECT RAISE(ABORT, 'portfolio_policy is append-only'); END;
+        CREATE TRIGGER portfolio_snapshot_no_update BEFORE UPDATE ON portfolio_snapshot BEGIN SELECT RAISE(ABORT, 'portfolio_snapshot is append-only'); END;
+        CREATE TRIGGER portfolio_snapshot_no_delete BEFORE DELETE ON portfolio_snapshot BEGIN SELECT RAISE(ABORT, 'portfolio_snapshot is append-only'); END;
+        CREATE TRIGGER portfolio_holding_no_update BEFORE UPDATE ON portfolio_holding BEGIN SELECT RAISE(ABORT, 'portfolio_holding is append-only'); END;
+        CREATE TRIGGER portfolio_holding_no_delete BEFORE DELETE ON portfolio_holding BEGIN SELECT RAISE(ABORT, 'portfolio_holding is append-only'); END;
+        CREATE TRIGGER portfolio_market_input_no_update BEFORE UPDATE ON portfolio_market_input BEGIN SELECT RAISE(ABORT, 'portfolio_market_input is append-only'); END;
+        CREATE TRIGGER portfolio_market_input_no_delete BEFORE DELETE ON portfolio_market_input BEGIN SELECT RAISE(ABORT, 'portfolio_market_input is append-only'); END;
+        CREATE TRIGGER portfolio_signal_input_no_update BEFORE UPDATE ON portfolio_signal_input BEGIN SELECT RAISE(ABORT, 'portfolio_signal_input is append-only'); END;
+        CREATE TRIGGER portfolio_signal_input_no_delete BEFORE DELETE ON portfolio_signal_input BEGIN SELECT RAISE(ABORT, 'portfolio_signal_input is append-only'); END;
+        CREATE TRIGGER thesis_break_event_no_update BEFORE UPDATE ON thesis_break_event BEGIN SELECT RAISE(ABORT, 'thesis_break_event is append-only'); END;
+        CREATE TRIGGER thesis_break_event_no_delete BEFORE DELETE ON thesis_break_event BEGIN SELECT RAISE(ABORT, 'thesis_break_event is append-only'); END;
+        CREATE TRIGGER thesis_break_verification_no_update BEFORE UPDATE ON thesis_break_verification BEGIN SELECT RAISE(ABORT, 'thesis_break_verification is append-only'); END;
+        CREATE TRIGGER thesis_break_verification_no_delete BEFORE DELETE ON thesis_break_verification BEGIN SELECT RAISE(ABORT, 'thesis_break_verification is append-only'); END;
+        CREATE TRIGGER portfolio_run_no_update BEFORE UPDATE ON portfolio_run BEGIN SELECT RAISE(ABORT, 'portfolio_run is append-only'); END;
+        CREATE TRIGGER portfolio_run_no_delete BEFORE DELETE ON portfolio_run BEGIN SELECT RAISE(ABORT, 'portfolio_run is append-only'); END;
+        CREATE TRIGGER portfolio_state_observation_no_update BEFORE UPDATE ON portfolio_state_observation BEGIN SELECT RAISE(ABORT, 'portfolio_state_observation is append-only'); END;
+        CREATE TRIGGER portfolio_state_observation_no_delete BEFORE DELETE ON portfolio_state_observation BEGIN SELECT RAISE(ABORT, 'portfolio_state_observation is append-only'); END;
+        CREATE TRIGGER portfolio_state_transition_no_update BEFORE UPDATE ON portfolio_state_transition BEGIN SELECT RAISE(ABORT, 'portfolio_state_transition is append-only'); END;
+        CREATE TRIGGER portfolio_state_transition_no_delete BEFORE DELETE ON portfolio_state_transition BEGIN SELECT RAISE(ABORT, 'portfolio_state_transition is append-only'); END;
+        CREATE TRIGGER portfolio_activity_day_no_update BEFORE UPDATE ON portfolio_activity_day BEGIN SELECT RAISE(ABORT, 'portfolio_activity_day is append-only'); END;
+        CREATE TRIGGER portfolio_activity_day_no_delete BEFORE DELETE ON portfolio_activity_day BEGIN SELECT RAISE(ABORT, 'portfolio_activity_day is append-only'); END;
+        CREATE TRIGGER trade_proposal_no_update BEFORE UPDATE ON trade_proposal BEGIN SELECT RAISE(ABORT, 'trade_proposal is append-only'); END;
+        CREATE TRIGGER trade_proposal_no_delete BEFORE DELETE ON trade_proposal BEGIN SELECT RAISE(ABORT, 'trade_proposal is append-only'); END;
+        CREATE TRIGGER portfolio_briefing_no_update BEFORE UPDATE ON portfolio_briefing BEGIN SELECT RAISE(ABORT, 'portfolio_briefing is append-only'); END;
+        CREATE TRIGGER portfolio_briefing_no_delete BEFORE DELETE ON portfolio_briefing BEGIN SELECT RAISE(ABORT, 'portfolio_briefing is append-only'); END;
         """,
     ),
 )

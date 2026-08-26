@@ -357,13 +357,23 @@ a token leaks into a session.
 | T10 Private info leakage | Evidence-ID-required validation at assessment insert | Design | Not yet built (Phase 2). |
 | T11 Hallucinated citations | Evidence-ID resolution check before insert | Design | Not yet built (Phase 2). |
 | T12 Model/provider compromise | No provider credentials in `tradehub-research`; diversity across analysts (not treated as independence) | Design | Correlated-provider-failure risk remains residual by design (see canonical spec). |
-| T13 Runaway orchestration | Bounded candidate funnel; gated Stage 3/4; reject out-of-run submissions | Design | Not yet built (Phase 1/2). |
+| T13 Runaway orchestration | Bounded candidate funnel; gated Stage 3/4; reject out-of-run submissions | Design | Funnel + score gates built (Phase 1/2); portfolio plane adds hysteresis/persistence, verified thesis-break lineage, and the daily aggregate budget — still to be wired into the Hermes companion skill (Epic 7). |
 | T14 Research plane altering policy | No write code path to execution-core config; recommend separate OS users | Design | OS-user separation is a deployment recommendation (Epic 7), not yet enforced. |
-| T15 Secrets in research artifacts | Opaque token references only; reuse `acceptance/sanitize.py` pattern | Design | Not yet built (Epic 7). |
-| T16 Committee/execution session co-location | Session separation (committee sessions never attach `tradehub-mcp`); opaque token references only; Telegram-only confirmation with re-rendered order; daily aggregate notional + order-count budget | Design | Deployment requirement (Epic 7). Supersedes the claim that a compromised Hermes environment is limited to "bad research input" (see Residual Risks below). |
+| T15 Secrets in research artifacts | Opaque token references only; reuse `acceptance/sanitize.py` pattern | Design | Phase 3: RA-03-26 AST-scans the research plane for execution imports, `/orders/*`, confirmation-token vocabulary, and Tiger credential names (PASS); briefing renders only fixed label maps and typed fields, never raw evidence/tokens. Broker-token artifacts remain an Epic 7 deployment item. |
+| T16 Committee/execution session co-location | Session separation (committee sessions never attach `tradehub-mcp`); opaque token references only; Telegram-only confirmation with re-rendered order; daily aggregate notional + order-count budget | Partial | Phase 3 implements the research-plane half: `portfolio_activity_day` first-writer-wins binding, count+notional caps derived from the immutable `trade_proposal` ledger, restart-safe, duplicate-consumption-proof (RA-03-21/22/23 PASS). Session separation + Telegram confirmation remain Epic 7 deployment items. |
 
-All statuses are **Design** — none of this is implemented yet. This table should be updated to
-**Done** per-row as each Epic (see `docs/v2-architecture-review.md`) lands, the same discipline the
+Phase 3 (2026-08-26) implementation status: the portfolio plane (`tradehub_research/portfolio/`)
+implements §13 end-to-end — canonical 11-edge state machine with derived current state and an
+immutable transition ledger, versioned POLICY contract (no hardcoded doctrine; FIXTURE/PROVISIONAL/
+PAPER gating, fail closed), score-driven eligibility that can never trade by itself, evidence-driven
+persistence (rebase/rerun/unchanged evidence never counts), verified thesis-break bypass, SELL
+asymmetry with long-only guards, deterministic band sizing with cash/no-action first-class,
+PIT-correct risk measures (volatility/correlation/ADV from the evidence ledger, honest UNKNOWN),
+and a terse deterministic briefing. Qualified by RA-03 (26/26 assertions) in
+`tradehub_research/acceptance/packs/ra03.py`.
+
+Statuses are **Design** until the controlling Epic lands, and are moved to **Partial**/**Done**
+per-row as each Epic (see `docs/v2-architecture-review.md`) ships, the same discipline the
 existing T1–T7 table already follows.
 
 ### Residual Risks (V2, Accepted for Now)

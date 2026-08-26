@@ -28,7 +28,7 @@ from tradehub_research.committee.routing import (
 from tradehub_research.committee.scoring import Scorer, classify_trajectory, score_screens
 from tradehub_research.committee.store import CommitteeStore, ComparatorSpec, ScoringSpec
 from tradehub_research.db import ResearchDB
-from tradehub_research.schema import MIGRATIONS
+from tradehub_research.schema import MIGRATIONS, PHASE_0_SCHEMA_VERSION
 from tradehub_research.screens import ScreenResult, ScreenSpec, canonical_json
 
 TOOLS = {"get_evidence_pack", "submit_assessment", "committee_status"}
@@ -783,7 +783,7 @@ def phase01_preserved(tmp: Path) -> None:
             conn.execute("INSERT INTO schema_version VALUES (?,?,?)", (version, "now", description))
         conn.execute("CREATE TABLE sentinel(value TEXT)")
         conn.execute("INSERT INTO sentinel VALUES ('unchanged')")
-    assert db.migrate() == 9
+    assert db.migrate() == PHASE_0_SCHEMA_VERSION == 10
     with db.connect(read_only=True) as conn:
         assert conn.execute("SELECT value FROM sentinel").fetchone()[0] == "unchanged"
 

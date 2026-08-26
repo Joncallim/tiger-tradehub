@@ -785,12 +785,14 @@ def test_research_acceptance_registry_is_an_explicit_whitelist():
     from tradehub_research.acceptance.packs.ra00 import ASSERTIONS as RA00_ASSERTIONS
     from tradehub_research.acceptance.packs.ra01 import ASSERTIONS as RA01_ASSERTIONS
     from tradehub_research.acceptance.packs.ra02 import ASSERTIONS as RA02_ASSERTIONS
+    from tradehub_research.acceptance.packs.ra03 import ASSERTIONS as RA03_ASSERTIONS
     from tradehub_research.acceptance.runner import PACK_REGISTRY
 
     assert PACK_REGISTRY == {
         "RA-00": RA00_ASSERTIONS,
         "RA-01": RA01_ASSERTIONS,
         "RA-02": RA02_ASSERTIONS,
+        "RA-03": RA03_ASSERTIONS,
     }
     assert [assertion_id for assertion_id, _ in PACK_REGISTRY["RA-00"]] == [
         "schema.version",
