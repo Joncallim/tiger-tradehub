@@ -105,10 +105,10 @@ class Phase4Runtime:
         with self.database.connect() as db:
             db.execute(
                 "INSERT INTO phase4_execution_link "
-                "(proposal_id,execution_ref,state,confirmation_token_ref,previewed_at) "
+                "(proposal_id,execution_ref,state,approval_ref_hash,previewed_at) "
                 "VALUES (?,?,?,?,?) "
                 "ON CONFLICT(proposal_id) DO UPDATE SET execution_ref=excluded.execution_ref, "
-                "state=excluded.state,confirmation_token_ref=excluded.confirmation_token_ref,"
+                "state=excluded.state,approval_ref_hash=excluded.approval_ref_hash,"
                 "previewed_at=excluded.previewed_at",
                 (proposal_id, execution_ref, "PREVIEWED", token_ref, _now()),
             )

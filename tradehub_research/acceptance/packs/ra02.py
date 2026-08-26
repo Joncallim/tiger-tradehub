@@ -783,7 +783,7 @@ def phase01_preserved(tmp: Path) -> None:
             conn.execute("INSERT INTO schema_version VALUES (?,?,?)", (version, "now", description))
         conn.execute("CREATE TABLE sentinel(value TEXT)")
         conn.execute("INSERT INTO sentinel VALUES ('unchanged')")
-    assert db.migrate() == PHASE_0_SCHEMA_VERSION == 10
+    assert db.migrate() == PHASE_0_SCHEMA_VERSION == 11
     with db.connect(read_only=True) as conn:
         assert conn.execute("SELECT value FROM sentinel").fetchone()[0] == "unchanged"
 

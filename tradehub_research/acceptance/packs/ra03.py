@@ -540,7 +540,7 @@ def ra03_00_upstream_packs_pass_same_commit(tmp: Path) -> None:
 
 def ra03_01_migration_and_append_only(tmp: Path) -> None:
     database = _runtime(tmp)
-    assert database.schema_version() == PHASE_0_SCHEMA_VERSION == 10
+    assert database.schema_version() == PHASE_0_SCHEMA_VERSION == 11
     with database.connect() as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         required = {

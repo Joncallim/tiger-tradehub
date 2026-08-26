@@ -1001,7 +1001,7 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             proposal_id TEXT PRIMARY KEY REFERENCES trade_proposal(proposal_id),
             execution_ref TEXT NOT NULL UNIQUE,
             state TEXT NOT NULL,
-            confirmation_token_ref TEXT CHECK(confirmation_token_ref IS NULL OR length(confirmation_token_ref)=64),
+            approval_ref_hash TEXT CHECK(approval_ref_hash IS NULL OR length(approval_ref_hash)=64),
             broker_order_ref TEXT,
             previewed_at TEXT,
             approved_at TEXT,
