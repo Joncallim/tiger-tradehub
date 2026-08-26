@@ -7,13 +7,27 @@ import httpx
 
 
 class TradeHubClient:
-    def __init__(self, base_url: str | None = None, api_token: str | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_token: str | None = None,
+        preview_only: bool = False,
+    ):
         self.base_url = (
             base_url or os.getenv("TRADEHUB_BASE_URL") or "http://127.0.0.1:8787"
         ).rstrip("/")
-        self.api_token = api_token or os.getenv("TRADEHUB_API_TOKEN")
+        self.preview_only = preview_only
+        self.api_token = api_token or (
+            os.getenv("TRADEHUB_PREVIEW_API_TOKEN")
+            if preview_only
+            else os.getenv("TRADEHUB_API_TOKEN")
+        )
         if not self.api_token:
-            raise RuntimeError("TRADEHUB_API_TOKEN is required")
+            raise RuntimeError(
+                "TRADEHUB_PREVIEW_API_TOKEN is required"
+                if preview_only
+                else "TRADEHUB_API_TOKEN is required"
+            )
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_token}"}
@@ -27,6 +41,8 @@ class TradeHubClient:
             return response.json()
 
     async def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.preview_only and path != "/orders/preview":
+            raise RuntimeError("preview-only capability cannot call execution write paths")
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 f"{self.base_url}{path}", headers=self._headers(), json=payload

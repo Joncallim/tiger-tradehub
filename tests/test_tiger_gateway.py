@@ -2,7 +2,12 @@ import json
 
 from tradehub.config import Settings
 from tradehub.models import OrderIntent
-from tradehub.tiger_gateway import TigerGateway, normalize, normalize_collection
+from tradehub.tiger_gateway import (
+    TigerGateway,
+    classify_preview,
+    normalize,
+    normalize_collection,
+)
 
 STRONG_TOKEN = "test-token-with-enough-length"
 
@@ -106,10 +111,42 @@ def settings():
     )
 
 
+def test_classify_preview_accepts_documented_success_shape():
+    assert (
+        classify_preview(
+            {
+                "init_margin_before": 0,
+                "init_margin": 0,
+                "maint_margin_before": 0,
+                "maint_margin": 0,
+                "margin_currency": "USD",
+                "equity_with_loan_before": 100,
+                "equity_with_loan": 100,
+                "min_commission": 0,
+                "max_commission": 1,
+                "commission_currency": "USD",
+            }
+        )
+        == "accepted"
+    )
+
+
+def test_classify_preview_rejects_warning_only_shape():
+    assert classify_preview({"warning_text": "insufficient buying power"}) == "rejected"
+
+
+def test_classify_preview_fails_closed_for_unknown_shape():
+    assert classify_preview({"status": "skipped"}) == "unknown"
+
+
+def test_classify_preview_fails_closed_for_none():
+    assert classify_preview(None) == "unknown"
+
+
 def test_cancel_order_passes_global_order_id_via_id_param():
     """tigeropen's cancel_order has two distinct params: `id` (global order id, what
     place_order returns and what TradeHub records) and `order_id` (account-specific
-    id). Passing the global id via `order_id` is rejected by Tiger with
+    id). Passing the global id into `order_id` is rejected by Tiger with
     ApiException code=1010 'biz param error'; only `id` works."""
     gateway = TigerGateway(settings())
     client = FakeTradeClient()

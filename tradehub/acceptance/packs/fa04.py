@@ -36,6 +36,10 @@ def _headers(manager: ServiceManager) -> dict[str, str]:
     return {"Authorization": f"Bearer {manager.env.get('TRADEHUB_API_TOKEN', '')}"}
 
 
+def _preview_headers(manager: ServiceManager) -> dict[str, str]:
+    return {"Authorization": f"Bearer {manager.env.get('TRADEHUB_PREVIEW_API_TOKEN', '')}"}
+
+
 def build_fa04_pack() -> PackDefinition:
     def _get_manager(ctx: RunContext, env_overrides: dict[str, str] | None = None):
         from tradehub.acceptance.service import get_service
@@ -103,7 +107,7 @@ def build_fa04_pack() -> PackDefinition:
         for label, payload in cases:
             response = httpx.post(
                 f"{_base(manager)}/orders/preview",
-                headers=_headers(manager),
+                headers=_preview_headers(manager),
                 json=payload,
                 timeout=10,
             )
@@ -116,7 +120,7 @@ def build_fa04_pack() -> PackDefinition:
         for label, payload in cases:
             response = httpx.post(
                 f"{_base(manager)}/orders/preview",
-                headers=_headers(manager),
+                headers=_preview_headers(manager),
                 json=payload,
                 timeout=10,
             )
@@ -165,7 +169,10 @@ def build_fa04_pack() -> PackDefinition:
         ]
         for payload in bad_payloads:
             response = httpx.post(
-                f"{base}/orders/preview", headers=_headers(manager), json=payload, timeout=10
+                f"{base}/orders/preview",
+                headers=_preview_headers(manager),
+                json=payload,
+                timeout=10,
             )
             if response.status_code not in (400, 422):
                 raise AssertionError_(
@@ -177,7 +184,7 @@ def build_fa04_pack() -> PackDefinition:
         base = _base(manager)
         preview = httpx.post(
             f"{base}/orders/preview",
-            headers=_headers(manager),
+            headers=_preview_headers(manager),
             json={
                 "symbol": ALLOWLISTED,
                 "side": "BUY",
@@ -220,7 +227,7 @@ def build_fa04_pack() -> PackDefinition:
         base = _base(manager)
         preview = httpx.post(
             f"{base}/orders/preview",
-            headers=_headers(manager),
+            headers=_preview_headers(manager),
             json={
                 "symbol": ALLOWLISTED,
                 "side": "BUY",
@@ -254,7 +261,7 @@ def build_fa04_pack() -> PackDefinition:
         before = _count_events(db_path)
         preview = httpx.post(
             f"{_base(manager)}/orders/preview",
-            headers=_headers(manager),
+            headers=_preview_headers(manager),
             json={
                 "symbol": ALLOWLISTED,
                 "side": "BUY",

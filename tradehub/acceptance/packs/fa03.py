@@ -42,6 +42,7 @@ def _mcp_env(ctx: RunContext) -> dict[str, str]:
     return {
         "TRADEHUB_BASE_URL": f"http://{manager.host}:{manager.port}",
         "TRADEHUB_API_TOKEN": manager.env.get("TRADEHUB_API_TOKEN", ""),
+        "TRADEHUB_PREVIEW_API_TOKEN": manager.env.get("TRADEHUB_PREVIEW_API_TOKEN", ""),
         "PATH": manager.env.get("PATH", ""),
     }
 
