@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 
@@ -10,7 +10,7 @@ class ProposalExecutionError(ValueError):
     pass
 
 
-class SettlementState(StrEnum):
+class SettlementState(str, Enum):
     FILLED = "FILLED"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     OPEN = "OPEN"
