@@ -17,6 +17,10 @@ install -d -o root -g root -m 0755 /opt/tiger-tradehub
 # The service identities need read/execute access to this root-owned tree.
 install -d -o tradehub-execution -g tradehub-execution -m 0750 /var/lib/tradehub
 install -d -o tradehub-research -g tradehub-research -m 0750 /var/lib/tradehub-research
+# Provision the files with explicit modes; do not rely on the caller's umask.
+install -o root -g tradehub-execution -m 0640 /path/to/execution.env /etc/tradehub/execution.env
+install -o root -g tradehub-research -m 0640 /path/to/research.env /etc/tradehub/research.env
+install -o root -g tradehub-execution -m 0640 /path/to/tiger_private_key.pk8 /etc/tradehub/tiger_private_key.pk8
 ```
 
 `/etc/tradehub/execution.env`; set `TRADEHUB_DATABASE_PATH=/var/lib/tradehub/tradehub.db` there. Store execution-only values
