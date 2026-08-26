@@ -247,7 +247,10 @@ def classify_preview(value: dict[str, Any] | None) -> str:
     if not isinstance(value, dict):
         return "unknown"
     warning = value.get("warning_text")
-    if isinstance(warning, str) and warning.strip():
+    message = value.get("message")
+    if (isinstance(warning, str) and warning.strip()) or (
+        isinstance(message, str) and message.strip()
+    ):
         return "rejected"
     if value.get("is_pass") is False:
         return "rejected"

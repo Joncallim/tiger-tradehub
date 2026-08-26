@@ -135,6 +135,28 @@ def test_classify_preview_rejects_warning_only_shape():
     assert classify_preview({"warning_text": "insufficient buying power"}) == "rejected"
 
 
+def test_classify_preview_rejects_nonempty_message_even_when_is_pass_true():
+    assert (
+        classify_preview(
+            {
+                "is_pass": True,
+                "message": "cannot submit this order",
+                "init_margin": 0,
+                "maint_margin": 0,
+                "equity_with_loan": 100,
+                "margin_currency": "USD",
+                "commission_currency": "USD",
+                "commission": 0,
+            }
+        )
+        == "rejected"
+    )
+
+
+def test_classify_preview_rejects_is_pass_false():
+    assert classify_preview({"is_pass": False, "message": "rejected"}) == "rejected"
+
+
 def test_classify_preview_fails_closed_for_unknown_shape():
     assert classify_preview({"status": "skipped"}) == "unknown"
 

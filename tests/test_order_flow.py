@@ -194,6 +194,41 @@ def test_preview_capability_cannot_submit(tmp_path):
     assert submit.status_code == 401
 
 
+def test_preview_capability_is_rejected_by_every_privileged_route(tmp_path):
+    db_path = tmp_path / "capability-routes.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_PREVIEW_API_TOKEN="preview-token-with-enough-length",
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    install(settings, store, gateway, preserve_preview=True)
+    payloads = {
+        "/orders/submit": {"confirmation_token": "not-a-real-token-value"},
+        "/orders/cancel": {"order_id": "broker-order-1"},
+        "/orders/submit/reconcile": {"confirmation_token": "not-a-real-token-value"},
+        "/orders/submit/resolve": {
+            "confirmation_token": "not-a-real-token-value",
+            "resolver": "test",
+            "global_order_id": "broker-order-1",
+        },
+    }
+    try:
+        client = TestClient(app)
+        for path, payload in payloads.items():
+            response = client.post(
+                path,
+                json=payload,
+                headers={"Authorization": "Bearer preview-token-with-enough-length"},
+            )
+            assert response.status_code == 401, (path, response.text)
+        assert gateway.placed_orders == []
+        assert gateway.cancel_order_id is None
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_preview_and_dry_run_submit_create_and_finalize_confirmation(tmp_path):
     db_path = tmp_path / "tradehub.db"
     settings = Settings(TRADEHUB_API_TOKEN=STRONG_TOKEN, TRADEHUB_DATABASE_PATH=db_path)

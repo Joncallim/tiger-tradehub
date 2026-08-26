@@ -2213,8 +2213,7 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_read_only_api.py",
         "tests/test_telegram_bot.py",
         "tests/test_tiger_gateway.py",
-        # pre-existing research test that deliberately uses __import__ to probe
-        # the research adapters (std-lib modules only, no execution surface)
+        "tests/test_runtime_isolation.py",
         "tests/test_research_adapters.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of
         # execution vocabulary in the research capability profile
