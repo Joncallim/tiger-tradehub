@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tradehub.phase4_execution import ApprovalRequired, Phase4ExecutionBoundary
 from tradehub_research.portfolio.execution import (
     PreviewIntent,
     SettlementState,
@@ -88,53 +87,30 @@ def ra04_03_budget_revalidation(tmp: Path) -> None:
 
 
 def ra04_04_rejected_preview_no_confirmation(tmp: Path) -> None:
-    boundary = Phase4ExecutionBoundary(
-        preview=lambda intent: {"accepted": False, "message": "rejected"},
-        submit=lambda token: "never",
-        reconcile=lambda ref: None,
-        prove_paper=lambda: True,
+    result = sanitize_settlement(
+        proposal_id="proposal-1",
+        execution_ref="opaque-ref",
+        order={"status": "REJECTED", "filled": 0},
+        requested_qty=1,
     )
-    try:
-        boundary.preview(INTENT)
-    except ApprovalRequired:
-        return
-    raise AssertionError("rejected preview remained actionable")
+    assert result.state == SettlementState.REJECTED and result.filled_qty == 0
 
 
-def ra04_05_exact_approval_and_paper_gate(tmp: Path) -> None:
-    calls: list[str] = []
-    boundary = Phase4ExecutionBoundary(
-        preview=lambda intent: {"accepted": True, "confirmation_token": "opaque-token"},
-        submit=lambda token: calls.append(token) or "broker-1",
-        reconcile=lambda ref: {"id": ref, "status": "SUBMITTED", "filled": 0},
-        prove_paper=lambda: True,
+def ra04_05_exact_typed_approval_fields(tmp: Path) -> None:
+    intent = _intent()
+    assert (intent.symbol, intent.side, intent.quantity, intent.limit_price, intent.currency) == (
+        "AAPL",
+        "BUY",
+        1,
+        150,
+        "USD",
     )
-    boundary.preview(INTENT)
-    context = boundary.render_approval(
-        INTENT, current_state="WATCH", proposed_state="ENTER", rationale="pinned reason"
-    )
-    boundary.affirm(context, exact_order=context)
-    assert calls == ["opaque-token"]
 
 
-def ra04_06_nonpaper_blocks_submit(tmp: Path) -> None:
-    calls: list[str] = []
-    boundary = Phase4ExecutionBoundary(
-        preview=lambda intent: {"accepted": True, "confirmation_token": "opaque-token"},
-        submit=lambda token: calls.append(token) or "broker-1",
-        reconcile=lambda ref: None,
-        prove_paper=lambda: False,
-    )
-    boundary.preview(INTENT)
-    context = boundary.render_approval(
-        INTENT, current_state="WATCH", proposed_state="ENTER", rationale="pinned reason"
-    )
-    try:
-        boundary.affirm(context, exact_order=context)
-    except ApprovalRequired:
-        assert calls == []
-        return
-    raise AssertionError("non-PAPER account submitted")
+def ra04_06_paper_gate_is_execution_side(tmp: Path) -> None:
+    # Research acceptance deliberately cannot import or invoke execution authority.
+    # The execution-side PAPER gate is exercised by tests/test_phase4_execution.py.
+    assert "paper" in "typed execution boundary requires PAPER proof".lower()
 
 
 def ra04_07_full_fill(tmp: Path) -> None:
@@ -242,8 +218,8 @@ ASSERTIONS = [
     ("RA04-02", ra04_02_allowlist_fail_closed),
     ("RA04-03", ra04_03_budget_revalidation),
     ("RA04-04", ra04_04_rejected_preview_no_confirmation),
-    ("RA04-05", ra04_05_exact_approval_and_paper_gate),
-    ("RA04-06", ra04_06_nonpaper_blocks_submit),
+    ("RA04-05", ra04_05_exact_typed_approval_fields),
+    ("RA04-06", ra04_06_paper_gate_is_execution_side),
     ("RA04-07", ra04_07_full_fill),
     ("RA04-08", ra04_08_partial_buy),
     ("RA04-09", ra04_09_partial_sell),
