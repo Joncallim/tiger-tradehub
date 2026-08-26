@@ -21,6 +21,19 @@ PROPOSAL = {
 }
 
 
+def test_stable_security_id_uses_canonical_ticker():
+    proposal = {**PROPOSAL, "security_id": "sec-123", "canonical_ticker": "AAPL"}
+    intent = proposal_to_preview_intent(
+        proposal,
+        allowlist={"AAPL"},
+        current_day_count=0,
+        current_day_notional=0,
+        max_day_count=3,
+        max_day_notional=1000,
+    )
+    assert intent.symbol == "AAPL"
+
+
 def test_proposal_translation_is_typed_and_deterministic():
     one = proposal_to_preview_intent(
         PROPOSAL,
@@ -116,6 +129,26 @@ def test_unfilled_enter_does_not_create_hold():
     assert not result.portfolio_mutated
     assert result.owned_quantity == 0
     assert result.next_state == "ENTER"
+
+
+def test_terminal_zero_fill_buy_restores_prior_state():
+    settlement = sanitize_settlement(
+        proposal_id="p5",
+        execution_ref="opaque-ref",
+        order={"status": "REJECTED", "filled": 0},
+        requested_qty=1,
+    )
+    result = apply_fill_to_portfolio(
+        proposal_id="p5",
+        execution_ref="opaque-ref",
+        action="BUY",
+        proposed_state="ENTER",
+        prior_state="WATCH",
+        current_quantity=0,
+        settlement=settlement,
+    )
+    assert not result.portfolio_mutated
+    assert result.next_state == "WATCH"
 
 
 def test_zero_fill_open_sell_remains_pending():

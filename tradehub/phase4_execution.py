@@ -101,11 +101,15 @@ class Phase4ExecutionBoundary:
         submit: Callable[[str], str],
         reconcile: Callable[[str], Mapping[str, Any] | None],
         prove_paper: Callable[[], bool],
+        persist_execution_link: Callable[[str, str], None] | None = None,
     ) -> None:
         self._preview = preview
         self._submit = submit
         self._reconcile = reconcile
         self._prove_paper = prove_paper
+        self._persist_execution_link = persist_execution_link or (
+            lambda proposal_id, execution_ref: None
+        )
         self._previewed: PreviewIntent | None = None
         self._confirmation_token: str | None = None
         self._broker_order_ref: str | None = None
@@ -116,7 +120,13 @@ class Phase4ExecutionBoundary:
             raise ApprovalRequired("broker preview was not accepted")
         self._previewed = intent
         self._confirmation_token = str(result["confirmation_token"])
-        return {"accepted": True, "proposal_id": intent.proposal_id}
+        self._execution_ref = f"execution:{intent.proposal_id}"
+        self._persist_execution_link(intent.proposal_id, self._execution_ref)
+        return {
+            "accepted": True,
+            "proposal_id": intent.proposal_id,
+            "execution_ref": self._execution_ref,
+        }
 
     def render_approval(
         self, intent: PreviewIntent, *, current_state: str, proposed_state: str, rationale: str
@@ -146,7 +156,12 @@ class Phase4ExecutionBoundary:
         self._broker_order_ref = self._submit(self._confirmation_token)
 
     def reconcile_and_settle(
-        self, *, current_quantity: float, action: str, proposed_state: str
+        self,
+        *,
+        current_quantity: float,
+        action: str,
+        proposed_state: str,
+        prior_state: str | None = None,
     ) -> ExecutionResult:
         if (
             self._previewed is None
@@ -163,7 +178,7 @@ class Phase4ExecutionBoundary:
             broker_order = None
         settlement = _sanitize_broker_order(
             proposal_id=proposal.proposal_id,
-            execution_ref=proposal.proposal_id,
+            execution_ref=self._execution_ref,
             order=broker_order,
             requested_qty=proposal.quantity,
         )
@@ -174,5 +189,6 @@ class Phase4ExecutionBoundary:
             proposed_state=proposed_state,
             current_quantity=current_quantity,
             settlement=settlement,
+            prior_state=prior_state,
         )
-        return ExecutionResult(proposal.proposal_id, proposal.proposal_id, settlement, portfolio)
+        return ExecutionResult(proposal.proposal_id, self._execution_ref, settlement, portfolio)

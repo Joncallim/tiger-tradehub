@@ -74,7 +74,9 @@ def proposal_to_preview_intent(
         raise ProposalExecutionError(f"proposal missing pinned fields: {missing}")
     if not allowlist:
         raise ProposalExecutionError("V2 execution allowlist is empty; refusing execution")
-    symbol = str(proposal["security_id"]).upper()
+    symbol = str(
+        proposal.get("canonical_ticker") or proposal.get("ticker") or proposal["security_id"]
+    ).upper()
     if symbol not in {item.upper() for item in allowlist}:
         raise ProposalExecutionError(f"symbol {symbol!r} is not in the V2 execution allowlist")
     if current_day_count >= max_day_count:
@@ -183,6 +185,7 @@ def apply_fill_to_portfolio(
     proposed_state: str,
     current_quantity: float,
     settlement: SanitizedSettlement,
+    prior_state: str | None = None,
 ) -> PortfolioSettlement:
     """Derive portfolio settlement from actual broker fill evidence only."""
     if settlement.state == SettlementState.INDETERMINATE:
@@ -197,6 +200,16 @@ def apply_fill_to_portfolio(
         )
     if action == "BUY":
         owned = current_quantity + settlement.filled_qty
+        if settlement.filled_qty == 0 and settlement.terminal:
+            return PortfolioSettlement(
+                proposal_id,
+                execution_ref,
+                settlement,
+                False,
+                current_quantity,
+                0.0,
+                prior_state or proposed_state,
+            )
         next_state = "HOLD" if settlement.filled_qty > 0 else proposed_state
         return PortfolioSettlement(
             proposal_id,

@@ -36,6 +36,23 @@ def test_execution_boundary_requires_exact_approval_and_paper_proof():
     assert "raw-token" not in repr(result)
 
 
+def test_preview_persists_only_opaque_execution_reference():
+    links = []
+    boundary = Phase4ExecutionBoundary(
+        preview=lambda intent: {"accepted": True, "confirmation_token": "raw-token"},
+        submit=lambda token: "broker-1",
+        reconcile=lambda ref: {"id": ref, "status": "OPEN", "filled": 0},
+        prove_paper=lambda: True,
+        persist_execution_link=lambda proposal_id, execution_ref: links.append(
+            (proposal_id, execution_ref)
+        ),
+    )
+    result = boundary.preview(INTENT)
+    assert result["execution_ref"] == "execution:p1"
+    assert links == [("p1", "execution:p1")]
+    assert "raw-token" not in repr(links)
+
+
 def test_reconciliation_accepts_normalized_order_id():
     boundary = Phase4ExecutionBoundary(
         preview=lambda intent: {"accepted": True, "confirmation_token": "raw-token"},
