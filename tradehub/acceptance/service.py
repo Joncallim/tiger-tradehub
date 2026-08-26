@@ -8,6 +8,7 @@ FA-01/FA-03/FA-04/FA-05 deterministic across runs and restarts.
 from __future__ import annotations
 
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -52,6 +53,7 @@ class ServiceManager:
             self.env.setdefault(key, value)
         if env_overrides:
             self.env.update(env_overrides)
+        self.env.setdefault("TRADEHUB_PREVIEW_API_TOKEN", secrets.token_urlsafe(32))
         self.port = int(self.env.get("TRADEHUB_PORT", "8787"))
         self.host = self.env.get("TRADEHUB_BIND_HOST", "127.0.0.1")
         self._process: subprocess.Popen[str] | None = None

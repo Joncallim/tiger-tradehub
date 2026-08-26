@@ -31,7 +31,7 @@ from tradehub.models import (
     SubmitOrderResponse,
 )
 from tradehub.policy import PolicyError, validate_order_intent
-from tradehub.tiger_gateway import TigerGateway
+from tradehub.tiger_gateway import TigerGateway, classify_preview
 
 logger = logging.getLogger(__name__)
 UPSTREAM_ERROR_MESSAGE = "upstream broker request failed"
@@ -72,6 +72,30 @@ def require_auth(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid bearer token",
+        )
+
+
+def require_preview_auth(
+    authorization: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+) -> None:
+    token = None
+    if authorization:
+        parts = authorization.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1]
+    if settings.preview_api_token is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="preview capability is not configured",
+        )
+    if token is None or not (
+        hmac.compare_digest(token, settings.preview_token)
+        or hmac.compare_digest(token, settings.api_token.get_secret_value())
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or invalid preview capability",
         )
 
 
@@ -153,7 +177,11 @@ def health(
     )
 
 
-@app.post("/orders/preview", response_model=PreviewResponse, dependencies=[Depends(require_auth)])
+@app.post(
+    "/orders/preview",
+    response_model=PreviewResponse,
+    dependencies=[Depends(require_preview_auth)],
+)
 def preview_order(
     intent: OrderIntent,
     settings: Settings = Depends(get_settings),
@@ -182,6 +210,22 @@ def preview_order(
             detail,
         )
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+
+    preview_status = classify_preview(tiger_preview)
+    if preview_status != "accepted":
+        store.record_event(
+            "preview_rejected" if preview_status == "rejected" else "preview_ambiguous",
+            {"intent": intent.model_dump(), "tiger_preview": tiger_preview},
+        )
+        return PreviewResponse(
+            accepted=False,
+            dry_run=settings.dry_run,
+            intent=intent,
+            confirmation_token=None,
+            expires_at=None,
+            policy_warnings=warnings,
+            tiger_preview=tiger_preview,
+        )
 
     token, expires_at = store.create_confirmation(
         intent, tiger_preview, settings.confirmation_ttl_seconds

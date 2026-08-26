@@ -1,0 +1,27 @@
+[Unit]
+Description=Tiger TradeHub guarded execution core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradehub-execution
+Group=tradehub-execution
+WorkingDirectory=/opt/tiger-tradehub
+EnvironmentFile=/etc/tradehub/execution.env
+ExecStart=/opt/tiger-tradehub/.venv/bin/tradehub
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tradehub
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

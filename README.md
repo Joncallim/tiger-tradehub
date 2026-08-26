@@ -59,20 +59,23 @@ pip install -e ".[mcp]"
 cp .env.example .env
 ```
 
-Edit `.env` and set a strong local API token:
+Edit `.env` and set two strong, distinct local capabilities:
 
 ```bash
-TRADEHUB_API_TOKEN=replace-with-a-long-random-token
+TRADEHUB_API_TOKEN=replace-with-a-long-random-execution-token
+TRADEHUB_PREVIEW_API_TOKEN=replace-with-a-different-long-random-preview-token
 TRADEHUB_DRY_RUN=true
 ```
 
-Generate a token with:
+Generate each token with:
 
 ```bash
 python -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-Startup rejects empty, placeholder, and short API tokens.
+`TRADEHUB_API_TOKEN` is retained by approval/submit clients. The distinct
+`TRADEHUB_PREVIEW_API_TOKEN` is the only credential used for broker previews.
+Startup rejects missing, equal, placeholder, and short values.
 
 Dry-run mode does not place live Tiger orders. Keep it enabled until the full Claude preview and
 confirmation flow is verified.
@@ -115,7 +118,8 @@ Run the API first, then add this MCP server to Claude Desktop or Claude Code con
       "command": "/absolute/path/to/tiger-tradehub/.venv/bin/tradehub-mcp",
       "env": {
         "TRADEHUB_BASE_URL": "http://127.0.0.1:8787",
-        "TRADEHUB_API_TOKEN": "replace-with-the-same-token-from-.env"
+        "TRADEHUB_API_TOKEN": "replace-with-the-execution-token-from-.env",
+        "TRADEHUB_PREVIEW_API_TOKEN": "replace-with-the-preview-token-from-.env"
       }
     }
   }
@@ -152,7 +156,7 @@ or automation.
 
 ```bash
 curl -s http://127.0.0.1:8787/orders/preview \
-  -H "Authorization: Bearer $TRADEHUB_API_TOKEN" \
+  -H "Authorization: Bearer $TRADEHUB_PREVIEW_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"symbol":"AAPL","side":"BUY","quantity":1,"order_type":"LIMIT","limit_price":150,"currency":"USD"}'
 ```

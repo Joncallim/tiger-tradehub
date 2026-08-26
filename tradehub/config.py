@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     api_token: SecretStr = Field(alias="TRADEHUB_API_TOKEN")
+    preview_api_token: SecretStr | None = Field(default=None, alias="TRADEHUB_PREVIEW_API_TOKEN")
     dry_run: bool = Field(default=True, alias="TRADEHUB_DRY_RUN")
     bind_host: str = Field(default="127.0.0.1", alias="TRADEHUB_BIND_HOST")
     port: int = Field(default=8787, alias="TRADEHUB_PORT")
@@ -47,6 +48,26 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("preview_api_token")
+    @classmethod
+    def validate_preview_api_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < MIN_API_TOKEN_LENGTH:
+            raise ValueError(
+                f"TRADEHUB_PREVIEW_API_TOKEN must be at least {MIN_API_TOKEN_LENGTH} characters"
+            )
+        return value
+
+    @property
+    def preview_token(self) -> str:
+        """Preview-only capability; production research deployments set it separately."""
+        return (self.preview_api_token or self.api_token).get_secret_value()
+
+    def require_distinct_preview_capability(self) -> None:
+        if self.preview_api_token is None:
+            raise ValueError("TRADEHUB_PREVIEW_API_TOKEN must be configured separately")
+        if self.preview_token == self.api_token.get_secret_value():
+            raise ValueError("TRADEHUB_PREVIEW_API_TOKEN must differ from TRADEHUB_API_TOKEN")
+
     @field_validator("symbol_allowlist", mode="before")
     @classmethod
     def parse_symbols(cls, value: object) -> set[str]:
@@ -80,4 +101,6 @@ def secret_value(value: SecretStr | None) -> str | None:
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    settings = Settings()  # type: ignore[call-arg]
+    settings.require_distinct_preview_capability()
+    return settings

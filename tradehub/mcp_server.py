@@ -13,6 +13,7 @@ def main() -> None:
 
     mcp = FastMCP("tiger-tradehub")
     client = TradeHubClient()
+    preview_client = TradeHubClient(preview_only=True)
 
     @mcp.tool()
     async def health() -> dict[str, Any]:
@@ -49,7 +50,7 @@ def main() -> None:
         reason: str | None = None,
     ) -> dict[str, Any]:
         """Preview a guarded Tiger order and return a short-lived confirmation token."""
-        return await client.post(
+        return await preview_client.post(
             "/orders/preview",
             {
                 "symbol": symbol,

@@ -1,0 +1,28 @@
+[Unit]
+Description=Tiger TradeHub research and committee API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradehub-research
+Group=tradehub-research
+WorkingDirectory=/opt/tiger-tradehub
+EnvironmentFile=/etc/tradehub/research.env
+ExecStart=/opt/tiger-tradehub/.venv/bin/uvicorn tradehub_research.committee.api:app --host 127.0.0.1 --port 8091
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tradehub-research
+InaccessiblePaths=/etc/tradehub/execution.env /etc/tradehub/tiger_private_key.pk8 -/home/jon/tiger-tradehub/.env -/home/jon/tiger-tradehub/data/tiger_private_key.pk8.pem -/opt/tiger-tradehub/.env -/opt/tiger-tradehub/data/tiger_private_key.pk8.pem
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

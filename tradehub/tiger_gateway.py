@@ -5,6 +5,31 @@ from typing import Any
 from tradehub.config import Settings, secret_value
 from tradehub.models import OrderIntent, OrderType
 
+PREVIEW_SUCCESS_FIELDS = frozenset(
+    {
+        "init_margin",
+        "maint_margin",
+        "equity_with_loan",
+        "margin_currency",
+        "commission_currency",
+        "commission",
+    }
+)
+DOCUMENTED_PREVIEW_SUCCESS_FIELDS = frozenset(
+    {
+        "init_margin_before",
+        "init_margin",
+        "maint_margin_before",
+        "maint_margin",
+        "margin_currency",
+        "equity_with_loan_before",
+        "equity_with_loan",
+        "min_commission",
+        "max_commission",
+        "commission_currency",
+    }
+)
+
 
 class TigerGateway:
     def __init__(self, settings: Settings):
@@ -215,3 +240,22 @@ def normalize_collection(value: Any) -> list[dict[str, Any]]:
         return [item for item in (normalize(entry) for entry in value) if item is not None]
     item = normalize(value)
     return [item] if item is not None else []
+
+
+def classify_preview(value: dict[str, Any] | None) -> str:
+    """Classify only the installed SDK's documented preview shapes."""
+    if not isinstance(value, dict):
+        return "unknown"
+    warning = value.get("warning_text")
+    message = value.get("message")
+    if (isinstance(warning, str) and warning.strip()) or (
+        isinstance(message, str) and message.strip()
+    ):
+        return "rejected"
+    if value.get("is_pass") is False:
+        return "rejected"
+    if value.get("is_pass") is True and PREVIEW_SUCCESS_FIELDS.issubset(value):
+        return "accepted"
+    if DOCUMENTED_PREVIEW_SUCCESS_FIELDS.issubset(value):
+        return "accepted"
+    return "unknown"

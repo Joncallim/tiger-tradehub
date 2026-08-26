@@ -24,6 +24,7 @@ class FakeGateway:
         self.created_orders = []
         self.fail_place = False
         self.fail_preview = False
+        self.preview_result = None
         self.accept_and_fail = False
         self.fail_reconcile = False
         self.get_order_results = None
@@ -40,7 +41,20 @@ class FakeGateway:
     def preview_order(self, intent):
         if self.fail_preview:
             raise RuntimeError("preview failed for sensitive-account")
-        return {"preview_symbol": intent.symbol}
+        if self.preview_result is not None:
+            return self.preview_result
+        return {
+            "init_margin_before": 0,
+            "init_margin": 0,
+            "maint_margin_before": 0,
+            "maint_margin": 0,
+            "margin_currency": "USD",
+            "equity_with_loan_before": 100000,
+            "equity_with_loan": 100000,
+            "min_commission": 0,
+            "max_commission": 0,
+            "commission_currency": "USD",
+        }
 
     def create_order(self, intent):
         order_id = f"reserved-{len(self.created_orders) + 1}"
@@ -104,7 +118,9 @@ def headers():
     return {"Authorization": f"Bearer {STRONG_TOKEN}"}
 
 
-def install(settings, store, gateway):
+def install(settings, store, gateway, preserve_preview=False):
+    if not preserve_preview:
+        settings.preview_api_token = settings.api_token
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_store] = lambda: store
     app.dependency_overrides[get_gateway] = lambda: gateway
@@ -127,6 +143,96 @@ def event_types(path):
             row[0]
             for row in db.execute("SELECT event_type FROM audit_events ORDER BY id").fetchall()
         ]
+
+
+def test_rejected_or_unknown_preview_mints_no_confirmation(tmp_path):
+    for broker_preview in ({"warning_text": "order rejected"}, {"unexpected": True}):
+        db_path = tmp_path / ("rejected.db" if "warning_text" in broker_preview else "unknown.db")
+        settings = Settings(TRADEHUB_API_TOKEN=STRONG_TOKEN, TRADEHUB_DATABASE_PATH=db_path)
+        store = AuditStore(db_path)
+        gateway = FakeGateway()
+        gateway.preview_result = broker_preview
+        install(settings, store, gateway)
+        try:
+            response = TestClient(app).post(
+                "/orders/preview", json=preview_payload(), headers=headers()
+            )
+        finally:
+            app.dependency_overrides.clear()
+        assert response.status_code == 200
+        assert response.json()["accepted"] is False
+        assert response.json()["confirmation_token"] is None
+        with sqlite3.connect(db_path) as db:
+            assert db.execute("SELECT COUNT(*) FROM confirmations").fetchone()[0] == 0
+
+
+def test_preview_capability_cannot_submit(tmp_path):
+    db_path = tmp_path / "capability.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_PREVIEW_API_TOKEN="preview-token-with-enough-length",
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    install(settings, store, gateway, preserve_preview=True)
+    try:
+        client = TestClient(app)
+        preview = client.post(
+            "/orders/preview",
+            json=preview_payload(),
+            headers={"Authorization": "Bearer preview-token-with-enough-length"},
+        )
+        execution_preview = client.post(
+            "/orders/preview",
+            json=preview_payload(),
+            headers=headers(),
+        )
+        submit = client.post(
+            "/orders/submit",
+            json={"confirmation_token": "not-a-real-token-value"},
+            headers={"Authorization": "Bearer preview-token-with-enough-length"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+    assert preview.status_code == 200
+    assert execution_preview.status_code == 200
+    assert submit.status_code == 401
+
+
+def test_preview_capability_is_rejected_by_every_privileged_route(tmp_path):
+    db_path = tmp_path / "capability-routes.db"
+    settings = Settings(
+        TRADEHUB_API_TOKEN=STRONG_TOKEN,
+        TRADEHUB_PREVIEW_API_TOKEN="preview-token-with-enough-length",
+        TRADEHUB_DATABASE_PATH=db_path,
+    )
+    store = AuditStore(db_path)
+    gateway = FakeGateway()
+    install(settings, store, gateway, preserve_preview=True)
+    payloads = {
+        "/orders/submit": {"confirmation_token": "not-a-real-token-value"},
+        "/orders/cancel": {"order_id": "broker-order-1"},
+        "/orders/submit/reconcile": {"confirmation_token": "not-a-real-token-value"},
+        "/orders/submit/resolve": {
+            "confirmation_token": "not-a-real-token-value",
+            "resolver": "test",
+            "global_order_id": "broker-order-1",
+        },
+    }
+    try:
+        client = TestClient(app)
+        for path, payload in payloads.items():
+            response = client.post(
+                path,
+                json=payload,
+                headers={"Authorization": "Bearer preview-token-with-enough-length"},
+            )
+            assert response.status_code == 401, (path, response.text)
+        assert gateway.placed_orders == []
+        assert gateway.cancel_order_id is None
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_preview_and_dry_run_submit_create_and_finalize_confirmation(tmp_path):
@@ -446,6 +552,7 @@ def test_submit_policy_revalidation_blocks_and_records_event(tmp_path):
     settings_state = {
         "value": Settings(
             TRADEHUB_API_TOKEN=STRONG_TOKEN,
+            TRADEHUB_PREVIEW_API_TOKEN=STRONG_TOKEN,
             TRADEHUB_DATABASE_PATH=db_path,
             TRADEHUB_MAX_NOTIONAL_USD=1000,
         )

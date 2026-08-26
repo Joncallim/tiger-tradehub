@@ -20,6 +20,7 @@ def main() -> None:
         raise SystemExit("TELEGRAM_ALLOWED_CHAT_IDS must contain at least one chat id")
 
     client = TradeHubClient()
+    preview_client = TradeHubClient(preview_only=True)
 
     def allowed(update: Update) -> bool:
         chat_id = update.effective_chat.id if update.effective_chat else None
@@ -43,7 +44,7 @@ def main() -> None:
             return
         try:
             payload = parse_preview_args(context.args)
-            response = await client.post("/orders/preview", payload)
+            response = await preview_client.post("/orders/preview", payload)
         except Exception as exc:
             await update.message.reply_text(f"Preview failed: {exc}")
             return
@@ -70,7 +71,7 @@ def main() -> None:
                 "limit_price": float(limit_price),
                 "currency": rest[0].upper() if rest else "USD",
             }
-            response = await client.post("/orders/preview", payload)
+            response = await preview_client.post("/orders/preview", payload)
         except Exception as exc:
             await update.message.reply_text(f"Preview failed: {exc}")
             return

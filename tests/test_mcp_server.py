@@ -37,7 +37,7 @@ def test_reconcile_order_tool_registered_and_forwards_payload(monkeypatch):
     monkeypatch.setitem(sys.modules, "mcp.server", types.ModuleType("mcp.server"))
     monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp_module)
 
-    monkeypatch.setattr(mcp_server, "TradeHubClient", lambda: FakeClient())
+    monkeypatch.setattr(mcp_server, "TradeHubClient", lambda **_: FakeClient())
 
     mcp_server.main()
 
