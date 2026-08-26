@@ -2103,7 +2103,7 @@ def ra03_25_briefing_deterministic_and_safe(tmp: Path) -> None:
     ):
         assert section in first.briefing
     assert "No portfolio action recommended." in first.briefing  # first-class no-action
-    for forbidden in ("confirmation", "token=", "submit_order", "TIGEROPEN", "private_key"):
+    for forbidden in ("confirmation", "token=", "submit_order", "tigeropen", "private_key"):
         assert forbidden not in first.briefing.lower()
 
 

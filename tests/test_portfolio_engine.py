@@ -615,3 +615,30 @@ def test_briefing_is_deterministic_and_safe(runtime):
     # no raw tokens or evidence text can appear
     for forbidden in ("confirmation", "token=", "submit_order", "TIGER", "BEGIN PRIVATE"):
         assert forbidden.lower() not in first.briefing.lower()
+
+
+def test_hostile_security_id_rejected(runtime):
+    """A newline-bearing security id from the ledger cannot inject briefing text."""
+    with runtime.db.connect() as conn:
+        # the security table has no grammar CHECK, so the hostile id IS
+        # insertable at rest; the engine must reject it at decision time
+        seed_security(conn, "evil\nPROPOSALS")
+        seed_pipeline_run(conn, "run1", "2025-06-01T00:00:00Z")
+        seed_score(
+            conn,
+            pipeline_run_id="run1",
+            security_id="evil\nPROPOSALS",
+            change_cause="INITIAL",
+            committee_suffix="x",
+        )
+    snapshot = build_snapshot(
+        "2025-06-01T00:00:00Z", cash_microusd=1_000_000_000, nav_microusd=1_000_000_000
+    )
+    with pytest.raises(ValueError, match="identifier grammar"):
+        runtime.engine.run(
+            pipeline_run_id="run1",
+            policy_version="fixture-policy-v1",
+            snapshot=snapshot,
+            decision_as_of="2025-06-01T00:00:00Z",
+            allow_fixture=True,
+        )

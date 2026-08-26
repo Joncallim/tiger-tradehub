@@ -954,7 +954,7 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         WHEN NEW.action='SELL' AND (
             (NEW.completion_quantity_microunits <> 0 AND NEW.proposed_state='EXIT')
             OR EXISTS (
-                SELECT 1 FROM portfolio_holding h JOIN portfolio_market_input m
+                SELECT 1 FROM portfolio_holding h LEFT JOIN portfolio_market_input m
                 ON m.snapshot_id=h.snapshot_id AND m.security_id=h.security_id
                 WHERE h.snapshot_id=NEW.portfolio_snapshot_id AND h.security_id=NEW.security_id
                   AND h.sellable_status='KNOWN'

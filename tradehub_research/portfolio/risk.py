@@ -124,7 +124,7 @@ class RiskEngine:
     # -- history measures ---------------------------------------------------
 
     def _series(self, security_id: str, as_of: str) -> Any:
-        key = security_id
+        key = f"{security_id}@{as_of}"
         if key not in self._series_cache:
             if hasattr(self.database, "connect"):
                 with self.database.connect() as conn:
@@ -405,7 +405,12 @@ class RiskEngine:
         return RiskResult("NOT_RUN", measures=measures, evidence_ids=evidence_ids)
 
     def _active_book_ppm(self, security_id: str) -> int:
-        """Sum of weights of other securities with a pending/actionable state."""
+        """Sum of weights of ALL other holdings (snapshot-complete, conservative).
+
+        Deliberately not restricted to pending/actionable states: the snapshot
+        has no per-holding state field, so the full book is the honest upper
+        bound on active exposure — conservative in the block direction.
+        """
         total = 0
         for holding in self.snapshot.holdings:
             if holding["security_id"] == security_id:

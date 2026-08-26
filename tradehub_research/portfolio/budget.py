@@ -98,6 +98,15 @@ class Budget:
                             f"activity date {activity_date} already bound to day_start_cash "
                             f"{stored_cash}, run snapshot cash is {day_start_cash_microusd}"
                         )
+                if stored_cash is None and day_start_cash_microusd is not None:
+                    # the day was first bound with UNKNOWN cash and cannot be
+                    # rebound later: fail closed rather than silently adopting
+                    # a later run's (possibly larger) claimed cash
+                    raise ValueError(
+                        f"activity date {activity_date} was bound with unknown cash; "
+                        "a later run cannot supply day_start_cash "
+                        f"{day_start_cash_microusd}"
+                    )
                 day_cash = int(stored_cash) if stored_cash is not None else day_start_cash_microusd
             else:
                 caps = (

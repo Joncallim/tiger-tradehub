@@ -128,12 +128,15 @@ class PortfolioEngine:
         if policy.policy_status == PolicyStatus.PROVISIONAL and not allow_provisional:
             raise ValueError(f"policy {policy_version!r} is PROVISIONAL; pass --allow-provisional")
         # PIT discipline: no input may be dated after the decision moment.
-        if snapshot.as_of > as_of:
+        # Both sides are normalized so mixed timezone offsets compare fairly.
+        snapshot_as_of = normalize_ts(snapshot.as_of)
+        if snapshot_as_of > as_of:
             raise ValueError(f"snapshot as_of {snapshot.as_of!r} is after decision_as_of {as_of!r}")
         signals = signals or []
         signal_by_id: dict[str, SignalInput] = {}
         for signal in signals:
-            if signal.as_of > as_of:
+            signal_as_of = normalize_ts(signal.as_of)
+            if signal_as_of > as_of:
                 raise ValueError(
                     f"signal {signal.security_id!r} as_of {signal.as_of!r} is after "
                     f"decision_as_of {as_of!r}"
@@ -502,7 +505,7 @@ class PortfolioEngine:
         for holding in snapshot.holdings:
             candidates.add(holding["security_id"])
         for row in db.execute(
-            "SELECT DISTINCT security_id FROM portfolio_state_transition WHERE effective_at<=?",
+            "SELECT DISTINCT security_id FROM portfolio_state_transition WHERE effective_at<?",
             (as_of,),
         ).fetchall():
             state = current_state(db, row["security_id"], as_of)
@@ -520,6 +523,18 @@ class PortfolioEngine:
         missing = sorted(candidate_ids - known)
         if missing:
             raise ValueError(f"candidate securities missing from security table: {missing}")
+        for security_id in sorted(candidate_ids):
+            # one-line identifier grammar: no control characters/newlines and a
+            # sane length cap, so a hostile id can never inject briefing text
+            if (
+                not isinstance(security_id, str)
+                or not security_id
+                or len(security_id) > 64
+                or any(ord(ch) < 32 for ch in security_id)
+            ):
+                raise ValueError(
+                    f"candidate security_id fails the identifier grammar: {security_id!r}"
+                )
 
     def _state_prestate_hash(self, db: Any, candidate_ids: set[str], as_of: str) -> str:
         """State head STRICTLY BEFORE as_of.
@@ -1055,7 +1070,11 @@ class PortfolioEngine:
             cash_microusd=snapshot.cash_microusd,
             cash_status=snapshot.cash_status.value,
             holdings_status=snapshot.holdings_status.value,
-            holding_valuation_status=snapshot.valuation_status.value,
+            holding_valuation_status=(
+                holding.get("valuation_status", snapshot.valuation_status.value)
+                if holding
+                else snapshot.valuation_status.value
+            ),
             current_weight_ppm=current_weight_ppm,
             direction=direction,
         )
@@ -1167,6 +1186,9 @@ class PortfolioEngine:
     ) -> None:
         state = current["state"]
         if outcome == "TRIM_EXIT_CANDIDATE":
+            # thread the pending state's effective_at so the escalation path
+            # enforces cooldown like every other trigger
+            decision["state_effective_at"] = current.get("effective_at")
             exit_ok, exit_cause = self._trim_exit_authorized(
                 decision, db, policy, snapshot, security_id, as_of
             )
@@ -1296,7 +1318,9 @@ class PortfolioEngine:
         decision["persistence_required"] = required
         if persistence >= required:
             return True, "RULE_PERSISTED"
-        material = self._material_change_satisfied(policy, edge, decision.get("score"), None)
+        material = self._material_change_satisfied(
+            policy, edge, decision.get("score"), decision.get("state_effective_at")
+        )
         decision["material_change_satisfied"] = int(material)
         if material and policy.allows_material_bypass(*edge):
             return True, "MATERIAL_CHANGE"

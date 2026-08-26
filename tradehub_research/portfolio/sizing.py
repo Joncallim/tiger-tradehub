@@ -242,6 +242,16 @@ def size_sell(
         if capped_quantity < sell_quantity:
             sell_quantity = capped_quantity
             max_notional = (sell_quantity * mark_price_microusd) // PPM
+    if sell_notional_cap is not None and sell_quantity < sellable_quantity_microunits:
+        # participation cap reduced the order: recompute the target weight from
+        # the actually sellable quantity so target_weight_ppm stays truthful
+        capped_target = max(
+            0,
+            current_weight_ppm
+            - (sell_quantity * mark_price_microusd * PPM) // (nav_microusd * PPM),
+        )
+        target_weight_ppm = capped_target
+        detail["target_capped_by_participation"] = True
     if sell_quantity <= 0 or max_notional <= 0:
         return SizingResult(
             target_weight_ppm=current_weight_ppm,
