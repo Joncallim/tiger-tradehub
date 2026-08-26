@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from tradehub.client import TradeHubClient
+from tradehub.phase4_runtime import Phase4Runtime
+from tradehub_research.config import ResearchSettings
+from tradehub_research.db import ResearchDB
 
 
 def main() -> None:
@@ -14,6 +18,18 @@ def main() -> None:
     mcp = FastMCP("tiger-tradehub")
     client = TradeHubClient()
     preview_client = TradeHubClient(preview_only=True)
+    research_settings = ResearchSettings()
+    phase4_runtime = Phase4Runtime(
+        ResearchDB(research_settings.db_path, research_settings.busy_timeout_ms),
+        allowlist={
+            item.strip()
+            for item in os.getenv("TRADEHUB_SYMBOL_ALLOWLIST", "").split(",")
+            if item.strip()
+        },
+        max_day_count=int(os.getenv("TRADEHUB_MAX_DAILY_PROPOSALS", "3")),
+        max_day_notional=float(os.getenv("TRADEHUB_MAX_DAILY_NOTIONAL_USD", "1000")),
+        preview_client=preview_client,
+    )
 
     @mcp.tool()
     async def health() -> dict[str, Any]:
@@ -62,6 +78,26 @@ def main() -> None:
                 "reason": reason,
             },
         )
+
+    @mcp.tool()
+    async def preview_persisted_proposal(proposal_id: str) -> dict[str, Any]:
+        """Load and revalidate one persisted proposal, then call guarded preview."""
+        result = await phase4_runtime.preview_proposal(proposal_id)
+        intent = result.pop("intent")
+        result["intent"] = {
+            "proposal_id": intent.proposal_id,
+            "symbol": intent.symbol,
+            "side": intent.side,
+            "quantity": intent.quantity,
+            "order_type": intent.order_type,
+            "limit_price": intent.limit_price,
+            "currency": intent.currency,
+            "score_snapshot_id": intent.score_snapshot_id,
+            "portfolio_snapshot_id": intent.portfolio_snapshot_id,
+            "policy_version": intent.policy_version,
+            "reason": intent.reason,
+        }
+        return result
 
     @mcp.tool()
     async def submit_order(confirmation_token: str) -> dict[str, Any]:
