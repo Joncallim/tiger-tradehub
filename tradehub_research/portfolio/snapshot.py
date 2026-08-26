@@ -354,13 +354,15 @@ def build_signal_input(
     as_of: str,
     *,
     remaining_opportunity_ppm: int | None = None,
-    opportunity_status: str = "KNOWN",
+    opportunity_status: str | None = None,
     source_kind: str = "FIXTURE",
     evidence_ids: list[str] | None = None,
 ) -> SignalInput:
     """Validate a signal input and derive its deterministic identity."""
     if not isinstance(security_id, str) or not security_id:
         raise ValueError("signal input security_id required")
+    if opportunity_status is None:
+        opportunity_status = "KNOWN" if remaining_opportunity_ppm is not None else "UNKNOWN"
     _validate_status(opportunity_status, "opportunity_status", known_only=True)
     _orthogonal(remaining_opportunity_ppm, opportunity_status, "remaining_opportunity_ppm")
     if remaining_opportunity_ppm is not None and not 0 <= remaining_opportunity_ppm <= 1_000_000:
