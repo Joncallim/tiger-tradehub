@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
+from tests.portfolio_test_helpers import seed_pipeline_run, seed_score, seed_security
 from tradehub_research.db import ResearchDB
 from tradehub_research.portfolio.state import (
     cooldown_satisfied,
@@ -12,7 +11,6 @@ from tradehub_research.portfolio.state import (
     persistence_count,
 )
 from tradehub_research.portfolio.types import State
-from tests.portfolio_test_helpers import seed_security, seed_pipeline_run, seed_score
 
 SNAP_ID = "s" * 64
 SCORE_ID = "c" * 64

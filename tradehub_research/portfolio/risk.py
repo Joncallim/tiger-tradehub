@@ -25,12 +25,17 @@ from tradehub_research.portfolio.prices import (
     total_return_series,
 )
 from tradehub_research.portfolio.snapshot import PortfolioSnapshot
-from tradehub_research.portfolio.types import State, json_roundtrip
+from tradehub_research.portfolio.types import Action, State, json_roundtrip
 
 
 @dataclass(frozen=True)
 class RiskInputs:
-    """Typed inputs the risk engine needs for one security decision."""
+    """Typed inputs the risk engine needs for one security decision.
+
+    ``direction`` is the PROPOSED action (BUY for ENTER/ADD, SELL for
+    TRIM/EXIT); it is set from eligibility, never from the current state
+    (a HOLD security can be evaluated for either direction).
+    """
 
     security_id: str
     sector: str | None
@@ -47,6 +52,7 @@ class RiskInputs:
     nav_microusd: int | None
     cash_microusd: int | None
     current_weight_ppm: int
+    direction: Action | None = None
 
 
 @dataclass(frozen=True)
@@ -77,18 +83,32 @@ def _ppm_from_decimal(value: Decimal) -> int:
 
 class RiskEngine:
     def __init__(self, database: Any, policy: PolicySpec, snapshot: PortfolioSnapshot):
+        # ``database`` may be a live transaction connection (engine runs) or a
+        # ResearchDB (unit tests); both expose the same row interface.
         self.database = database
         self.policy = policy
         self.snapshot = snapshot
         self.risk = policy.risk
         self._series_cache: dict[str, Any] = {}
 
+    def _query(self):
+        """Context manager yielding a connection for price queries."""
+        from contextlib import nullcontext
+
+        if hasattr(self.database, "connect"):
+            return self.database.connect(read_only=True)
+        return nullcontext(self.database)
+
     # -- history measures ---------------------------------------------------
 
     def _series(self, security_id: str, as_of: str) -> Any:
         key = security_id
         if key not in self._series_cache:
-            self._series_cache[key] = total_return_series(self.database, security_id, as_of)
+            if hasattr(self.database, "connect"):
+                with self.database.connect(read_only=True) as conn:
+                    self._series_cache[key] = total_return_series(conn, security_id, as_of)
+            else:
+                self._series_cache[key] = total_return_series(self.database, security_id, as_of)
         return self._series_cache[key]
 
     def _history_measures(self, security_id: str, as_of: str) -> tuple[dict[str, Any], list[str]]:
@@ -107,13 +127,14 @@ class RiskEngine:
             )
         else:
             measures["annualized_vol_ppm"] = None
-        adv = average_dollar_volume(
-            self.database,
-            security_id,
-            as_of,
-            int(risk["adv_window_sessions"]),
-            int(risk["min_adv_observations"]),
-        )
+        with self._query() as query_conn:
+            adv = average_dollar_volume(
+                query_conn,
+                security_id,
+                as_of,
+                int(risk["adv_window_sessions"]),
+                int(risk["min_adv_observations"]),
+            )
         measures["ledger_adv_microusd"] = adv
         measures["return_count"] = len(series)
         return measures, evidence_ids
@@ -172,8 +193,8 @@ class RiskEngine:
         evidence_ids: list[str] = []
         status = "NOT_RUN"
 
-        is_buy = inputs.current_state in (State.WATCH, State.HOLD)  # ENTER/ADD proposals
-        is_sell = inputs.current_state in (State.HOLD, State.TRIM)
+        is_buy = inputs.direction == Action.BUY
+        is_sell = inputs.direction == Action.SELL
 
         # Factor / drawdown seams: honest NOT_AVAILABLE, block when required.
         factor_available = False

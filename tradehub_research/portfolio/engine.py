@@ -40,6 +40,7 @@ from tradehub_research.portfolio.state import (
 from tradehub_research.portfolio.types import (
     PENDING_STATES,
     TRIGGER_TO_REASON,
+    Action,
     C,
     D,
     FinalStatus,
@@ -650,7 +651,13 @@ class PortfolioEngine:
             return decision
 
         risk_inputs = self._risk_inputs(
-            db, decision, snapshot, security_id, current_state_value, position_present
+            db,
+            decision,
+            snapshot,
+            security_id,
+            current_state_value,
+            position_present,
+            eligibility.to_state,
         )
         risk_result = risk_engine.evaluate(risk_inputs, as_of)
         decision["risk_status"] = risk_result.status
@@ -789,7 +796,14 @@ class PortfolioEngine:
         security_id: str,
         current_state_value: State,
         position_present: bool,
+        proposed_state: State,
     ) -> RiskInputs:
+        if proposed_state in (State.ENTER, State.ADD):
+            direction = Action.BUY
+        elif proposed_state in (State.TRIM, State.EXIT):
+            direction = Action.SELL
+        else:
+            direction = None
         holding = snapshot.holding(security_id)
         market_input = snapshot.market_input(security_id)
         sector = holding.get("sector") if holding else None
@@ -827,6 +841,7 @@ class PortfolioEngine:
             nav_microusd=snapshot.nav_microusd,
             cash_microusd=snapshot.cash_microusd,
             current_weight_ppm=current_weight_ppm,
+            direction=direction,
         )
 
     def _material_change_satisfied(

@@ -117,7 +117,7 @@ def seed_price_bars(
 
 def seed_pipeline_run(db: Any, run_id: str, as_of: str) -> None:
     db.execute(
-        "INSERT INTO pipeline_run(run_id,as_of,universe_hash,screen_manifest_json,"
+        "INSERT OR IGNORE INTO pipeline_run(run_id,as_of,universe_hash,screen_manifest_json,"
         "screen_manifest_hash,funnel_config_json,funnel_config_hash,input_snapshot_id,"
         "input_view_hash,expected_security_count,status,failure_json,started_at,finished_at,"
         "flags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -172,8 +172,19 @@ def seed_score(
     assessment_a = f"as-a-{security_id}-{committee_suffix}"
     assessment_b = f"as-b-{security_id}-{committee_suffix}"
     screen_definition_hash = f"sd-{security_id}-{committee_suffix}"
-    scoring_version_number = 1 + sum(ord(ch) for ch in committee_suffix)
-    comparator_version_number = 1 + sum(ord(ch) for ch in committee_suffix)
+    import hashlib as _hashlib
+
+    scoring_version_number = (
+        1
+        + int(_hashlib.sha256(f"{security_id}{committee_suffix}".encode()).hexdigest()[:8], 16)
+        % 100000
+    )
+    comparator_version_number = scoring_version_number
+    ordinal = (
+        1
+        + int(_hashlib.sha256(f"{security_id}{committee_suffix}ord".encode()).hexdigest()[:8], 16)
+        % 1000
+    )
 
     db.execute(
         "INSERT INTO scoring_version(config_hash,scoring_version,spec_json,description,created_at)"
@@ -197,7 +208,7 @@ def seed_score(
             candidate_id,
             pipeline_run_id,
             security_id,
-            1,
+            ordinal,
             "[]",
             json_roundtrip([screen_definition_hash]),
             "{}",
