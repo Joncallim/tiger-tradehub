@@ -294,6 +294,9 @@ def build_fa05_pack() -> PackDefinition:
         manager.start()
         base = f"http://{manager.host}:{manager.port}"
         headers = {"Authorization": f"Bearer {manager.env.get('TRADEHUB_API_TOKEN', '')}"}
+        preview_headers = {
+            "Authorization": f"Bearer {manager.env.get('TRADEHUB_PREVIEW_API_TOKEN', '')}"
+        }
 
         # 1. read current paper-account state
         before = httpx.get(f"{base}/account/orders", headers=headers, timeout=30)
@@ -312,7 +315,7 @@ def build_fa05_pack() -> PackDefinition:
             "currency": "USD",
         }
         preview = httpx.post(
-            f"{base}/orders/preview", headers=headers, json=preview_payload, timeout=30
+            f"{base}/orders/preview", headers=preview_headers, json=preview_payload, timeout=30
         )
         if preview.status_code != 200:
             manager.stop()

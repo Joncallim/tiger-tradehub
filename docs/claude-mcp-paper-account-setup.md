@@ -57,16 +57,17 @@ Copy the example file:
 cp .env.example .env
 ```
 
-Generate a strong TradeHub API token:
+Generate two distinct strong TradeHub capabilities:
 
 ```bash
 python -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-Open `.env` in a text editor and replace `change-me`:
+Open `.env` in a text editor and replace the placeholders:
 
 ```bash
-TRADEHUB_API_TOKEN=paste-your-generated-token-here
+TRADEHUB_API_TOKEN=paste-your-execution-token-here
+TRADEHUB_PREVIEW_API_TOKEN=paste-your-different-preview-token-here
 TRADEHUB_DRY_RUN=true
 ```
 
@@ -157,7 +158,8 @@ Add this block. Replace the path and token with your real values:
       "command": "/absolute/path/to/tiger-tradehub/.venv/bin/tradehub-mcp",
       "env": {
         "TRADEHUB_BASE_URL": "http://127.0.0.1:8787",
-        "TRADEHUB_API_TOKEN": "paste-your-generated-token-here"
+        "TRADEHUB_API_TOKEN": "paste-your-execution-token-here",
+        "TRADEHUB_PREVIEW_API_TOKEN": "paste-your-different-preview-token-here"
       }
     }
   }

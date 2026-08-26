@@ -71,7 +71,7 @@ def test_reconcile_command_posts_reconcile_and_formats_status(monkeypatch):
     monkeypatch.setitem(sys.modules, "telegram", fake_telegram_module)
     monkeypatch.setitem(sys.modules, "telegram.ext", fake_ext_module)
 
-    monkeypatch.setattr(telegram_bot, "TradeHubClient", lambda: FakeClient())
+    monkeypatch.setattr(telegram_bot, "TradeHubClient", lambda **_: FakeClient())
     monkeypatch.setattr(
         telegram_bot,
         "get_settings",
