@@ -12,9 +12,11 @@ Run as root on the host:
 install -d -o root -g root -m 0751 /etc/tradehub
 useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin tradehub-execution
 useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin tradehub-research
+install -d -o tradehub-execution -g tradehub-execution -m 0750 /var/lib/tradehub
+install -d -o tradehub-research -g tradehub-research -m 0750 /var/lib/tradehub-research
 ```
 
-Store execution-only values in `/etc/tradehub/execution.env`, mode `0640`,
+`/etc/tradehub/execution.env`; set `TRADEHUB_DATABASE_PATH=/var/lib/tradehub/tradehub.db` there. Store execution-only values
 owner `root:tradehub-execution`. It contains `TRADEHUB_API_TOKEN`,
 `TRADEHUB_PREVIEW_API_TOKEN`, and Tiger credential settings. Store the Tiger
 private key at `/etc/tradehub/tiger_private_key.pk8`, mode `0640`, owner
@@ -22,7 +24,7 @@ private key at `/etc/tradehub/tiger_private_key.pk8`, mode `0640`, owner
 execution environment file.
 
 Store research-only values in `/etc/tradehub/research.env`, mode `0640`,
-owner `root:tradehub-research`. It must contain only `RESEARCH_*` settings and
+owner `root:tradehub-research`; set `RESEARCH_DB_PATH=/var/lib/tradehub-research/research.db` there. It must contain only `RESEARCH_*` settings and
 must not contain execution or Tiger credentials.
 
 Install and enable the units:

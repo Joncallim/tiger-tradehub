@@ -32,7 +32,8 @@ def test_research_unit_is_a_distinct_unprivileged_runtime():
     assert "/etc/tradehub/tiger_private_key.pk8" in inaccessible
     assert "/home/jon/tiger-tradehub/.env" in inaccessible
     assert "/home/jon/tiger-tradehub/data/tiger_private_key.pk8.pem" in inaccessible
-    assert research["ReadWritePaths"] == ["/home/jon/tiger-tradehub/data/research"]
+    assert research["ReadWritePaths"] == ["/var/lib/tradehub-research"]
+    assert execution["ReadWritePaths"] == ["/var/lib/tradehub"]
 
 
 def test_current_root_execution_secret_files_are_not_readable_by_unprivileged_runtime():
