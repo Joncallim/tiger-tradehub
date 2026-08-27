@@ -354,7 +354,7 @@ def test_full_production_seam_preview_through_settlement(tmp_path, settings, aud
         preview_result = asyncio.run(runtime.preview_proposal(proposal_id))
         assert preview_result["accepted"] is True
 
-        rendered = asyncio.run(runtime.render_approval(proposal_id, rationale="score lineage"))
+        rendered = asyncio.run(runtime.render_approval(proposal_id))
         assert rendered["symbol"] == "AAPL"
         assert rendered["side"] == "BUY"
 
@@ -404,7 +404,7 @@ def test_affirm_rejects_altered_context_through_the_production_seam(
         )
 
         asyncio.run(runtime.preview_proposal(proposal_id))
-        rendered = asyncio.run(runtime.render_approval(proposal_id, rationale="score lineage"))
+        rendered = asyncio.run(runtime.render_approval(proposal_id))
         altered = {**rendered, "quantity": 999}
 
         with pytest.raises((ValueError, KeyError, TypeError)):
@@ -449,7 +449,7 @@ def test_restart_recovery_resumes_after_process_restart(tmp_path, settings, audi
             audit_store=audit_store,
             prove_paper=lambda: True,
         )
-        rendered = asyncio.run(runtime_b.render_approval(proposal_id, rationale="post-restart"))
+        rendered = asyncio.run(runtime_b.render_approval(proposal_id))
         affirm_result = asyncio.run(runtime_b.affirm_approval(proposal_id, exact_context=rendered))
         assert affirm_result["state"] == "SUBMITTED"
         settlement = asyncio.run(runtime_b.reconcile_proposal(proposal_id))

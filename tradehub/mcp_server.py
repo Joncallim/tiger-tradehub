@@ -153,15 +153,16 @@ def main() -> None:
         return result
 
     @mcp.tool()
-    async def render_approval(proposal_id: str, rationale: str = "") -> dict[str, Any]:
+    async def render_approval(proposal_id: str) -> dict[str, Any]:
         """Render the exact approval context for a previewed proposal.
 
         Returns the full order context (ticker, side, quantity, limit price,
         currency, current/proposed state, proposal id, reason) for display.
-        Round-trip this EXACT object to ``affirm_approval`` -- an altered or
-        model-reconstructed context will be rejected.
+        The rationale is derived from the proposal's own reason codes (never
+        caller-supplied). Round-trip this EXACT object to ``affirm_approval``
+        -- an altered or model-reconstructed context will be rejected.
         """
-        return await phase4_runtime.render_approval(proposal_id, rationale=rationale)
+        return await phase4_runtime.render_approval(proposal_id)
 
     @mcp.tool()
     async def affirm_approval(proposal_id: str, exact_context: dict[str, Any]) -> dict[str, Any]:

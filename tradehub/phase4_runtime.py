@@ -292,14 +292,27 @@ class Phase4Runtime:
             already_applied_fill=already_applied_fill,
         )
 
+    def _deterministic_rationale(self, proposal: Any) -> str:
+        """Concise deterministic reason derived from the persisted proposal's
+        own reason codes -- never caller-supplied free text. This closes the
+        gap where a caller-chosen ``rationale`` string could otherwise be
+        echoed back as its own "canonical" value (self-comparison is not a
+        binding); the approval's reason is always this DB-derived string."""
+        import json as _json
+
+        codes = _json.loads(proposal["reason_codes_json"])
+        return ", ".join(str(c) for c in codes) if codes else "no reason codes recorded"
+
     # -- Stage 2: render + affirm approval -----------------------------------
 
-    async def render_approval(self, proposal_id: str, *, rationale: str) -> dict[str, Any]:
+    async def render_approval(self, proposal_id: str) -> dict[str, Any]:
         """Render the exact approval from the persisted proposal/preview.
 
         Returns the rendered context for display; the caller must then call
         ``affirm_approval`` with that EXACT context (round-tripped, never
-        reconstructed from prose) to actually submit.
+        reconstructed from prose) to actually submit. The rationale is
+        derived deterministically from the proposal's own reason codes --
+        it is never accepted as caller input, so it cannot be spoofed.
         """
         with self.database.connect() as db:
             proposal = self._load_proposal_row(db, proposal_id)
@@ -307,6 +320,7 @@ class Phase4Runtime:
             if link is None or link["state"] != "PREVIEWED":
                 raise ValueError(f"proposal {proposal_id} is not in PREVIEWED state")
             intent = self._load_intent(db, proposal)
+            rationale = self._deterministic_rationale(proposal)
 
         boundary = self._recover_boundary(proposal_id, intent, link)
         context = boundary.render_approval(
@@ -338,6 +352,9 @@ class Phase4Runtime:
         instance from ``render_approval`` does not survive across an async
         MCP tool call boundary) and compares the caller's round-tripped
         context against it -- a fabricated/altered context can never match.
+        The rationale used for comparison is ALWAYS the deterministic,
+        DB-derived value -- a caller cannot supply their own rationale and
+        have it treated as canonical.
         """
         with self.database.connect() as db:
             proposal = self._load_proposal_row(db, proposal_id)
@@ -345,13 +362,14 @@ class Phase4Runtime:
             if link is None or link["state"] != "PREVIEWED":
                 raise ValueError(f"proposal {proposal_id} is not in PREVIEWED state")
             intent = self._load_intent(db, proposal)
+            rationale = self._deterministic_rationale(proposal)
 
         boundary = self._recover_boundary(proposal_id, intent, link)
         canonical = boundary.render_approval(
             intent,
             current_state=str(proposal["current_state"]),
             proposed_state=str(proposal["proposed_state"]),
-            rationale=str(exact_context.get("rationale", "")),
+            rationale=rationale,
         )
         caller_context = ApprovalContext(
             proposal_id=str(exact_context["proposal_id"]),
