@@ -103,6 +103,27 @@ class TiingoQuota:
                 raise RuntimeError("Tiingo 450-symbol rolling-month bootstrap ceiling reached")
             db.execute("INSERT INTO bootstrap_symbol VALUES (?,?)", (symbol, now))
 
+    def bootstrap_usage(self, now: float, limit: int = 450) -> dict[str, Any]:
+        """Read-only introspection of the durable rolling-month bootstrap set.
+
+        Does NOT reserve/consume a slot -- callers use this to plan a bounded
+        backfill (compute headroom) BEFORE spending any quota via
+        reserve_bootstrap_symbol/fetch_prices.
+        """
+        if self.state_path is None:
+            return {"used": 0, "remaining": limit, "limit": limit, "symbols": []}
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "DELETE FROM bootstrap_symbol WHERE first_requested_at <= ?", (now - 30 * 86400,)
+            )
+            rows = db.execute(
+                "SELECT symbol, first_requested_at FROM bootstrap_symbol ORDER BY symbol"
+            ).fetchall()
+        symbols = [{"symbol": row[0], "first_requested_at": row[1]} for row in rows]
+        used = len(symbols)
+        return {"used": used, "remaining": max(0, limit - used), "limit": limit, "symbols": symbols}
+
 
 class TiingoEodAdapter(NetworkClient):
     def __init__(

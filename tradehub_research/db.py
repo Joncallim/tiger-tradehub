@@ -32,9 +32,18 @@ def normalize_ts(value: str) -> str:
 
 
 class ResearchDB:
-    def __init__(self, path: Path | str, busy_timeout_ms: int = 5000):
+    def __init__(
+        self,
+        path: Path | str,
+        busy_timeout_ms: int = 5000,
+        *,
+        migrations: tuple[tuple[int, str, str], ...] = MIGRATIONS,
+        expected_schema_version: int = PHASE_0_SCHEMA_VERSION,
+    ):
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
+        self._migrations = migrations
+        self._expected_schema_version = expected_schema_version
 
     @contextmanager
     def connect(self, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
@@ -70,7 +79,7 @@ class ResearchDB:
             )
             db.commit()
             applied = {row[0] for row in db.execute("SELECT version_id FROM schema_version")}
-            for version, description, sql in MIGRATIONS:
+            for version, description, sql in self._migrations:
                 if version not in applied:
                     values = (description.replace("'", "''"), utc_now().replace("'", "''"))
                     # Table replacement must preserve dependent rows while names move.
@@ -105,7 +114,7 @@ class ResearchDB:
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         return {
-            "ok": integrity == "ok" and self.schema_version() == PHASE_0_SCHEMA_VERSION,
+            "ok": integrity == "ok" and self.schema_version() == self._expected_schema_version,
             "integrity": integrity,
             "schema_version": self.schema_version(),
             "tables": sorted(tables),
