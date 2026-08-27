@@ -76,7 +76,7 @@ def test_outcome_append_does_not_mutate_prediction(tmp_path):
     assert outcome["total_return"] == 0.03  # outcome lives in its own row
 
 
-def test_prediction_dedupes_and_never_overwrites(tmp_path):
+def test_prediction_dedupes_identical_and_rejects_tamper(tmp_path):
     experiment_db = ExperimentDB(tmp_path / "experiment.db")
     experiment_db.migrate()
 
@@ -94,21 +94,41 @@ def test_prediction_dedupes_and_never_overwrites(tmp_path):
         evidence_ids=["ev-1"],
         horizon_sessions=63,
     )
+    # Identical content dedupes to the SAME prediction (no duplicate row).
     second = record_prediction(
         experiment_db,
         security_id="sec-1",
         as_of="2024-01-01T00:00:00Z",
         variant_name="production",
-        score_value=0.99,  # would-be tamper
+        score_value=0.7,
         state=None,
         screen_passed=True,
         sufficient_data=True,
-        raw_features={"momentum": 0.99},
+        raw_features={"momentum": 0.05},
         config_hash="cfg-1",
         evidence_ids=["ev-1"],
         horizon_sessions=63,
     )
-    assert first == second  # original row returned, tamper attempt ignored
+    assert first == second
+
+    # A colliding re-record with DIFFERENT content is a data-integrity
+    # error -- the first prediction is immutable and authoritative, and
+    # dedupe must never silently alias different features (tamper-adjacent).
+    with pytest.raises(ValueError, match="different raw_features_hash"):
+        record_prediction(
+            experiment_db,
+            security_id="sec-1",
+            as_of="2024-01-01T00:00:00Z",
+            variant_name="production",
+            score_value=0.99,  # would-be tamper
+            state=None,
+            screen_passed=True,
+            sufficient_data=True,
+            raw_features={"momentum": 0.99},
+            config_hash="cfg-1",
+            evidence_ids=["ev-1"],
+            horizon_sessions=63,
+        )
 
     with experiment_db.connect(read_only=True) as conn:
         count = conn.execute("SELECT COUNT(*) FROM forward_prediction").fetchone()[0]

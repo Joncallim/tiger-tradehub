@@ -76,8 +76,10 @@ def run_sealed_holdout(
     holdout_start = holdout["start"]
     holdout_end = holdout["end"]
 
+    from tradehub_research.validation.replay import screen_observation_date
+
     holdout_screens = [
-        s for s in screens if holdout_start <= s.get("computed_at", "")[:10] <= holdout_end
+        s for s in screens if holdout_start <= screen_observation_date(s) <= holdout_end
     ]
     holdout_labels = [
         label
@@ -187,12 +189,22 @@ def _signals_by_date(
     screens_by_security: dict[str, list[dict[str, Any]]],
 ) -> dict[str, dict[str, float]]:
     """Per-date signals keyed by the EVALUATION date (pipeline_run as_of via
-    screen_observation_date), never computed_at (run wall-clock time)."""
+    screen_observation_date), never computed_at (run wall-clock time).
+
+    AGGREGATION, never overwrite: a security screened by six Hunter
+    families contributes the MEAN family confidence (B4-equal-scoring
+    semantics) -- the same aggregation rule as the evaluation baselines, so
+    the holdout signal is comparable to the development signal and no
+    family silently wins (round-1 P1 class, held out here)."""
     from tradehub_research.validation.replay import screen_observation_date
 
     signals: dict[str, dict[str, float]] = {}
     for security_id, security_screens in screens_by_security.items():
         for screen in security_screens:
             day = screen_observation_date(screen)
-            signals.setdefault(day, {})[security_id] = float(screen.get("confidence", 0.0) or 0.0)
-    return signals
+            bucket = signals.setdefault(day, {}).setdefault(security_id, [])
+            bucket.append(float(screen.get("confidence", 0.0) or 0.0))
+    return {
+        day: {security_id: sum(values) / len(values) for security_id, values in securities.items()}
+        for day, securities in signals.items()
+    }

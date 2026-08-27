@@ -58,11 +58,22 @@ def record_prediction(
     outcome_due = _outcome_due_date(as_of, horizon_sessions)
     with experiment_db.connect() as conn:
         existing = conn.execute(
-            "SELECT prediction_id FROM forward_prediction "
+            "SELECT prediction_id, raw_features_hash, config_hash FROM forward_prediction "
             "WHERE security_id=? AND as_of=? AND variant_name=? AND horizon_sessions=?",
             (security_id, as_of[:10], variant_name, horizon_sessions),
         ).fetchone()
         if existing is not None:
+            # Dedupe must never alias different content: the FIRST recorded
+            # prediction is immutable and authoritative; a colliding
+            # re-record with DIFFERENT features/config is a data-integrity
+            # error, not a silent no-op (tamper-adjacent).
+            if str(existing[1]) != raw_features_hash or str(existing[2]) != config_hash:
+                raise ValueError(
+                    f"forward_prediction collision for "
+                    f"{security_id}@{as_of[:10]}/{variant_name}/h{horizon_sessions}: "
+                    "existing row has different raw_features_hash or config_hash; "
+                    "the first-recorded prediction is authoritative"
+                )
             return str(existing[0])
         conn.execute(
             "INSERT INTO forward_prediction VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
