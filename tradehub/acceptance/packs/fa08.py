@@ -82,10 +82,14 @@ def _upstream_packs_pass() -> list[str]:
     return missing
 
 
-def _seed_acceptance_proposal(research_db_path: Path) -> str:
+def _seed_acceptance_proposal(research_db_path: Path, *, run_id: str) -> str:
     """Seed a minimal eligible persisted proposal in an isolated research DB
     for this acceptance run (an acceptance pack never reuses production
-    research state)."""
+    research state). The proposal_id is derived from run_id so repeated
+    acceptance runs never collide on the same client_request_id in the
+    shared execution-side AuditStore -- a stable ID here would trip the
+    ambiguous-authority fail-closed guard in
+    ``AuditStore.find_confirmation_by_client_request_id``."""
     from tests.portfolio_test_helpers import seed_pipeline_run, seed_score, seed_security
     from tradehub_research.db import ResearchDB
     from tradehub_research.portfolio.fixtures import fixture_policy
@@ -99,7 +103,7 @@ def _seed_acceptance_proposal(research_db_path: Path) -> str:
     portfolio_run_id = "r" * 64
     decision_id = "d" * 64
     transition_id = "t" * 64
-    proposal_id = "p" * 64
+    proposal_id = ("p" + run_id).replace("-", "")[:64].ljust(64, "0")
     with database.connect() as db:
         seed_security(db, security_id, ticker=ACCEPTANCE_SYMBOL)
         db.execute(
@@ -307,7 +311,7 @@ def build_fa08_pack() -> PackDefinition:
 
         research_db_path = REPO_ROOT / "data" / "acceptance" / f"{ctx.run_id}-research.db"
         research_db_path.parent.mkdir(parents=True, exist_ok=True)
-        proposal_id = _seed_acceptance_proposal(research_db_path)
+        proposal_id = _seed_acceptance_proposal(research_db_path, run_id=ctx.run_id)
 
         manager = ServiceManager(ctx, env_overrides={"TRADEHUB_DRY_RUN": "false"})
         manager.start()
