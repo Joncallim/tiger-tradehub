@@ -324,7 +324,10 @@ def build_fa08_pack() -> PackDefinition:
         submit_client = TradeHubClient(
             base_url=base, api_token=manager.env.get("TRADEHUB_API_TOKEN", "")
         )
-        audit_store = AuditStore(manager.env.get("TRADEHUB_DATABASE_PATH", ""))
+        db_path_value = manager.env.get("TRADEHUB_DATABASE_PATH") or str(
+            REPO_ROOT / "data" / "tradehub.db"
+        )
+        audit_store = AuditStore(Path(db_path_value))
         runtime = Phase4Runtime(
             research_db,
             allowlist=set(ctx.settings.symbol_allowlist),
