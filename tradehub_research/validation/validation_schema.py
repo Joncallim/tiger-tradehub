@@ -12,7 +12,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-VALIDATION_SCHEMA_VERSION = 1
+VALIDATION_SCHEMA_VERSION = 2
 
 VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -198,6 +198,51 @@ VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         BEGIN SELECT RAISE(ABORT,'backfill_attempt is append-only'); END;
         CREATE TRIGGER backfill_attempt_no_delete BEFORE DELETE ON backfill_attempt
         BEGIN SELECT RAISE(ABORT,'backfill_attempt is append-only'); END;
+        """,
+    ),
+    (
+        2,
+        "Phase 5 forward tracker: immutable predictions + appended outcomes",
+        """
+        CREATE TABLE forward_prediction (
+            prediction_id TEXT PRIMARY KEY,
+            security_id TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            variant_name TEXT NOT NULL,
+            score_value REAL,
+            state TEXT,
+            screen_passed INTEGER CHECK(screen_passed IS NULL OR screen_passed IN (0,1)),
+            sufficient_data INTEGER CHECK(sufficient_data IS NULL OR sufficient_data IN (0,1)),
+            raw_features_hash TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json)),
+            horizon_sessions INTEGER NOT NULL CHECK(horizon_sessions IN (21,63,126,252)),
+            outcome_due_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(security_id, as_of, variant_name, horizon_sessions)
+        );
+        CREATE TRIGGER forward_prediction_no_update BEFORE UPDATE ON forward_prediction
+        BEGIN SELECT RAISE(ABORT,'forward_prediction is immutable before outcome'); END;
+        CREATE TRIGGER forward_prediction_no_delete BEFORE DELETE ON forward_prediction
+        BEGIN SELECT RAISE(ABORT,'forward_prediction is append-only'); END;
+
+        CREATE TABLE forward_outcome (
+            outcome_id TEXT PRIMARY KEY,
+            prediction_id TEXT NOT NULL REFERENCES forward_prediction(prediction_id),
+            outcome_status TEXT NOT NULL CHECK(outcome_status IN
+                ('OBSERVED','DELISTING_OUTCOME_UNKNOWN','CENSORED_INSUFFICIENT_HORIZON')),
+            raw_return REAL,
+            total_return REAL,
+            benchmark_relative_return REAL,
+            entry_session_date TEXT,
+            exit_session_date TEXT,
+            appended_at TEXT NOT NULL,
+            UNIQUE(prediction_id)
+        );
+        CREATE TRIGGER forward_outcome_no_update BEFORE UPDATE ON forward_outcome
+        BEGIN SELECT RAISE(ABORT,'forward_outcome is append-only'); END;
+        CREATE TRIGGER forward_outcome_no_delete BEFORE DELETE ON forward_outcome
+        BEGIN SELECT RAISE(ABORT,'forward_outcome is append-only'); END;
         """,
     ),
 )

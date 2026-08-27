@@ -13,6 +13,7 @@ from tradehub_research.acceptance.packs.ra01 import ASSERTIONS as RA01_ASSERTION
 from tradehub_research.acceptance.packs.ra02 import ASSERTIONS as RA02_ASSERTIONS
 from tradehub_research.acceptance.packs.ra03 import ASSERTIONS as RA03_ASSERTIONS
 from tradehub_research.acceptance.packs.ra04 import ASSERTIONS as RA04_ASSERTIONS
+from tradehub_research.acceptance.packs.ra05 import ASSERTIONS as RA05_ASSERTIONS
 from tradehub_research.acceptance.sanitize import sanitize
 from tradehub_research.acceptance.schema import AssertionResult, RunResult, Status
 
@@ -26,6 +27,7 @@ PACK_REGISTRY: dict[str, list[PackAssertion]] = {
     "RA-02": RA02_ASSERTIONS,
     "RA-03": RA03_ASSERTIONS,
     "RA-04": RA04_ASSERTIONS,
+    "RA-05": RA05_ASSERTIONS,
 }
 
 
