@@ -168,7 +168,7 @@ def _fixture(
 
 def test_schema_v9_fresh_and_append_only(tmp_path):
     database = ResearchDB(tmp_path / "fresh.db")
-    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 10
+    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 11
     with database.connect() as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"evidence_pack", "committee_run", "score_snapshot"} <= tables
@@ -185,7 +185,7 @@ def test_schema_v7_upgrade_is_additive(tmp_path):
         for version, description, sql in MIGRATIONS[:7]:
             db.executescript(sql)
             db.execute("INSERT INTO schema_version VALUES (?,?,?)", (version, "now", description))
-    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 10
+    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 11
 
 
 def test_pack_exact_groups_supersession_and_hash_retry(tmp_path):

@@ -19,6 +19,55 @@ def intent():
     return OrderIntent(symbol="AAPL", side="BUY", quantity=1, limit_price=150)
 
 
+def intent_with_client_request_id(client_request_id: str):
+    return OrderIntent(
+        symbol="AAPL",
+        side="BUY",
+        quantity=1,
+        limit_price=150,
+        client_request_id=client_request_id,
+    )
+
+
+def test_find_active_confirmation_by_client_request_id_recovers_after_restart(tmp_path):
+    store = AuditStore(tmp_path / "tradehub.db")
+    token, _ = store.create_confirmation(
+        intent_with_client_request_id("proposal-1"), None, ttl_seconds=300
+    )
+
+    recovered = store.find_active_confirmation_by_client_request_id("proposal-1")
+
+    assert recovered is not None
+    recovered_token, recovered_intent, submission_state = recovered
+    assert recovered_token == token
+    assert recovered_intent.client_request_id == "proposal-1"
+
+
+def test_find_active_confirmation_returns_none_when_absent(tmp_path):
+    store = AuditStore(tmp_path / "tradehub.db")
+    assert store.find_active_confirmation_by_client_request_id("missing") is None
+
+
+def test_find_active_confirmation_ignores_submitted_confirmations(tmp_path):
+    store = AuditStore(tmp_path / "tradehub.db")
+    token, _ = store.create_confirmation(
+        intent_with_client_request_id("proposal-2"), None, ttl_seconds=300
+    )
+    *_, lease_id = store.claim_confirmation(token)
+    store.finalize_confirmation(token, order_id="broker-1", submit_lease_id=lease_id)
+
+    assert store.find_active_confirmation_by_client_request_id("proposal-2") is None
+
+
+def test_find_active_confirmation_fails_closed_on_ambiguity(tmp_path):
+    store = AuditStore(tmp_path / "tradehub.db")
+    store.create_confirmation(intent_with_client_request_id("dup"), None, ttl_seconds=300)
+    store.create_confirmation(intent_with_client_request_id("dup"), None, ttl_seconds=300)
+
+    with pytest.raises(ValueError, match="multiple active confirmations"):
+        store.find_active_confirmation_by_client_request_id("dup")
+
+
 def test_create_confirmation_records_preview_and_claim_returns_intent(tmp_path):
     store = AuditStore(tmp_path / "tradehub.db")
 

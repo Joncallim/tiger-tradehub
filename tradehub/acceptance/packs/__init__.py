@@ -18,6 +18,7 @@ def _build_all() -> dict[str, PackDefinition]:
     from tradehub.acceptance.packs.fa03 import build_fa03_pack
     from tradehub.acceptance.packs.fa04 import build_fa04_pack
     from tradehub.acceptance.packs.fa05 import build_fa05_pack
+    from tradehub.acceptance.packs.fa08 import build_fa08_pack
 
     packs = [
         build_fa00_pack(),
@@ -26,6 +27,7 @@ def _build_all() -> dict[str, PackDefinition]:
         build_fa03_pack(),
         build_fa04_pack(),
         build_fa05_pack(),
+        build_fa08_pack(),
     ]
     return {pack.pack_id: pack for pack in packs}
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-PHASE_0_SCHEMA_VERSION = 10
+PHASE_0_SCHEMA_VERSION = 11
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -991,6 +991,28 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         CREATE TRIGGER trade_proposal_no_delete BEFORE DELETE ON trade_proposal BEGIN SELECT RAISE(ABORT, 'trade_proposal is append-only'); END;
         CREATE TRIGGER portfolio_briefing_no_update BEFORE UPDATE ON portfolio_briefing BEGIN SELECT RAISE(ABORT, 'portfolio_briefing is append-only'); END;
         CREATE TRIGGER portfolio_briefing_no_delete BEFORE DELETE ON portfolio_briefing BEGIN SELECT RAISE(ABORT, 'portfolio_briefing is append-only'); END;
+        """,
+    ),
+    (
+        11,
+        "V2 Phase 4 safe execution linkage",
+        """
+        CREATE TABLE phase4_execution_link (
+            proposal_id TEXT PRIMARY KEY REFERENCES trade_proposal(proposal_id),
+            execution_ref TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            approval_ref_hash TEXT CHECK(approval_ref_hash IS NULL OR length(approval_ref_hash)=64),
+            broker_order_ref TEXT,
+            previewed_at TEXT,
+            approved_at TEXT,
+            submitted_at TEXT,
+            reconciled_at TEXT,
+            settlement_ref TEXT,
+            applied_fill_microunits INTEGER NOT NULL DEFAULT 0,
+            owned_quantity_microunits INTEGER,
+            rendered_context_hash TEXT CHECK(rendered_context_hash IS NULL OR length(rendered_context_hash)=64)
+        );
+        CREATE INDEX phase4_execution_link_state_idx ON phase4_execution_link(state);
         """,
     ),
 )

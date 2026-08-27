@@ -566,6 +566,81 @@ class AuditStore:
                 raise KeyError("unknown confirmation token")
             return row["submission_state"]
 
+    def find_active_confirmation_by_client_request_id(
+        self, client_request_id: str
+    ) -> tuple[str, OrderIntent, str | None] | None:
+        """Restart-recovery lookup: locate the unique non-submitted, non-expired
+        confirmation whose ``intent.client_request_id`` matches ``client_request_id``.
+
+        Returns ``(token, intent, submission_state)`` for the SINGLE matching
+        row, or ``None`` if no active (not-yet-submitted, not-expired)
+        confirmation exists. Raises ``ValueError`` if more than one candidate
+        is active -- ambiguity is a fail-closed condition, never silently
+        resolved by picking one.
+
+        This is how execution-side code recovers actual confirmation
+        authority after a restart from only a safe (proposal_id, hashed
+        reference) research-side record: the raw token itself is never
+        persisted or transmitted outside this store.
+        """
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT token, intent_json, submission_state FROM confirmations "
+                "WHERE submitted_at IS NULL AND expires_at >= ?",
+                (now,),
+            ).fetchall()
+        candidates = []
+        for row in rows:
+            intent = OrderIntent.model_validate_json(row["intent_json"])
+            if intent.client_request_id == client_request_id:
+                candidates.append((row["token"], intent, row["submission_state"]))
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            raise ValueError(
+                f"multiple active confirmations for client_request_id={client_request_id!r}; "
+                "cannot recover authority unambiguously"
+            )
+        return candidates[0]
+
+    def find_confirmation_by_client_request_id(
+        self, client_request_id: str
+    ) -> tuple[str, OrderIntent, str | None] | None:
+        """Restart-recovery lookup across BOTH not-yet-submitted and already
+        submitted confirmations (unlike ``find_active_confirmation_by_...``
+        which excludes submitted rows). Used to recover the confirmation
+        token for reconciliation after a restart that happened AFTER submit.
+
+        Expired, never-submitted confirmations are excluded (dead authority);
+        an already-submitted confirmation is included regardless of
+        ``expires_at`` since its authority window is defined by the broker
+        order lifecycle, not the preview TTL.
+
+        Same ambiguity fail-closed contract as
+        ``find_active_confirmation_by_client_request_id``.
+        """
+        now = utc_now().isoformat()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT token, intent_json, submission_state FROM confirmations "
+                "WHERE submitted_at IS NOT NULL OR expires_at >= ?",
+                (now,),
+            ).fetchall()
+        candidates = []
+        for row in rows:
+            intent = OrderIntent.model_validate_json(row["intent_json"])
+            if intent.client_request_id == client_request_id:
+                candidates.append((row["token"], intent, row["submission_state"]))
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            raise ValueError(
+                f"multiple confirmations for client_request_id={client_request_id!r}; "
+                "cannot recover authority unambiguously"
+            )
+        return candidates[0]
+
 
 def utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)

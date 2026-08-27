@@ -38,6 +38,29 @@ def test_reconcile_order_tool_registered_and_forwards_payload(monkeypatch):
     monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp_module)
 
     monkeypatch.setattr(mcp_server, "TradeHubClient", lambda **_: FakeClient())
+    monkeypatch.setattr(
+        mcp_server, "Settings", lambda: types.SimpleNamespace(database_path=":memory:")
+    )
+    monkeypatch.setattr(mcp_server, "AuditStore", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        mcp_server,
+        "ResearchSettings",
+        lambda: types.SimpleNamespace(db_path=":memory:", busy_timeout_ms=1000),
+    )
+
+    class FakeResearchDB:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def migrate(self):
+            pass
+
+    monkeypatch.setattr(mcp_server, "ResearchDB", FakeResearchDB)
+    monkeypatch.setattr(
+        mcp_server,
+        "Phase4Runtime",
+        lambda *_a, **_k: types.SimpleNamespace(),
+    )
 
     mcp_server.main()
 
