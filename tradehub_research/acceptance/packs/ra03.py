@@ -2221,6 +2221,7 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_tiger_gateway.py",
         "tests/test_phase4_execution.py",
         "tests/test_phase4_runtime.py",
+        "tests/test_phase4_runtime_production_seam.py",
         "tests/test_runtime_isolation.py",
         "tests/test_research_adapters.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of

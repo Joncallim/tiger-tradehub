@@ -1008,6 +1008,8 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             submitted_at TEXT,
             reconciled_at TEXT,
             settlement_ref TEXT,
+            applied_fill_microunits INTEGER NOT NULL DEFAULT 0,
+            owned_quantity_microunits INTEGER,
             rendered_context_hash TEXT CHECK(rendered_context_hash IS NULL OR length(rendered_context_hash)=64)
         );
         CREATE INDEX phase4_execution_link_state_idx ON phase4_execution_link(state);

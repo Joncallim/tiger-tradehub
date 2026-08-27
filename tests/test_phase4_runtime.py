@@ -25,7 +25,7 @@ class Connection:
     def execute(self, sql, params=()):
         if "SELECT p.*, d.observed_at" in sql:
             return Result(self.proposal)
-        if "SELECT state,execution_ref" in sql:
+        if "SELECT * FROM phase4_execution_link" in sql:
             return Result(None)
         if "SELECT COUNT(*), COALESCE" in sql:
             return Result((0, 0))
@@ -51,6 +51,15 @@ class PreviewClient:
     async def post(self, path, payload):
         self.calls.append((path, payload))
         return {"accepted": True, "confirmation_token": "execution-secret"}
+
+
+class SubmitClient:
+    def __init__(self):
+        self.calls = []
+
+    async def post(self, path, payload):
+        self.calls.append((path, payload))
+        return {"accepted": True}
 
 
 def test_production_preview_loads_proposal_resolves_identity_and_persists_safe_link(monkeypatch):
@@ -80,6 +89,7 @@ def test_production_preview_loads_proposal_resolves_identity_and_persists_safe_l
         max_day_count=3,
         max_day_notional=1000,
         preview_client=client,
+        submit_client=SubmitClient(),
     )
 
     result = asyncio.run(runtime.preview_proposal("p1"))
