@@ -348,9 +348,7 @@ def build_fa08_pack() -> PackDefinition:
             if preview_result.get("accepted") is not True:
                 raise AssertionError_("production preview was not accepted")
 
-            rendered = asyncio.run(
-                runtime.render_approval(proposal_id, rationale="FA-08 acceptance")
-            )
+            rendered = asyncio.run(runtime.render_approval(proposal_id))
             affirm_result = asyncio.run(
                 runtime.affirm_approval(proposal_id, exact_context=rendered)
             )
