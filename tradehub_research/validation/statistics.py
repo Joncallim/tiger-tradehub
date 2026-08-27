@@ -24,14 +24,30 @@ from statistics import mean
 from typing import Any
 
 
+def _rank_eq(a: float, b: float) -> bool:
+    """Tolerance-based equality for rank ties.
+
+    Computed features are sums/ratios of floats; summation order (and even
+    the interpreter's summation algorithm -- CPython 3.14's compensated
+    sum() vs earlier naive sequential sum) can make two mathematically
+    equal values differ by one ULP. Exact-equality tie detection then
+    breaks ties differently across interpreters, silently changing the IC.
+    Ties are compared within a relative epsilon; values that differ by a
+    few ULPs ARE ties for ranking purposes."""
+    return abs(a - b) <= 1e-12 * max(1.0, abs(a), abs(b))
+
+
 def spearman_rank(values: Sequence[float]) -> list[float]:
-    """Rank a sequence with average ranking for ties (1-based)."""
+    """Rank a sequence with average ranking for ties (1-based).
+
+    Tie detection uses _rank_eq (relative epsilon), NOT exact float
+    equality -- see _rank_eq for why."""
     order = sorted(range(len(values)), key=lambda i: values[i])
     ranks = [0.0] * len(values)
     index = 0
     while index < len(order):
         j = index
-        while j + 1 < len(order) and values[order[j + 1]] == values[order[index]]:
+        while j + 1 < len(order) and _rank_eq(values[order[j + 1]], values[order[index]]):
             j += 1
         average = (index + j) / 2 + 1
         for k in range(index, j + 1):
