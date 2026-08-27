@@ -354,3 +354,29 @@ def latest_close_microusd(db: Any, security_id: str, as_of: str) -> tuple[int | 
         return None, None
     micro = (_d(close) * Decimal(1_000_000)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
     return int(micro), _session_key(bar)
+
+
+def next_session_on_or_after(
+    db: Any, security_id: str, after_ts: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """First canonical bar with session date > ``after_ts``'s date.
+
+    Returns (bar, session_date) or (None, None) when no eligible session
+    exists. This is the outcome-builder ENTRY convention (handoff sec 6.3):
+    "first eligible session after the observation timestamp". The entry
+    price is the REALIZED next-session open/close -- an outcome-side label,
+    deliberately NOT a decision-time-visible price (the decision-time
+    feature path remains PIT-filtered and is guarded by the lookahead
+    canaries). A far-future visibility bound is therefore correct here:
+    realized labels may use realized prices; only features may not.
+    """
+    records = _visible_records(db, security_id, _OUTCOME_VISIBILITY_BOUND)
+    bars = _bar_records(records, _OUTCOME_VISIBILITY_BOUND)
+    cutoff = after_ts[:10]
+    for bar in bars:
+        if _session_key(bar) > cutoff:
+            return bar, _session_key(bar)
+    return None, None
+
+
+_OUTCOME_VISIBILITY_BOUND = "9999-12-31T00:00:00Z"
