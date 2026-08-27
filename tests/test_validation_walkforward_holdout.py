@@ -137,3 +137,46 @@ def test_re_sealing_blocked_after_holdout(tmp_path):
             screens=_synthetic_screens(),
             outcome_labels=_synthetic_outcomes(),
         )
+
+
+def test_db_trigger_blocks_second_holdout_attempt_per_regime(tmp_path):
+    """The reviewer's probe: even a direct SQL insert of a second HOLDOUT
+    attempt for a sealed regime must abort at the DB boundary (the final
+    holdout is one-time structurally, not just by application convention)."""
+    import sqlite3
+
+    experiment_db = ExperimentDB(tmp_path / "experiment.db")
+    experiment_db.migrate()
+    _seed_regime(experiment_db)
+    regime_id = draft_evaluation_regime(
+        experiment_db, "snap-1", coverage_start="2023-01-01", coverage_end="2024-12-31"
+    )
+    run_sealed_holdout(
+        experiment_db,
+        regime_id=regime_id,
+        dataset_snapshot_id="snap-1",
+        baseline="B3_HUNTERS_ONLY",
+        screens=_synthetic_screens(),
+        outcome_labels=_synthetic_outcomes(),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="one final HOLDOUT"):
+        with experiment_db.connect() as conn:
+            conn.execute(
+                "INSERT INTO experiment_attempt VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "second-holdout",
+                    regime_id,
+                    "snap-1",
+                    "HOLDOUT",
+                    "HOLDOUT_DUP",
+                    "{}",
+                    "deadbeef" * 8,
+                    None,
+                    63,
+                    2,
+                    "RUNNING",
+                    None,
+                    "2026-01-01T00:00:00Z",
+                    None,
+                ),
+            )

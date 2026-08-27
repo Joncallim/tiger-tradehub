@@ -98,10 +98,12 @@ def record_prediction_from_screen(
     screened security -- including FAILs and insufficient-data rows."""
     raw_features = json.loads(screen.get("raw_features_json", "{}"))
     evidence_ids = json.loads(screen.get("evidence_ids_json", "[]"))
+    from tradehub_research.validation.replay import screen_observation_date
+
     return record_prediction(
         experiment_db,
         security_id=screen["security_id"],
-        as_of=screen.get("computed_at", screen.get("run_id", "")),
+        as_of=screen_observation_date(screen),
         variant_name=variant_name,
         score_value=float(screen.get("confidence", 0.0) or 0.0),
         state=None,

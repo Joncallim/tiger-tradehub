@@ -20,8 +20,14 @@ def _seed_regime(experiment_db):
 
 
 def _synthetic_screens():
-    """Two dates x four securities x six families; a modest signal in the
-    outcomes that the confidence diagnostic should rank positively."""
+    """Two dates x four securities x six families.
+
+    Two families (valuation, inflection) rank securities in agreement with
+    the outcome (a best, d worst); four families rank OPPOSITE. This makes
+    the B2 family-rank composite (rank-average: majority anti order) and
+    the B4 mean-confidence signal (mean: minority agree order... by
+    construction they genuinely disagree), so the five baselines are
+    distinct and every family removal changes the evaluated signal."""
     screens = []
     families = (
         "valuation",
@@ -31,14 +37,18 @@ def _synthetic_screens():
         "event",
         "momentum_confirmation",
     )
+    # Confidence per security per family, on a scale of 0..1, chosen so
+    # that EVERY baseline signal has cross-sectional variance:
+    #   B3 any-pass: a/b pass (agreeing), c fails all, d passes (opposing)
+    #   B4 mean: a > c > b = d (ties, but variance exists)
+    #   B2 composite: rank-average gives a > b > c > d (opposite order)
+    agreeing = {"a": 0.9, "b": 0.6, "c": 0.5, "d": 0.2}  # outcome-agreeing
+    opposing = {"a": 0.4, "b": 0.45, "c": 0.55, "d": 0.65}  # outcome-opposing
     for day in ("2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01"):
-        for sid, confidence in (
-            ("a", 0.9),
-            ("b", 0.7),
-            ("c", 0.5),
-            ("d", 0.3),
-        ):
-            for family in families:
+        for family_index, family in enumerate(families):
+            table = agreeing if family_index < 2 else opposing
+            for sid in ("a", "b", "c", "d"):
+                confidence = table[sid]
                 screens.append(
                     {
                         "screen_result_id": f"{day}-{sid}-{family}",
@@ -106,6 +116,14 @@ def test_remove_one_hunter_ablation_truly_removes_component(tmp_path):
     experiment_db.migrate()
     _seed_regime(experiment_db)
 
+    full = evaluate_baseline(
+        experiment_db,
+        regime_id="regime-1",
+        dataset_snapshot_id="snap-1",
+        baseline="B4_EQUAL_SCORING",
+        screens=_synthetic_screens(),
+        outcome_labels=_synthetic_outcomes(),
+    )
     results = run_remove_one_hunter_ablations(
         experiment_db,
         regime_id="regime-1",
@@ -115,7 +133,57 @@ def test_remove_one_hunter_ablation_truly_removes_component(tmp_path):
     )
 
     assert len(results) == 6  # one per Hunter family
-    assert variant_count(experiment_db, "regime-1") == 6
+    assert variant_count(experiment_db, "regime-1") == 7  # full + six removals
+
+    # The ablation must TRULY remove the component: with the equal-scoring
+    # signal (mean confidence across families), removing any family changes
+    # every security's signal, so no ablation result may equal the full
+    # population's IC at every horizon (the reviewer's P1 probe).
+    full_ic = full["horizons"]["21"].get("mean_ic")
+    differing = [r for r in results if r["horizons"]["21"].get("mean_ic") != full_ic]
+    assert len(differing) == 6
+
+
+def test_baselines_are_genuinely_distinct(tmp_path):
+    """B0-B4 must be distinct evaluations (the reviewer's P1 probe: they
+    collapsed into one confidence-based signal). B0/B1 are portfolio-style
+    (mean return metrics); B2-B4 are IC baselines; none may share the
+    recorded metric shape or horizon values trivially."""
+    experiment_db = ExperimentDB(tmp_path / "experiment.db")
+    experiment_db.migrate()
+    _seed_regime(experiment_db)
+
+    summaries = {}
+    for baseline in (
+        "B0_BENCHMARK",
+        "B1_UNIVERSE",
+        "B2_FACTOR_COMPOSITE",
+        "B3_HUNTERS_ONLY",
+        "B4_EQUAL_SCORING",
+    ):
+        summaries[baseline] = evaluate_baseline(
+            experiment_db,
+            regime_id="regime-1",
+            dataset_snapshot_id="snap-1",
+            baseline=baseline,
+            screens=_synthetic_screens(),
+            outcome_labels=_synthetic_outcomes(),
+        )
+
+    # B0/B1 are portfolio-style: they report mean_return, not mean_ic.
+    assert "mean_return" in summaries["B0_BENCHMARK"]["horizons"]["21"]
+    assert "mean_return" in summaries["B1_UNIVERSE"]["horizons"]["21"]
+    assert "mean_ic" in summaries["B2_FACTOR_COMPOSITE"]["horizons"]["21"]
+    assert "mean_ic" in summaries["B3_HUNTERS_ONLY"]["horizons"]["21"]
+    assert "mean_ic" in summaries["B4_EQUAL_SCORING"]["horizons"]["21"]
+
+    # No two IC baselines share identical IC values at every horizon.
+    ic_by_baseline = {
+        name: [s["horizons"][str(h)].get("mean_ic") for h in (21, 63, 126, 252)]
+        for name, s in summaries.items()
+        if name != "B0_BENCHMARK" and name != "B1_UNIVERSE"
+    }
+    assert len({tuple(v) for v in ic_by_baseline.values()}) == 3
 
 
 def test_committee_ablations_record_insufficient_data_not_silent(tmp_path):

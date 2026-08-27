@@ -73,7 +73,9 @@ def _matured_development_screens(
         and label["outcome_status"] == "OBSERVED"
         and _outcome_ends_before(label["observation_date"], horizon, cutoff)
     }
-    return [s for s in screens if s.get("computed_at", "")[:10] in mature_dates]
+    from tradehub_research.validation.replay import screen_observation_date
+
+    return [s for s in screens if screen_observation_date(s) in mature_dates]
 
 
 def _outcome_ends_before(observation_date: str, horizon_sessions: int, cutoff: date) -> bool:

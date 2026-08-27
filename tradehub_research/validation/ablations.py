@@ -48,9 +48,11 @@ def run_remove_one_hunter_ablations(
     outcome_labels: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Ablation 2: six runs, each excluding one Hunter family from the
-    screened population before evaluation. A family's removal must actually
-    change the evaluated population (ablation truly removes the component,
-    RA-05 axis BASELINES)."""
+    screened population before evaluation. Underlying signal is the
+    equal-scoring baseline (B4: mean confidence across families) so a
+    family's removal ALWAYS changes the evaluated signal -- the ablation
+    truly removes the component (RA-05 axis BASELINES). The guard also
+    rejects a removal that changes no rows."""
     results: list[dict[str, Any]] = []
     for removed in HUNTER_FAMILIES:
         filtered = [s for s in screens if s.get("family") != removed]
@@ -74,7 +76,8 @@ def run_remove_one_hunter_ablations(
             experiment_db,
             regime_id=regime_id,
             dataset_snapshot_id=dataset_snapshot_id,
-            baseline=f"ABLATION_REMOVE_{removed}",
+            baseline="B4_EQUAL_SCORING",
+            variant_name=f"ABLATION_REMOVE_{removed}",
             screens=filtered,
             outcome_labels=outcome_labels,
         )
@@ -109,7 +112,8 @@ def run_confluence_ablation(
             experiment_db,
             regime_id=regime_id,
             dataset_snapshot_id=dataset_snapshot_id,
-            baseline="ABLATION_CONFLUENCE_ON",
+            baseline="B4_EQUAL_SCORING",
+            variant_name="ABLATION_CONFLUENCE_ON",
             screens=screens,
             outcome_labels=outcome_labels,
         )

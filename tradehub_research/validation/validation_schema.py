@@ -12,7 +12,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-VALIDATION_SCHEMA_VERSION = 2
+VALIDATION_SCHEMA_VERSION = 3
 
 VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -243,6 +243,21 @@ VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         BEGIN SELECT RAISE(ABORT,'forward_outcome is append-only'); END;
         CREATE TRIGGER forward_outcome_no_delete BEFORE DELETE ON forward_outcome
         BEGIN SELECT RAISE(ABORT,'forward_outcome is append-only'); END;
+        """,
+    ),
+    (
+        3,
+        "Phase 5: single-sealed-HOLDOUT DB-level guard",
+        """
+        -- The sealed regime permits HOLDOUT-kind inserts, but the final
+        -- holdout is ONE-TIME: at most one HOLDOUT attempt may ever exist
+        -- per regime (the application layer also refuses re-runs; this
+        -- trigger makes the invariant structural at the DB boundary).
+        CREATE TRIGGER experiment_attempt_single_holdout BEFORE INSERT ON experiment_attempt
+        WHEN NEW.variant_kind = 'HOLDOUT' AND EXISTS (
+            SELECT 1 FROM experiment_attempt
+            WHERE regime_id = NEW.regime_id AND variant_kind = 'HOLDOUT')
+        BEGIN SELECT RAISE(ABORT,'regime already has its one final HOLDOUT attempt'); END;
         """,
     ),
 )

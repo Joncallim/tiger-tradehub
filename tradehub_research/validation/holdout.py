@@ -186,9 +186,13 @@ def run_sealed_holdout(
 def _signals_by_date(
     screens_by_security: dict[str, list[dict[str, Any]]],
 ) -> dict[str, dict[str, float]]:
+    """Per-date signals keyed by the EVALUATION date (pipeline_run as_of via
+    screen_observation_date), never computed_at (run wall-clock time)."""
+    from tradehub_research.validation.replay import screen_observation_date
+
     signals: dict[str, dict[str, float]] = {}
     for security_id, security_screens in screens_by_security.items():
         for screen in security_screens:
-            day = str(screen.get("computed_at", ""))[:10]
+            day = screen_observation_date(screen)
             signals.setdefault(day, {})[security_id] = float(screen.get("confidence", 0.0) or 0.0)
     return signals
