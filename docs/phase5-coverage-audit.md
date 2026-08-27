@@ -1,51 +1,70 @@
-# Phase 5 — Data-Sufficiency Audit (Packet A, initial pass)
+# Phase 5 — Data-Sufficiency Audit (Packet A)
 
-Status: **audit findings, pre-implementation**. This supersedes the expected-coverage
-table in `docs/phase5-validation-research-architecture-handoff.md` §4 with the actual
-live state observed on `main @ c200639`.
+Status: **living audit — programmatically re-derivable via
+`research-validate audit`** (tradehub_research/validation/coverage_audit.py).
+This document records the audit's evolution; the tool output is the oracle.
 
-## Method
+## Audit at start of #38 (main @ c200639)
 
-Inspected the live `research.db` in this worktree (`data/research/research.db`) and the
-sibling execution worktree (`/home/jon/tiger-tradehub/data/research/research.db`)
-directly via `sqlite3`, checked adapter-level durable-quota state
-(`tradehub_research/adapters/tiingo.py`'s `bootstrap_symbol` table), checked both
-`.env` files for `TIINGO_TOKEN`/`RESEARCH_SEC_USER_AGENT`, and checked for any
+Inspected the live `research.db` in this worktree and the sibling execution
+worktree directly via `sqlite3`, checked adapter-level durable-quota state,
+checked both `.env` files for Tiingo/SEC credentials, and checked for any
 cron/systemd ingestion job.
 
-## Findings
-
-| Check | Result |
+| Check | Result (start) |
 | --- | --- |
-| `research.db` row counts (security, evidence_event, universe_membership, screen_result, candidate, pipeline_run, score_snapshot, model_assessment, trade_proposal, experiment_run, oos_evaluation_log, sealed_holdout, snapshot_manifest) | **0 in every table, both worktrees** |
-| `TIINGO_TOKEN` configured | **No**, in either `.env` |
-| `RESEARCH_SEC_USER_AGENT` configured | **No**, in either `.env` |
-| Tiingo adapter's own `bootstrap_symbol` rolling-30-day quota table | **Empty** — zero Tiingo API calls ever made, historical or live |
-| SEC EDGAR adapter (`tradehub_research/adapters/sec.py`) | Exists (daily-index, companyfacts/XBRL, Form 4 parsers), **never invoked against live data** |
-| Cron/systemd ingestion job | **None found** |
+| `research.db` row counts (all core tables) | **0 in every table, both worktrees** |
+| `TIINGO_TOKEN` configured | **No** |
+| `RESEARCH_SEC_USER_AGENT` configured | **No** |
+| Tiingo `bootstrap_symbol` rolling-30-day quota table | **Empty** — zero Tiingo API calls ever made |
+| SEC EDGAR adapter | Exists, never invoked against live data |
+| Cron/systemd ingestion | None found |
 
-## Revised conclusion vs. handoff §4
+Conclusion: every "PARTIAL/EVALUABLE" posture in the handoff's §4 coverage
+table was **ZERO-EVALUABLE** — a complete absence of ingested data, not a
+coverage gap. `INSUFFICIENT DATA` remains a valid Phase-5 verdict.
 
-The handoff's §4 table describes momentum/valuation/quality/inflection/informed-activity/event
-as EVALUABLE, PARTIAL, or PARTIAL/sparse based on an assumed partial backfill. The live
-audit found **zero ingested data of any kind** — every row in that table is presently
-**ZERO-EVALUABLE**, not a coverage gap to route around. This is a complete absence of
-ingested evidence, not partial coverage.
+## Update — SEC identity bootstrap (2026-08-27)
 
-## Path forward (per owner authorization)
+Per the steering directive and handoff §4.1, the SEC bulk route was used for
+identity bootstrap (no key required; User-Agent
+`TigerTradeHub joncallim@gmail.com`):
 
-1. Build the validation ENGINE regardless — schema/`experiment.db` boundary, statistics,
-   outcome builder, RA-05 methodological tests exercised via synthetic/fixture data
-   (this does not require live data and proves the mechanism is trustworthy).
-2. Separately, perform a **real bounded** Tiingo/SEC backfill once credentials are
-   available (Tiingo API key pending from the owner; SEC User-Agent will be a generic
-   placeholder contact string) so investment evidence can eventually be evaluated
-   against real data rather than only synthetic fixtures.
-3. Both efforts respect existing adapter guardrails (`NetworkClient` rate-limit/token-bucket/
-   cache-budget machinery, the Tiingo 450-symbol/30-day rolling ceiling) without loosening
-   them, and a hash-selected deterministic PIT-universe sample (frozen before any price
-   retrieval, never selected on future outcome) if the full eligible universe exceeds the
-   backfill entitlement, per handoff §4.1.
+- `company_tickers.json` fetched once (bounded, cached, HTTP 200): **10,388
+  companies** parsed (ticker + CIK + title).
+- Hash-selected deterministic sample frozen into `experiment.db`
+  `universe_sample` before any price retrieval: **450 tickers**, seed
+  20260827, algorithm `sha256(seed+NUL+ticker) ascending take-450`,
+  labeled **BOOTSTRAP_COHORT** (present-day sample, NOT a historical PIT
+  universe; never promoted without reconstructed PIT membership).
+- Security bootstrap into live `research.db`: **328 unique securities**
+  (450 CIK-normalized rows, share-class CIK dedup), 450 baseline identity
+  events, 328 eligible universe memberships (price/market-cap/liquidity
+  NULL until Tiingo fills them). `knowledge_time` = retrieval time —
+  documented PIT limitation: no historical constituent-index membership.
 
-`INSUFFICIENT DATA` remains an explicitly valid Phase-5 investment-evidence verdict per
-handoff §18 and is not something this epic tunes away.
+Live audit after bootstrap (`research-validate audit`):
+
+| Check | Result (now) |
+| --- | --- |
+| `security` rows | **328** |
+| `security_identity_event` rows | **450** |
+| `universe_membership` rows | **328** |
+| `evidence_event` rows | **0** |
+| Overall posture | **ZERO_EVALUABLE** (identity present; zero evidence — honest) |
+| Tiingo bootstrap usage | 0/450 (Tiingo key pending from owner) |
+
+## Remaining work for real investment evidence
+
+1. **Tiingo API key** (owner-supplied) → bounded EOD backfill for the
+   BOOTSTRAP_COHORT within the 450-symbol/30-day rolling ceiling
+   (`tradehub_research/backfill/tiingo_driver.py` — designed, awaiting key).
+2. **SEC bulk data** (companyfacts.zip / submissions.zip) for XBRL facts +
+   Form 4 history (`tradehub_research/backfill/sec_driver.py` — designed).
+3. Monthly PIT grid replay + outcome labels + baselines/ablations against
+   the real ingested evidence (`validation/` engine is built and
+   RA-05-verified; it consumes whatever the backfill produces).
+
+Until (1)–(2) land, investment evidence is `INSUFFICIENT DATA` — a valid,
+explicitly permitted Phase-5 verdict (handoff §18), not something to tune
+away.
