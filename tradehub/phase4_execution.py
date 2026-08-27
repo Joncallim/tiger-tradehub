@@ -1,3 +1,27 @@
+"""Execution-side Phase-4 coordinator.
+
+A single ``Phase4ExecutionBoundary`` instance handles exactly ONE proposal's
+lifecycle end to end (preview -> approval -> submit -> reconcile). It is
+deliberately single-use: broker callbacks and secrets never cross into
+research code, and no state from one proposal can bleed into another because
+the instance refuses to preview a second proposal without an explicit
+``reset()``.
+
+Approval binding: the boundary itself renders and retains the canonical
+``ApprovalContext`` produced from the CURRENT preview. ``affirm()`` compares
+the caller's context against that retained canonical context -- a caller
+cannot preview proposal A, render/display a different context B, and then
+affirm(B) while consuming A's confirmation token, because there is only ever
+one retained context and it is the boundary's own record of what was
+rendered, not a value the caller can substitute.
+
+Settlement direction: ``reconcile_and_settle`` takes NO caller-supplied
+``action``/``proposed_state``/``prior_state``. Those come exclusively from
+the approved ``ApprovalContext`` (``side``, ``proposed_state``,
+``current_state``) -- an approved BUY can never be settled as SELL, and the
+state transition being settled is always the one that was actually approved.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -93,7 +117,7 @@ def _sanitize_broker_order(
 
 
 class Phase4ExecutionBoundary:
-    """Execution-side coordinator; broker callbacks never cross into research code."""
+    """Single-use, single-proposal execution-side coordinator."""
 
     def __init__(
         self,
@@ -103,6 +127,7 @@ class Phase4ExecutionBoundary:
         reconcile: Callable[[str], Mapping[str, Any] | None],
         prove_paper: Callable[[], bool],
         persist_execution_link: Callable[[str, str, Mapping[str, str]], None] | None = None,
+        already_applied_fill: float = 0.0,
     ) -> None:
         self._preview = preview
         self._submit = submit
@@ -111,11 +136,72 @@ class Phase4ExecutionBoundary:
         self._persist_execution_link = persist_execution_link or (
             lambda proposal_id, execution_ref, metadata: None
         )
+        self._initial_applied_fill = already_applied_fill
+        self._reset_proposal_state()
+
+    def _reset_proposal_state(self) -> None:
         self._previewed: PreviewIntent | None = None
         self._confirmation_token: str | None = None
+        self._execution_ref: str | None = None
+        self._rendered_context: ApprovalContext | None = None
         self._broker_order_ref: str | None = None
+        self._applied_fill: float = self._initial_applied_fill
+
+    def reset(self) -> None:
+        """Explicitly discard all proposal-scoped state.
+
+        No broker order ref, rendered approval, affirmation, confirmation, or
+        applied-fill state survives into the next proposal. Callers should
+        prefer constructing a fresh boundary per proposal; this exists for
+        long-lived orchestrators that reuse one instance across proposals.
+        """
+        self._reset_proposal_state()
+
+    @classmethod
+    def recover_previewed(
+        cls,
+        *,
+        intent: PreviewIntent,
+        confirmation_token: str,
+        execution_ref: str,
+        submit: Callable[[str], str],
+        reconcile: Callable[[str], Mapping[str, Any] | None],
+        prove_paper: Callable[[], bool],
+        persist_execution_link: Callable[[str, str, Mapping[str, str]], None] | None = None,
+        broker_order_ref: str | None = None,
+        already_applied_fill: float = 0.0,
+    ) -> Phase4ExecutionBoundary:
+        """Restart-recovery constructor.
+
+        Reconstructs a boundary already in the PREVIEWED (or later, if
+        ``broker_order_ref`` is supplied) state WITHOUT re-invoking the
+        broker preview endpoint. The caller is responsible for having
+        recovered ``confirmation_token`` from execution-side authority
+        (e.g. ``AuditStore.find_active_confirmation_by_client_request_id``)
+        and verified its hash against the safe research-side reference
+        before calling this. Approval must still be freshly rendered and
+        affirmed -- recovery never skips explicit human affirmation.
+        """
+        boundary = cls(
+            preview=lambda _intent: {"accepted": True, "confirmation_token": confirmation_token},
+            submit=submit,
+            reconcile=reconcile,
+            prove_paper=prove_paper,
+            persist_execution_link=persist_execution_link,
+            already_applied_fill=already_applied_fill,
+        )
+        boundary._previewed = intent
+        boundary._confirmation_token = confirmation_token
+        boundary._execution_ref = execution_ref
+        boundary._broker_order_ref = broker_order_ref
+        return boundary
 
     def preview(self, intent: PreviewIntent) -> Mapping[str, Any]:
+        if self._previewed is not None:
+            raise ApprovalRequired(
+                "boundary already has an active proposal in flight; call reset() "
+                "or construct a fresh boundary before previewing another proposal"
+            )
         result = self._preview(intent)
         if result.get("accepted") is not True or not result.get("confirmation_token"):
             raise ApprovalRequired("broker preview was not accepted")
@@ -139,7 +225,7 @@ class Phase4ExecutionBoundary:
     ) -> ApprovalContext:
         if self._previewed != intent:
             raise ApprovalRequired("approval must follow the exact current preview")
-        return ApprovalContext(
+        context = ApprovalContext(
             proposal_id=intent.proposal_id,
             symbol=intent.symbol,
             side=intent.side,
@@ -152,10 +238,18 @@ class Phase4ExecutionBoundary:
             rationale=rationale,
             score_snapshot_id=intent.score_snapshot_id,
         )
+        # The boundary retains this as the ONE canonical rendered context.
+        # affirm() compares against THIS retained value, never a caller-
+        # supplied "exact_order" -- a fabricated context can never be
+        # affirmed because it will not equal what render_approval produced.
+        self._rendered_context = context
+        return context
 
-    def affirm(self, context: ApprovalContext, *, exact_order: ApprovalContext) -> None:
-        if context != exact_order or self._previewed is None:
-            raise ApprovalRequired("affirmation does not match the exact rendered order")
+    def affirm(self, context: ApprovalContext) -> None:
+        if self._previewed is None or self._rendered_context is None:
+            raise ApprovalRequired("approval must be rendered before affirmation")
+        if context != self._rendered_context:
+            raise ApprovalRequired("affirmation does not match the canonical rendered order")
         if not self._prove_paper():
             raise ApprovalRequired("broker account is not positively proven PAPER")
         # The raw token is deliberately retained only in this execution object.
@@ -166,21 +260,21 @@ class Phase4ExecutionBoundary:
             {"broker_order_ref": str(self._broker_order_ref)},
         )
 
-    def reconcile_and_settle(
-        self,
-        *,
-        current_quantity: float,
-        action: str,
-        proposed_state: str,
-        prior_state: str | None = None,
-    ) -> ExecutionResult:
+    def reconcile_and_settle(self, *, current_quantity: float) -> ExecutionResult:
         if (
             self._previewed is None
             or self._confirmation_token is None
             or self._broker_order_ref is None
+            or self._rendered_context is None
         ):
             raise ApprovalRequired("explicit approval is required before reconciliation")
         proposal = self._previewed
+        context = self._rendered_context
+        # Direction and target state come EXCLUSIVELY from the approved
+        # context -- never from a caller-supplied action/proposed_state.
+        action = context.side
+        proposed_state = context.proposed_state
+        prior_state = context.current_state
         broker_order = self._reconcile(self._broker_order_ref)
         broker_ref = (
             None if not broker_order else (broker_order.get("id") or broker_order.get("order_id"))
@@ -201,5 +295,16 @@ class Phase4ExecutionBoundary:
             current_quantity=current_quantity,
             settlement=settlement,
             prior_state=prior_state,
+            already_applied_fill=self._applied_fill,
+        )
+        self._applied_fill = portfolio.applied_fill
+        self._persist_execution_link(
+            proposal.proposal_id,
+            self._execution_ref,
+            {
+                "settlement_state": settlement.state.value,
+                "applied_fill": str(self._applied_fill),
+                "owned_quantity": str(portfolio.owned_quantity),
+            },
         )
         return ExecutionResult(proposal.proposal_id, self._execution_ref, settlement, portfolio)

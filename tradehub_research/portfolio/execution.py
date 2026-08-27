@@ -184,6 +184,7 @@ class PortfolioSettlement:
     owned_quantity: float
     sold_quantity: float
     next_state: str
+    applied_fill: float
 
 
 def apply_fill_to_portfolio(
@@ -195,8 +196,23 @@ def apply_fill_to_portfolio(
     current_quantity: float,
     settlement: SanitizedSettlement,
     prior_state: str | None = None,
+    already_applied_fill: float = 0.0,
 ) -> PortfolioSettlement:
-    """Derive portfolio settlement from actual broker fill evidence only."""
+    """Derive portfolio settlement from actual broker fill evidence only.
+
+    Broker-reported ``filled_qty`` is cumulative across the life of an order.
+    Only the NEW delta since ``already_applied_fill`` mutates portfolio
+    exposure -- repeated reconciliation of an unchanged cumulative fill is a
+    no-op, and restart-recovered ``already_applied_fill`` prevents replaying
+    fills already applied in a prior process.
+
+    Nonterminal partial/open fills create REAL exposure (delta is still
+    applied) but the proposed-state transition stays PENDING until the
+    settlement is terminal -- a 40%-filled ENTER never becomes HOLD, and the
+    analogous SELL case never becomes WATCH/HOLD early.
+    """
+    if action not in ("BUY", "SELL"):
+        raise ProposalExecutionError("settlement action must be BUY or SELL")
     if settlement.state == SettlementState.INDETERMINATE:
         return PortfolioSettlement(
             proposal_id,
@@ -206,61 +222,42 @@ def apply_fill_to_portfolio(
             current_quantity,
             0.0,
             "PENDING_RECONCILIATION",
+            already_applied_fill,
         )
-    if action == "BUY":
-        owned = current_quantity + settlement.filled_qty
-        if settlement.filled_qty == 0 and settlement.terminal:
-            if prior_state is None:
-                raise ProposalExecutionError(
-                    "prior state is required for terminal zero-fill rollback"
-                )
-            return PortfolioSettlement(
-                proposal_id,
-                execution_ref,
-                settlement,
-                False,
-                current_quantity,
-                0.0,
-                prior_state or proposed_state,
-            )
-        next_state = "HOLD" if settlement.filled_qty > 0 else proposed_state
+    fill_delta = max(0.0, settlement.filled_qty - already_applied_fill)
+    new_applied_fill = already_applied_fill + fill_delta
+    if settlement.filled_qty == 0 and settlement.terminal:
+        if prior_state is None:
+            raise ProposalExecutionError("prior state is required for terminal zero-fill rollback")
         return PortfolioSettlement(
             proposal_id,
             execution_ref,
             settlement,
-            settlement.filled_qty > 0,
+            False,
+            current_quantity,
+            0.0,
+            prior_state,
+            new_applied_fill,
+        )
+    if action == "BUY":
+        owned = current_quantity + fill_delta
+        next_state = "HOLD" if settlement.terminal else proposed_state
+        return PortfolioSettlement(
+            proposal_id,
+            execution_ref,
+            settlement,
+            fill_delta > 0,
             owned,
             0.0,
             next_state,
+            new_applied_fill,
         )
-    if action == "SELL":
-        sold = min(current_quantity, settlement.filled_qty)
-        remaining = max(0.0, current_quantity - sold)
-        if settlement.filled_qty == 0 and settlement.terminal:
-            if prior_state is None:
-                raise ProposalExecutionError(
-                    "prior state is required for terminal zero-fill rollback"
-                )
-            return PortfolioSettlement(
-                proposal_id,
-                execution_ref,
-                settlement,
-                False,
-                current_quantity,
-                0.0,
-                prior_state,
-            )
-        if settlement.filled_qty == 0 and settlement.state == SettlementState.OPEN:
-            return PortfolioSettlement(
-                proposal_id,
-                execution_ref,
-                settlement,
-                False,
-                current_quantity,
-                0.0,
-                proposed_state,
-            )
-        next_state = "WATCH" if remaining == 0 else "HOLD"
+    # action == "SELL"
+    sold = min(current_quantity, fill_delta)
+    remaining = max(0.0, current_quantity - sold)
+    if not settlement.terminal:
+        # Nonterminal (open/partial) SELL remains pending -- never HOLD/WATCH
+        # early, matching the nonterminal BUY semantics above.
         return PortfolioSettlement(
             proposal_id,
             execution_ref,
@@ -268,6 +265,17 @@ def apply_fill_to_portfolio(
             sold > 0,
             remaining,
             sold,
-            next_state,
+            proposed_state,
+            new_applied_fill,
         )
-    raise ProposalExecutionError("settlement action must be BUY or SELL")
+    next_state = "WATCH" if remaining == 0 else "HOLD"
+    return PortfolioSettlement(
+        proposal_id,
+        execution_ref,
+        settlement,
+        sold > 0,
+        remaining,
+        sold,
+        next_state,
+        new_applied_fill,
+    )

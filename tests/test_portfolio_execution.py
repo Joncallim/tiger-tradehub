@@ -213,7 +213,10 @@ def test_zero_fill_open_sell_remains_pending():
     assert result.next_state == "TRIM"
 
 
-def test_partial_sell_reduces_only_actual_position():
+def test_partial_sell_reduces_position_but_remains_pending_trim():
+    """A partial nonterminal SELL creates real exposure reduction (the delta
+    mutates the portfolio) but the state transition stays PENDING until the
+    settlement is terminal -- it must never jump to HOLD early."""
     settlement = sanitize_settlement(
         proposal_id="p2",
         execution_ref="opaque-ref",
@@ -231,7 +234,75 @@ def test_partial_sell_reduces_only_actual_position():
     assert result.portfolio_mutated
     assert result.sold_quantity == 0.4
     assert result.owned_quantity == 0.6
-    assert result.next_state == "HOLD"
+    assert result.next_state == "TRIM"
+
+
+def test_partial_then_full_sell_applies_only_the_new_delta():
+    first_settlement = sanitize_settlement(
+        proposal_id="p2",
+        execution_ref="opaque-ref",
+        order={"id": "broker-2", "status": "SUBMITTED", "filled": 0.4},
+        requested_qty=1,
+    )
+    first = apply_fill_to_portfolio(
+        proposal_id="p2",
+        execution_ref="opaque-ref",
+        action="SELL",
+        proposed_state="TRIM",
+        current_quantity=1,
+        settlement=first_settlement,
+    )
+    assert first.sold_quantity == 0.4
+    assert first.owned_quantity == 0.6
+    assert first.applied_fill == 0.4
+
+    second_settlement = sanitize_settlement(
+        proposal_id="p2",
+        execution_ref="opaque-ref",
+        order={"id": "broker-2", "status": "FILLED", "filled": 1.0},
+        requested_qty=1,
+    )
+    second = apply_fill_to_portfolio(
+        proposal_id="p2",
+        execution_ref="opaque-ref",
+        action="SELL",
+        proposed_state="TRIM",
+        current_quantity=0.6,
+        settlement=second_settlement,
+        already_applied_fill=first.applied_fill,
+    )
+    assert second.sold_quantity == 0.6  # delta only, not another 1.0
+    assert second.owned_quantity == 0.0
+    assert second.next_state == "WATCH"  # terminal, fully sold
+
+
+def test_repeated_identical_reconciliation_applies_zero_delta_for_buy():
+    settlement = sanitize_settlement(
+        proposal_id="p1",
+        execution_ref="opaque-ref",
+        order={"id": "broker-1", "status": "SUBMITTED", "filled": 0.4},
+        requested_qty=1,
+    )
+    first = apply_fill_to_portfolio(
+        proposal_id="p1",
+        execution_ref="opaque-ref",
+        action="BUY",
+        proposed_state="ENTER",
+        current_quantity=0,
+        settlement=settlement,
+    )
+    assert first.owned_quantity == 0.4
+    second = apply_fill_to_portfolio(
+        proposal_id="p1",
+        execution_ref="opaque-ref",
+        action="BUY",
+        proposed_state="ENTER",
+        current_quantity=first.owned_quantity,
+        settlement=settlement,
+        already_applied_fill=first.applied_fill,
+    )
+    assert second.owned_quantity == 0.4  # unchanged: no duplicate application
+    assert not second.portfolio_mutated
 
 
 def test_indeterminate_settlement_does_not_mutate_portfolio():
