@@ -45,13 +45,25 @@ def _cmd_snapshot_create(args: argparse.Namespace) -> int:
     research_db = _research_db(args)
     experiment_db = _experiment_db(args)
     experiment_db.migrate()
+    universe_sample_id = args.universe_sample_id
+    if universe_sample_id is None:
+        with experiment_db.connect(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT sample_id FROM universe_sample ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        universe_sample_id = str(row[0]) if row else None
     snapshot_id = build_validation_snapshot(
         research_db,
         experiment_db,
         dest_dir=args.dest_dir,
         scope=args.scope,
+        universe_sample_id=universe_sample_id,
     )
-    print(json.dumps({"ok": True, "snapshot_id": snapshot_id}))
+    print(
+        json.dumps(
+            {"ok": True, "snapshot_id": snapshot_id, "universe_sample_id": universe_sample_id}
+        )
+    )
     return 0
 
 
@@ -87,6 +99,39 @@ def _cmd_regime_seal(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_benchmark_pin(args: argparse.Namespace) -> int:
+    from tradehub_research.config import ResearchSettings
+    from tradehub_research.validation.pipeline import fetch_and_pin_benchmark
+
+    settings = ResearchSettings()
+    if not settings.sec_user_agent:
+        raise SystemExit("RESEARCH_SEC_USER_AGENT is required (descriptive UA with contact)")
+    experiment_db = _experiment_db(args)
+    result = fetch_and_pin_benchmark(
+        experiment_db, settings.adapter_cache_dir, settings.sec_user_agent
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _cmd_pipeline_run(args: argparse.Namespace) -> int:
+    from tradehub_research.validation.pipeline import run_pipeline, summarize_pipeline
+
+    experiment_db = _experiment_db(args)
+    research_db = _research_db(args)
+    result = run_pipeline(
+        experiment_db,
+        research_db,
+        dataset_snapshot_id=args.snapshot_id,
+        regime_id=args.regime_id,
+        benchmark_id=args.benchmark_id,
+        replay_db_path=args.replay_db,
+    )
+    summary = summarize_pipeline(result)
+    print(json.dumps({"pipeline": result, "summary": summary}, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="research-validate")
     parser.add_argument("--research-db", type=Path, help="research.db path override")
@@ -101,6 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     snapshot_create = snapshot_sub.add_parser("create", help="freeze a validation snapshot")
     snapshot_create.add_argument("--dest-dir", type=Path, required=True)
     snapshot_create.add_argument("--scope", default="phase-5 validation snapshot")
+    snapshot_create.add_argument(
+        "--universe-sample-id",
+        default=None,
+        help="frozen universe_sample id (defaults to the latest)",
+    )
     snapshot_create.set_defaults(handler=_cmd_snapshot_create)
 
     regime = subparsers.add_parser("regime", help="evaluation regime commands")
@@ -115,6 +165,24 @@ def main(argv: list[str] | None = None) -> int:
     regime_seal = regime_sub.add_parser("seal", help="seal a regime (one-time)")
     regime_seal.add_argument("--regime-id", required=True)
     regime_seal.set_defaults(handler=_cmd_regime_seal)
+
+    benchmark = subparsers.add_parser("benchmark", help="benchmark artifact commands")
+    benchmark_sub = benchmark.add_subparsers(dest="benchmark_command", required=True)
+    benchmark_pin = benchmark_sub.add_parser(
+        "pin", help="fetch + pin the FF daily market benchmark"
+    )
+    benchmark_pin.set_defaults(handler=_cmd_benchmark_pin)
+
+    pipeline = subparsers.add_parser(
+        "pipeline", help="run the full real-data evaluation sequence (replay -> holdout)"
+    )
+    pipeline.add_argument("--snapshot-id", required=True)
+    pipeline.add_argument("--regime-id", required=True)
+    pipeline.add_argument("--benchmark-id", required=True)
+    pipeline.add_argument(
+        "--replay-db", type=Path, default=Path("data/research/validation_replay.db")
+    )
+    pipeline.set_defaults(handler=_cmd_pipeline_run)
 
     args = parser.parse_args(argv)
     return args.handler(args)

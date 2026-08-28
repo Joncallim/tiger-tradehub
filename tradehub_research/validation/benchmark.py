@@ -37,7 +37,10 @@ def parse_ff_daily_factors(raw: str) -> tuple[dict[str, float], str]:
     Returns (date -> daily total return of the market portfolio
     (Mkt-RF + RF, i.e. the gross US-market daily return), parsed_series_hash).
     The header/footer preamble and the annual-summary tail are skipped;
-    rows are 'YYYYMMDD  MktRF  SMB  HML  RF'.
+    rows are 'YYYYMMDD  MktRF  SMB  HML  RF'. Keys are normalized to ISO
+    'YYYY-MM-DD' so session-date comparisons in the outcome builder
+    (which uses ISO dates) match -- a YYYYMMDD-keyed series would never
+    satisfy entry_session < session <= exit_session against ISO dates.
     """
     lines = raw.splitlines()
     rows: dict[str, float] = {}
@@ -55,7 +58,8 @@ def parse_ff_daily_factors(raw: str) -> tuple[dict[str, float], str]:
             rf = float(parts[4])
         except ValueError:
             continue
-        rows[date_token] = (mkt_rf + rf) / 100.0  # percent -> decimal
+        iso = f"{date_token[:4]}-{date_token[4:6]}-{date_token[6:8]}"
+        rows[iso] = (mkt_rf + rf) / 100.0  # percent -> decimal
     if not rows:
         raise ValueError("no daily factor rows parsed")
     series_hash = hashlib.sha256(

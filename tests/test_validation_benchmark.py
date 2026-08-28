@@ -25,8 +25,11 @@ def test_parse_ff_daily_factors(tmp_path):
 
     assert len(rows) == 6  # annual-summary tail and header skipped
     # 19260701: Mkt-RF 0.29% + RF 0.009% -> 0.299% -> 0.00299 decimal
-    assert abs(rows["19260701"] - 0.00299) < 1e-9
-    assert abs(rows["19260709"] - (-0.00291)) < 1e-9
+    assert abs(rows["1926-07-01"] - 0.00299) < 1e-9
+    assert abs(rows["1926-07-09"] - (-0.00291)) < 1e-9
+    # Keys are normalized to ISO YYYY-MM-DD so the outcome builder's
+    # session-date comparisons (ISO) can match the series.
+    assert "19260701" not in rows
     assert len(series_hash) == 64
 
 
@@ -51,7 +54,7 @@ def test_pin_and_load_benchmark_artifact(tmp_path):
     )
 
     loaded = load_benchmark_daily_returns(experiment_db, benchmark_id)
-    assert loaded["19260701"] == 0.00299
+    assert loaded["1926-07-01"] == 0.00299
 
 
 def test_tampered_benchmark_fails_closed(tmp_path):

@@ -54,7 +54,28 @@ Live audit after bootstrap (`research-validate audit`):
 | Overall posture | **ZERO_EVALUABLE** (identity present; zero evidence — honest) |
 | Tiingo bootstrap usage | 0/450 (Tiingo key pending from owner) |
 
-## Remaining work for real investment evidence
+## Update — identity reconciliation (2026-08-28)
+
+The live research.db identity layer was found **misaligned with the frozen
+cohort**: the first bootstrap inserted the alphabetical head of
+company_tickers.json (328 CIKs starting A/AA/AAAU), not the hash-selected
+sample — only 16 of 443 cohort CIKs were present. Root cause: the bootstrap
+invocation used a different ticker list than the frozen universe_sample.
+
+Correction (append-only-safe, `reconcile_cohort_identity` in
+`tradehub_research/backfill/security_bootstrap.py`):
+- 427 missing cohort securities inserted; 6 mismatched canonical tickers
+  corrected with superseding `ticker_change` identity events;
+- 312 non-cohort memberships superseded to eligible=0 (they can never
+  screen again; rows retained as the honest correction record);
+- 427 cohort memberships added → 443 eligible terminal memberships, exactly
+  matching the frozen cohort's 443 unique CIKs (450 tickers, share-class
+  CIK dedup).
+- Tiingo backfill then resumed against the corrected identity: the 440
+  erroneous DUPLICATE_CIK ledger rows from the misaligned run remain
+  visible append-only (an honest record of the defect).
+
+## Update — real Tiingo/SEC backfill (2026-08-28, in progress)
 
 1. **Tiingo API key** (owner-supplied) → bounded EOD backfill for the
    BOOTSTRAP_COHORT within the 450-symbol/30-day rolling ceiling

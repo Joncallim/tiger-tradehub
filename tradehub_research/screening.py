@@ -248,6 +248,14 @@ def _group_fields(rows) -> dict[str, list[dict[str, Any]]]:
         # The values remain in the evidence ledger under
         # provider_adjusted_audit_only for audit/outcome reconstruction.
         fields.pop("provider_adjusted_audit_only", None)
+        # Canonical fact-field aliases (hunters consume concept/
+        # period_start/period_end; the SEC adapter stores tag/start/end in
+        # the raw lineage). setdefault keeps fixture-authored canonical
+        # names authoritative and never touches non-fact records.
+        if fields.get("record_type") == "xbrl_fact":
+            fields.setdefault("concept", fields.get("tag"))
+            fields.setdefault("period_start", fields.get("start"))
+            fields.setdefault("period_end", fields.get("end"))
         fields["evidence_id"] = row["evidence_id"]
         fields["public_available_time"] = row["public_available_time"]
         grouped.setdefault(row["security_id"], []).append(fields)

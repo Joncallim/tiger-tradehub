@@ -57,10 +57,18 @@ from tradehub_research.validation.statistics import (
 )
 
 # Predeclared monotonic diagnostic per family for B2 (frozen mapping).
+# B2's predeclared monotonic diagnostic per family (handoff sec 8: "one
+# predeclared, monotonic diagnostic per family"). Raw-feature paths are
+# used because the Hunters' `confidence` column is categorical (1.0 pass/
+# fail, 0.0 insufficient) and would make the composite constant: the
+# monotonic raw features (earnings yield, ROA, 126d momentum return) are
+# the diagnostics the baseline was declared to rank. A missing diagnostic
+# (family insufficient) ranks WORST -- conservative: no data cannot
+# support an opportunity.
 B2_DIAGNOSTIC_BY_FAMILY = {
-    "valuation": "confidence",
-    "quality": "confidence",
-    "momentum_confirmation": "confidence",
+    "valuation": ("raw_features", "earnings_yield_ttm", "value"),
+    "quality": ("raw_features", "roa_ttm", "value"),
+    "momentum_confirmation": ("raw_features", "return_126d", "value"),
 }
 
 HORIZON_SESSIONS = (21, 63, 126, 252)
@@ -102,6 +110,25 @@ def _b4_equal_scoring(family_screens: list[dict[str, Any]]) -> float:
     return sum(confidences) / len(confidences)
 
 
+def _b2_diagnostic_value(family_screen: dict[str, Any], diagnostic: Any) -> float:
+    """Resolve one B2 diagnostic: raw-feature path or plain screen column.
+
+    A missing raw feature (insufficient family) resolves to -inf so the
+    security ranks WORST in that family -- missing data cannot support an
+    opportunity (conservative, documented B2 convention)."""
+    if isinstance(diagnostic, (tuple, list)) and diagnostic and diagnostic[0] == "raw_features":
+        features = family_screen.get("raw_features") or {}
+        entry = features.get(diagnostic[1]) or {}
+        value = entry.get("value")
+        if value is None:
+            return float("-inf")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("-inf")
+    return float(family_screen.get(diagnostic, 0.0) or 0.0)
+
+
 def _b2_composite_by_date(
     grouped: dict[str, dict[str, list[dict[str, Any]]]],
 ) -> dict[str, dict[str, float]]:
@@ -114,7 +141,7 @@ def _b2_composite_by_date(
             for security_id, family_screens in securities.items():
                 family_screen = next((s for s in family_screens if s.get("family") == family), None)
                 if family_screen is not None:
-                    per_security[security_id] = float(family_screen.get(diagnostic, 0.0) or 0.0)
+                    per_security[security_id] = _b2_diagnostic_value(family_screen, diagnostic)
             if len(per_security) >= 3:
                 family_diagnostics[family] = per_security
         if not family_diagnostics:
@@ -136,7 +163,11 @@ def _b2_composite_by_date(
 def _outcome_map(outcome_labels: list[dict[str, Any]], horizon: int) -> dict[str, dict[str, float]]:
     """{security_id: {observation_date: benchmark_relative_return}} for the
     OBSERVED labels at the given horizon -- the cross-sectional outcome for
-    IC baselines (B2-B4)."""
+    IC baselines (B2-B4).
+
+    Dates are normalized to YYYY-MM-DD (``[:10]``) so they align with
+    signal keys from ``screen_observation_date``; label observation_date
+    carries a full RFC3339 timestamp while signals are date-keyed."""
     result: dict[str, dict[str, float]] = {}
     for label in outcome_labels:
         if label["horizon_sessions"] != horizon:
@@ -145,7 +176,7 @@ def _outcome_map(outcome_labels: list[dict[str, Any]], horizon: int) -> dict[str
             continue
         if label["benchmark_relative_return"] is None:
             continue
-        result.setdefault(label["security_id"], {})[label["observation_date"]] = float(
+        result.setdefault(label["security_id"], {})[str(label["observation_date"])[:10]] = float(
             label["benchmark_relative_return"]
         )
     return result
@@ -168,7 +199,7 @@ def _universe_return_by_date(
             continue
         if label["total_return"] is None:
             continue
-        per_date[label["observation_date"]].append(float(label["total_return"]))
+        per_date[label["observation_date"][:10]].append(float(label["total_return"]))
     return {day: sum(values) / len(values) for day, values in per_date.items()}
 
 
@@ -190,7 +221,7 @@ def _benchmark_return_by_date(
             continue
         if label["benchmark_return"] is None:
             continue
-        day = label["observation_date"]
+        day = str(label["observation_date"])[:10]
         value = float(label["benchmark_return"])
         if day in per_date and per_date[day] != value:
             raise ValueError(
