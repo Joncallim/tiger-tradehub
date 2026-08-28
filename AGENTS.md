@@ -72,13 +72,18 @@ The deterministic code gate is:
 .venv/bin/python -m pytest tests/ -q
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
+.venv/bin/python -m pip_audit
 ```
 
-Use `tradehub-acceptance run --list` to identify an applicable approved pack.
-Normal offline and dry-run acceptance may be used when configured with synthetic
-or sanctioned local credentials. Broker PAPER-write acceptance is not a routine
-test: it requires explicit authority and every gate defined by the acceptance
-program. Never modify production `.env` to run acceptance.
+Match acceptance to the changed plane. For execution-core changes, use
+`tradehub-acceptance run --list` and run the applicable approved FA pack. For
+research-plane changes, use `tradehub-research-acceptance run --list` and run
+the applicable RA-00 through RA-04 pack. Changes crossing both planes require
+both applicable acceptance paths. Normal offline and dry-run acceptance may be
+used when configured with synthetic or sanctioned local credentials. Broker
+PAPER-write acceptance is not a routine test: it requires explicit authority
+and every gate defined by the acceptance program. Never modify production
+`.env` to run acceptance.
 
 ## Risk Triggers
 
