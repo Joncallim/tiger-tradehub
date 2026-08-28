@@ -75,12 +75,17 @@ The deterministic code gate is:
 .venv/bin/python -m pip_audit
 ```
 
-Match acceptance to the changed plane. For execution-core changes, use
-`tradehub-acceptance run --list` and run the applicable approved FA pack. For
-research-plane changes, use `tradehub-research-acceptance run --list` and run
-the applicable RA-00 through RA-04 pack. Changes crossing both planes require
-both applicable acceptance paths. Normal offline and dry-run acceptance may be
-used when configured with synthetic or sanctioned local credentials. Broker
+Match acceptance to the changed plane and select the pack from the checked-in
+registries, not from an assumed discovery flag. The execution registry
+`tradehub/acceptance/packs/__init__.py` currently exposes FA-00 through FA-05
+and FA-08; run an applicable pack with, for example,
+`.venv/bin/tradehub-acceptance run FA-00 --json`. The research registry in
+`tradehub_research/acceptance/runner.py` exposes RA-00 through RA-04; run an
+applicable pack with, for example,
+`.venv/bin/tradehub-research-acceptance RA-00`. Substitute another registered
+pack ID as the change requires. Changes crossing both planes require both
+applicable acceptance paths. Normal offline and dry-run acceptance may be used
+when configured with synthetic or sanctioned local credentials. Broker
 PAPER-write acceptance is not a routine test: it requires explicit authority
 and every gate defined by the acceptance program. Never modify production
 `.env` to run acceptance.
