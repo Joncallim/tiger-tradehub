@@ -124,10 +124,15 @@ def _synthetic_screens() -> list[dict]:
 
 
 def _synthetic_outcomes() -> list[dict]:
+    """Labels with benchmark_return (same per date/horizon), total_return,
+    and benchmark_relative_return -- benchmark return differs from the
+    equal-weight universe return so B0/B1 are economically distinct."""
     labels = []
     for day in ("2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01"):
         for sid, magnitude in (("a", 0.10), ("b", 0.05), ("c", -0.02), ("d", -0.08)):
             for horizon in (21, 63):
+                benchmark_return = 0.02 * (horizon / 21)
+                relative = magnitude * (horizon / 21)
                 labels.append(
                     {
                         "label_id": f"{day}-{sid}-{horizon}",
@@ -136,7 +141,9 @@ def _synthetic_outcomes() -> list[dict]:
                         "observation_date": day,
                         "horizon_sessions": horizon,
                         "outcome_status": "OBSERVED",
-                        "benchmark_relative_return": magnitude * (horizon / 21),
+                        "benchmark_return": benchmark_return,
+                        "total_return": benchmark_return + relative,
+                        "benchmark_relative_return": relative,
                     }
                 )
     return labels

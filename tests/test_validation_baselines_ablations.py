@@ -1,3 +1,5 @@
+import pytest
+
 from tradehub_research.validation.ablations import (
     record_committee_insufficient_data,
     run_remove_one_hunter_ablations,
@@ -67,11 +69,20 @@ def _synthetic_screens():
 
 
 def _synthetic_outcomes():
-    """Outcomes where higher-confidence securities do better on average."""
+    """Outcomes where higher-confidence securities do better on average.
+
+    Each label carries benchmark_return (the pinned benchmark return for
+    the date/horizon -- the SAME value for every security on a date, per
+    the benchmark-artifact contract), total_return, and
+    benchmark_relative_return. benchmark_return is deliberately NOT equal
+    to the equal-weight universe return (mean total_return), so B0 and B1
+    are economically distinct series (B0 != B1 regression)."""
     labels = []
     for day in ("2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01"):
         for sid, magnitude in (("a", 0.10), ("b", 0.05), ("c", -0.02), ("d", -0.08)):
             for horizon in (21, 63):
+                benchmark_return = 0.02 * (horizon / 21)
+                relative = magnitude * (horizon / 21)
                 labels.append(
                     {
                         "label_id": f"{day}-{sid}-{horizon}",
@@ -80,7 +91,9 @@ def _synthetic_outcomes():
                         "observation_date": day,
                         "horizon_sessions": horizon,
                         "outcome_status": "OBSERVED",
-                        "benchmark_relative_return": magnitude * (horizon / 21),
+                        "benchmark_return": benchmark_return,
+                        "total_return": benchmark_return + relative,
+                        "benchmark_relative_return": relative,
                     }
                 )
     return labels
@@ -145,10 +158,12 @@ def test_remove_one_hunter_ablation_truly_removes_component(tmp_path):
 
 
 def test_baselines_are_genuinely_distinct(tmp_path):
-    """B0-B4 must be distinct evaluations (the reviewer's P1 probe: they
-    collapsed into one confidence-based signal). B0/B1 are portfolio-style
-    (mean return metrics); B2-B4 are IC baselines; none may share the
-    recorded metric shape or horizon values trivially."""
+    """B0-B4 must be distinct evaluations (the reviewer's P1 probes: they
+    collapsed into one confidence-based signal, and B0/B1 both consumed
+    benchmark_relative_return). B0 = pinned benchmark return itself;
+    B1 = equal-weight universe return; B2-B4 = distinct IC baselines.
+    With the fixture, benchmark_return (0.02) != equal-weight universe
+    return (0.02 + mean relative), so B0 result != B1 result by VALUE."""
     experiment_db = ExperimentDB(tmp_path / "experiment.db")
     experiment_db.migrate()
     _seed_regime(experiment_db)
@@ -176,6 +191,15 @@ def test_baselines_are_genuinely_distinct(tmp_path):
     assert "mean_ic" in summaries["B2_FACTOR_COMPOSITE"]["horizons"]["21"]
     assert "mean_ic" in summaries["B3_HUNTERS_ONLY"]["horizons"]["21"]
     assert "mean_ic" in summaries["B4_EQUAL_SCORING"]["horizons"]["21"]
+
+    # B0 != B1 BY VALUE: B0 is the benchmark return itself (0.02 at h21);
+    # B1 is the equal-weight universe return (0.02 + mean relative =
+    # 0.0325 at h21). Merely having a mean_return field is not enough.
+    b0_h21 = summaries["B0_BENCHMARK"]["horizons"]["21"]["mean_return"]
+    b1_h21 = summaries["B1_UNIVERSE"]["horizons"]["21"]["mean_return"]
+    assert b0_h21 != b1_h21
+    assert b0_h21 == pytest.approx(0.02)
+    assert b1_h21 == pytest.approx(0.02 + (0.10 + 0.05 - 0.02 - 0.08) / 4)
 
     # No two IC baselines share identical IC values at every horizon.
     ic_by_baseline = {
