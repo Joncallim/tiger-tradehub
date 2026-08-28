@@ -326,6 +326,7 @@ def run_backfill(
         license_confirmed=settings.tiingo_license_confirmed,
         user_agent="TigerTradeHub research-backfill",
         cache_dir=settings.adapter_cache_dir,
+        cache_budget_bytes=8 * 1024 * 1024 * 1024,  # ~450 full histories + SEC bulk artifacts
     )
     quota = adapter.quota
 

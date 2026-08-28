@@ -75,6 +75,8 @@ def render_daily_report(data: dict[str, Any]) -> str:
     daily_pnl_pct, cash, gross_position_value, realized_pnl,
     unrealized_pnl, fees) plus optional research-health lines. All
     arithmetic happens here; the output is plain-text Telegram-friendly.
+    Unit convention: every ``*_pct`` field is PERCENT units (0.25 means
+    0.25%), never a decimal fraction -- the renderers format them as-is.
     """
     lines: list[str] = ["TRADEHUB · DAILY", ""]
     lines.append(
@@ -122,7 +124,9 @@ def render_weekly_report(data: dict[str, Any]) -> str:
     """Deterministic weekly report in the handoff sec 17.4 shape.
 
     All P&L / % arithmetic is computed HERE from broker-sourced inputs;
-    model prose never calculates numbers."""
+    model prose never calculates numbers. Unit convention: every
+    ``*_pct`` field is PERCENT units (0.25 means 0.25%), never a decimal
+    fraction."""
     lines: list[str] = ["TRADEHUB · WEEK", ""]
     lines.append(
         f"P&L        {_signed_usd(data.get('period_pnl', 0.0))} "

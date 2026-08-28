@@ -103,9 +103,7 @@ def fetch_and_pin_benchmark(
             response = client.get(FF_DAILY_URL)
             response.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-            member = next(
-                name for name in archive.namelist() if name.upper().endswith(".CSV")
-            )
+            member = next(name for name in archive.namelist() if name.upper().endswith(".CSV"))
             text = archive.read(member).decode("utf-8", errors="replace")
         cache_path.write_text(text, encoding="utf-8")
     raw = cache_path.read_text(encoding="utf-8", errors="replace")
