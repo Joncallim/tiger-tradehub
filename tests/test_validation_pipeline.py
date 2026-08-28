@@ -269,7 +269,7 @@ def test_pipeline_full_sequence(tmp_path):
     )
 
     assert result["cohort"]["cohort"] == "BOOTSTRAP_COHORT"
-    assert result["grid"]["monthly_timestamps"] >= 15
+    assert result["grid"]["count"] >= 15
     assert result["replay"]["screen_results"] >= 15 * 4 * 6  # grid x securities x families
     assert result["replay"]["screenable_observations"] >= 15 * 4
     assert result["outcomes"]["labels"] >= 15 * 4 * 4  # obs x horizons

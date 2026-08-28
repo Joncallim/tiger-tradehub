@@ -321,7 +321,8 @@ def run_pipeline(
         "dataset_snapshot_id": dataset_snapshot_id,
         "coverage": {"start": spec["coverage_start"], "end": spec["coverage_end"]},
         "grid": {
-            "monthly_timestamps": len(grid),
+            "monthly_timestamps": [ts for ts in grid],
+            "count": len(grid),
             "first": grid[0] if grid else None,
             "last": grid[-1] if grid else None,
         },
