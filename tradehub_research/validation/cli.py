@@ -55,7 +55,7 @@ def _cmd_snapshot_create(args: argparse.Namespace) -> int:
     snapshot_id = build_validation_snapshot(
         research_db,
         experiment_db,
-        dest_dir=args.dest_dir,
+        dest_dir=Path(args.dest_dir),
         scope=args.scope,
         universe_sample_id=universe_sample_id,
     )
