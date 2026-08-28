@@ -134,12 +134,21 @@ def record_all_screen_predictions(
     horizons: tuple[int, ...] = HORIZON_SESSIONS,
 ) -> dict[str, int]:
     """Record forward predictions for the ENTIRE screened population at all
-    four horizons (pass AND fail, sufficient AND insufficient)."""
+    four horizons (pass AND fail, sufficient AND insufficient).
+
+    Each family screen is a DISTINCT prediction under the
+    ``production/<family>`` variant: the forward tracker attributes
+    eventual outcomes per hunter (per-hunter evidence for the complexity
+    decision) without colliding on (security, date, horizon). The scored
+    production row is recorded separately by the production pipeline with
+    variant ``production``."""
     counts: dict[str, int] = {}
     for screen in screens:
+        family = screen.get("family", "unknown")
+        variant = f"production/{family}"
         for horizon in horizons:
             prediction_id = record_prediction_from_screen(
-                experiment_db, screen=screen, horizon_sessions=horizon
+                experiment_db, screen=screen, horizon_sessions=horizon, variant_name=variant
             )
             counts.setdefault(screen["security_id"], 0)
             counts[screen["security_id"]] += 1 if prediction_id else 0

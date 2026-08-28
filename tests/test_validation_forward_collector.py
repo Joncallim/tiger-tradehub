@@ -185,3 +185,49 @@ def test_record_from_screen_keeps_fail_and_insufficient(tmp_path):
     assert set(by_security) == {"a", "b", "c"}
     assert by_security["b"]["screen_passed"] == 0  # FAIL retained
     assert by_security["c"]["sufficient_data"] == 0  # insufficient retained
+
+
+def test_record_all_screens_family_scoped_and_idempotent(tmp_path):
+    from tradehub_research.validation.forward_collector import record_all_screen_predictions
+
+    experiment_db = ExperimentDB(tmp_path / "experiment.db")
+    experiment_db.migrate()
+    screens = [
+        {
+            "security_id": "a",
+            "computed_at": "2024-01-01T00:00:00Z",
+            "family": "valuation",
+            "passed": 1,
+            "sufficient_data": 1,
+            "confidence": 0.8,
+            "config_hash": "cfg-v",
+            "raw_features_json": "{}",
+            "evidence_ids_json": "[]",
+        },
+        {
+            "security_id": "a",
+            "computed_at": "2024-01-01T00:00:00Z",
+            "family": "momentum_confirmation",
+            "passed": 1,
+            "sufficient_data": 1,
+            "confidence": 0.9,
+            "config_hash": "cfg-m",
+            "raw_features_json": "{}",
+            "evidence_ids_json": "[]",
+        },
+    ]
+    counts = record_all_screen_predictions(experiment_db, screens=screens, horizons=(21,))
+    assert counts["a"] == 2
+    with experiment_db.connect(read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT variant_name FROM forward_prediction ORDER BY variant_name"
+        ).fetchall()
+    assert [r["variant_name"] for r in rows] == [
+        "production/momentum_confirmation",
+        "production/valuation",
+    ]
+    # Idempotent: same screens again -> no new rows.
+    record_all_screen_predictions(experiment_db, screens=screens, horizons=(21,))
+    with experiment_db.connect(read_only=True) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM forward_prediction").fetchone()[0]
+    assert n == 2
