@@ -74,19 +74,25 @@ CO_PRIMARY_HORIZONS = (63, 126)
 WALK_FORWARD_VARIANTS = ("B3_HUNTERS_ONLY", "B4_EQUAL_SCORING")
 
 FF_DAILY_URL = (
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library/daily_factors.html"
+    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+    "F-F_Research_Data_Factors_daily_CSV.zip"
 )
 
 
 def fetch_and_pin_benchmark(
     experiment_db: ExperimentDB, cache_dir: Path, user_agent: str
 ) -> dict[str, Any]:
-    """Fetch the Kenneth French daily market series once, parse, pin, verify."""
+    """Fetch the Kenneth French daily market series once, parse, pin, verify.
+
+    The live artifact is a ZIP wrapping the CSV; the extracted CSV text is
+    cached and pinned (raw_content_hash over the exact CSV bytes)."""
     import hashlib
+    import io
+    import zipfile
 
     import httpx
 
-    cache_path = cache_dir / "benchmark" / "ff_daily_factors.txt"
+    cache_path = cache_dir / "benchmark" / "ff_daily_factors.csv"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if not cache_path.exists():
         with httpx.Client(
@@ -96,7 +102,12 @@ def fetch_and_pin_benchmark(
         ) as client:
             response = client.get(FF_DAILY_URL)
             response.raise_for_status()
-        cache_path.write_text(response.text, encoding="utf-8")
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            member = next(
+                name for name in archive.namelist() if name.upper().endswith(".CSV")
+            )
+            text = archive.read(member).decode("utf-8", errors="replace")
+        cache_path.write_text(text, encoding="utf-8")
     raw = cache_path.read_text(encoding="utf-8", errors="replace")
     raw_hash = hashlib.sha256(raw.encode()).hexdigest()
     series, parsed_hash = parse_ff_daily_factors(raw)

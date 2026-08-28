@@ -24,9 +24,12 @@ from pathlib import Path
 from tradehub_research.db import utc_now
 from tradehub_research.validation.experiment_db import ExperimentDB
 
-# Kenneth French daily factors: Mkt-RF, SMB, HML, RF per day.
+# Kenneth French daily factors: Mkt-RF, SMB, HML, RF per day. The live
+# artifact is the CSV zip (the classic data_library/daily_factors.html
+# page was retired in the 2025 site restructure).
 FF_DAILY_URL = (
-    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library/daily_factors.html"
+    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+    "F-F_Research_Data_Factors_daily_CSV.zip"
 )
 PARSER_VERSION = "ff-daily-market-v1"
 
@@ -37,7 +40,8 @@ def parse_ff_daily_factors(raw: str) -> tuple[dict[str, float], str]:
     Returns (date -> daily total return of the market portfolio
     (Mkt-RF + RF, i.e. the gross US-market daily return), parsed_series_hash).
     The header/footer preamble and the annual-summary tail are skipped;
-    rows are 'YYYYMMDD  MktRF  SMB  HML  RF'. Keys are normalized to ISO
+    rows are 'YYYYMMDD  MktRF  SMB  HML  RF' (whitespace or comma
+    separated -- the live CSV zip uses commas). Keys are normalized to ISO
     'YYYY-MM-DD' so session-date comparisons in the outcome builder
     (which uses ISO dates) match -- a YYYYMMDD-keyed series would never
     satisfy entry_session < session <= exit_session against ISO dates.
@@ -47,7 +51,7 @@ def parse_ff_daily_factors(raw: str) -> tuple[dict[str, float], str]:
     for line in lines:
         if not line.strip() or line.startswith((" ", "Mkt-RF", "Annual")):
             continue
-        parts = re.split(r"\s+", line.strip())
+        parts = re.split(r"[,\s]+", line.strip())
         if len(parts) < 5:
             continue
         date_token = parts[0]
