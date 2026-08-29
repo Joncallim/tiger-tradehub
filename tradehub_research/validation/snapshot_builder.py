@@ -50,6 +50,17 @@ def build_validation_snapshot(
     dest_dir.mkdir(parents=True, exist_ok=True)
     coverage = run_coverage_audit(database=research_db)
 
+    # Always link the frozen sample: when the caller omits the id, resolve
+    # the LATEST frozen universe_sample so the dataset_snapshot FK is never
+    # NULL (the manifest is traceable, but the explicit FK is the primary
+    # lineage pointer).
+    if universe_sample_id is None:
+        with experiment_db.connect(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT sample_id FROM universe_sample ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        universe_sample_id = str(row[0]) if row else None
+
     dataset_snapshot_id = str(uuid.uuid4())
     dest_path = dest_dir / f"{dataset_snapshot_id}.sqlite"
     underlying_snapshot_id = create_snapshot(research_db, dest_path, scope=scope)

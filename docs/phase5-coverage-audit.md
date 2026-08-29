@@ -117,10 +117,21 @@ Verdicts (see PR #48):
 - VALIDATION ENGINE: PASS — machinery verified on real data (PIT firewall,
   snapshot immutability, append-only ledger, sealed one-time holdout, honest
   INSUFFICIENT handling; RA-00..05 + 485+ tests green; independent review
-  PASS (independent review, 2026-08-29).
+  PASS (ModelArk deepseek-v4-pro, 2026-08-29)).
 - INVESTMENT EVIDENCE: INSUFFICIENT DATA — a present-day BOOTSTRAP_COHORT has
   no matured outcomes by construction; the forward tracker + future regimes
   evaluate labels as they mature. No historical performance claim is made.
+
+Independent review findings (deferrals, non-blocking):
+- P2: 9 sec_xbrl rows with event_time > PAT — legitimate derived_from_index
+  semantics (filing precedes fiscal period-end); unreferenced by any screen.
+- P2: lookahead_canary_run table empty — canary TESTS exist (4, non-vacuous)
+  and pass in CI; no live-DB canary row recorded (structural guards are the
+  primary defense; a live canary run is a follow-up).
+- P3: dataset_snapshot.universe_sample_id NULL on the first real snapshot
+  (append-only; manifest lineage intact). build_validation_snapshot now
+  resolves the latest sample automatically so future snapshots always carry
+  the FK.
 
 1. **Tiingo API key** (owner-supplied) → bounded EOD backfill for the
    BOOTSTRAP_COHORT within the 450-symbol/30-day rolling ceiling
