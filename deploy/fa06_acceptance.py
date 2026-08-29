@@ -102,7 +102,10 @@ def main() -> int:
     ], timeout=600)
     try:
         summary = json.loads(out.strip().splitlines()[-1])
-        check("forward capture idempotent (no dupes)", summary.get("counts", {}).get("rejected") == 0)
+        check(
+            "forward capture idempotent (no dupes)",
+            summary.get("counts", {}).get("rejected") == 0,
+        )
     except Exception:  # noqa: BLE001
         check("forward capture idempotent (no dupes)", False, out[-200:])
 
