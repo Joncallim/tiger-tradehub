@@ -319,7 +319,6 @@ def run_backfill(
     cohort = load_cohort_tickers(experiment_db)
     canonical = canonical_tickers_by_cik(research_db)
     canonical_set = set(canonical.values())
-    today = datetime.now(timezone.utc).date().isoformat()
 
     adapter = TiingoEodAdapter(
         token=settings.tiingo_token,
@@ -372,12 +371,22 @@ def run_backfill(
         )
     )
 
+    # End at the last COMPLETED session (yesterday UTC): today's EOD bar has a
+    # PAT of next-day 00:15Z (20:15 ET close), which is in the future
+    # mid-session and is rejected by the evidence layer as
+    # PARSE: public_available_time cannot follow ingested_time. Backfills
+    # request only completed sessions.
+    last_completed = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
     store = EvidenceStore(research_db)
     for row in pending:
         ticker = row["ticker"]
         try:
             fetched = fetch_one(
-                adapter, quota, ticker=ticker, start_date=BACKFILL_START_DATE, end_date=today
+                adapter,
+                quota,
+                ticker=ticker,
+                start_date=BACKFILL_START_DATE,
+                end_date=last_completed,
             )
             records = adapter.parse(fetched.raw_bytes, fetched, ticker=ticker)
             ingest_records(records, store)
@@ -417,7 +426,8 @@ def run_backfill(
             continue
         try:
             fetched = fetch_one(
-                adapter, quota, ticker=ticker, start_date=BACKFILL_START_DATE, end_date=today
+                adapter, quota, ticker=ticker, start_date=BACKFILL_START_DATE,
+                end_date=last_completed
             )
             records = adapter.parse(fetched.raw_bytes, fetched, ticker=ticker)
             ingest_records(records, store)
