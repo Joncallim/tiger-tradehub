@@ -117,7 +117,7 @@ Verdicts (see PR #48):
 - VALIDATION ENGINE: PASS — machinery verified on real data (PIT firewall,
   snapshot immutability, append-only ledger, sealed one-time holdout, honest
   INSUFFICIENT handling; RA-00..05 + 485+ tests green; independent review
-  [status]).
+  PASS (independent review, 2026-08-29).
 - INVESTMENT EVIDENCE: INSUFFICIENT DATA — a present-day BOOTSTRAP_COHORT has
   no matured outcomes by construction; the forward tracker + future regimes
   evaluate labels as they mature. No historical performance claim is made.
