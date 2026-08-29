@@ -18,7 +18,6 @@ Read-only except for the deliberate restart/rollback actions it performs.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
