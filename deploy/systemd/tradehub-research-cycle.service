@@ -1,0 +1,15 @@
+[Unit]
+Description=TradeHub M/W/F research cycle (ops)
+After=tradehub-daily-refresh.service
+
+[Service]
+Type=oneshot
+User=jon
+Group=jon
+WorkingDirectory=/home/jon/tiger-tradehub-main
+EnvironmentFile=/etc/tradehub/research.env
+Environment=TRADEHUB_RESEARCH_DIR=/home/jon/tiger-tradehub-main/data/research
+ExecStart=/home/jon/tiger-tradehub-main/.venv/bin/python -m tradehub_research.ops.research_cycle
+
+[Install]
+WantedBy=multi-user.target

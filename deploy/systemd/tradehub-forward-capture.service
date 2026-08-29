@@ -1,0 +1,14 @@
+[Unit]
+Description=TradeHub forward-learning capture (after the research cycle)
+
+[Service]
+Type=oneshot
+User=jon
+Group=jon
+WorkingDirectory=/home/jon/tiger-tradehub-main
+EnvironmentFile=/etc/tradehub/research.env
+Environment=TRADEHUB_RESEARCH_DIR=/home/jon/tiger-tradehub-main/data/research
+ExecStart=/home/jon/tiger-tradehub-main/.venv/bin/python -m tradehub_research.ops.forward_capture
+
+[Install]
+WantedBy=multi-user.target

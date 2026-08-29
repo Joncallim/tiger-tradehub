@@ -1,0 +1,9 @@
+[Unit]
+Description=TradeHub M/W/F research cycle timer
+
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 23:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

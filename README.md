@@ -1,243 +1,96 @@
 # Tiger TradeHub
 
-Tiger TradeHub is a guarded local bridge from Claude to Tiger Brokers OpenAPI.
-It is designed primarily for a local Claude MCP workflow: you run TradeHub on your own machine,
-Claude gets a small set of trading tools, and Tiger credentials stay in your local environment.
+A simple, low-touch autonomous investment system: deterministic research,
+guarded execution, honest validation, and concise reporting. The ambition is
+a **boring, reliable daily operating system** — models interpret where they
+materially help; deterministic code does the rest. **Not financial advice.**
+MIT License. Dry-run mode is on by default; use a Tiger paper account.
 
-This project is not financial advice. It is local trading infrastructure provided as-is under the
-MIT License. Keep dry-run mode enabled and use a Tiger paper account until you have personally
-verified every preview, confirmation, and submit path.
+## Architecture (V2)
 
-TradeHub uses Tiger's official Python SDK for account, preview, and order placement, but keeps AI
-clients behind explicit policy checks and a two-step confirmation flow.
-
-Smooth onboarding is a project goal. A new user should be able to install the package, start in
-dry-run mode, connect Claude, preview an order, and confirm a dry-run submission without exposing a
-public trading endpoint.
-
-## What This Builds
-
-- Local `FastAPI` REST service used as the guarded backend.
-- MCP server for Claude Desktop or Claude Code.
-- Optional Telegram bot for `/buy`, `/sell`, `/preview`, `/confirm`, `/assets`, `/positions`,
-  `/orders`, and `/health`.
-- SQLite audit trail for previews, confirmations, submissions, and blocked requests.
-- Dry-run mode enabled by default.
-- OpenAPI schema for advanced direct HTTP or ChatGPT Actions deployments.
-
-Tiger's official OpenAPI supports account status, order creation/modification/cancellation, market
-data, streaming push updates, and paper accounts. Their Python SDK exposes order preview and order
-placement helpers; see the official SDK and docs linked below.
-
-## Safety Model
-
-The service is deliberately not a raw trading proxy.
-
-1. A client submits an order intent to `/orders/preview`.
-2. TradeHub validates symbol allowlist, quantity, notional, order type, and side.
-3. TradeHub returns a confirmation token and, when configured, Tiger's own order preview.
-4. The client must call `/orders/submit` with that token before it expires.
-5. If `TRADEHUB_DRY_RUN=true`, no live Tiger order is placed.
-
-Release 1 intentionally supports USD-denominated limit orders only. Market orders and non-USD
-orders are rejected until a stronger exposure model and FX conversion are added.
-
-Keep `TRADEHUB_DRY_RUN=true` and use a Tiger paper account until you have verified the full flow.
-
-## Quick Start For Claude
-
-This is the recommended path.
-
-For a slower step-by-step walkthrough, including Claude Desktop MCP setup and Tiger paper-account
-testing, see [docs/claude-mcp-paper-account-setup.md](docs/claude-mcp-paper-account-setup.md).
-
-```bash
-cd tiger-tradehub
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[mcp]"
-cp .env.example .env
+```
+market/evidence refresh          (ops timers: Tiingo/SEC incremental)
+        ↓
+deterministic Hunters            (momentum/valuation/quality/inflection/event)
+        ↓
+candidate funnel + evidence packs
+        ↓
+committee — models ONLY where interpretation materially helps
+        ↓
+deterministic score / state / risk
+        ↓
+typed proposals → deterministic execution policy → guarded execution
+        ↓
+broker reconciliation → deterministic daily/weekly reporting
 ```
 
-Edit `.env` and set two strong, distinct local capabilities:
+Three trust contexts stay distinct:
 
-```bash
-TRADEHUB_API_TOKEN=replace-with-a-long-random-execution-token
-TRADEHUB_PREVIEW_API_TOKEN=replace-with-a-different-long-random-preview-token
-TRADEHUB_DRY_RUN=true
-```
+| Context | What it sees | Where |
+|---|---|---|
+| **Committee** | Raw evidence packs, 3 small MCP tools (`get_evidence_pack`, `submit_assessment`, `committee_status`) — no execution, no credentials, no shell | `tradehub-research-mcp` (Hermes) |
+| **Operator / read-only** | Sanitized research/portfolio/report summaries | deterministic CLI + reports |
+| **Execution / approval** | Tiger credentials, broker write authority, confirmation flow | `tradehub` service, `tradehub-execution` user, loopback-only |
 
-Generate each token with:
+Models are **never** the privileged autonomous execution actor. The future
+autonomous runner is deterministic code inside a human-defined constitution
+(Phase 6 / #51 — paper only).
 
-```bash
-python -c 'import secrets; print(secrets.token_urlsafe(32))'
-```
+## Research plane
 
-`TRADEHUB_API_TOKEN` is retained by approval/submit clients. The distinct
-`TRADEHUB_PREVIEW_API_TOKEN` is the only credential used for broker previews.
-Startup rejects missing, equal, placeholder, and short values.
+- **Deterministic Hunters** screen the eligible universe with PIT-correct
+  evidence (`public_available_time <= as_of`). Raw/unadjusted fields for
+  decision features; adjusted values live in an audit-only namespace.
+- **BOOTSTRAP_COHORT** discipline: the 450-ticker sample (seed 20260827) is
+  a present-day cohort, never a historical PIT universe. Pre-bootstrap
+  dates are legitimately empty.
+- **Validation engine** (Phase 5): frozen snapshots, append-only experiment
+  ledger, sealed one-time holdout, honest `INSUFFICIENT DATA` verdicts.
+  VALIDATION ENGINE = PASS; INVESTMENT EVIDENCE = INSUFFICIENT DATA until
+  real forward outcomes mature.
+- **Forward tracker**: every actual production screen is recorded as an
+  immutable prediction (`as_of <= collection date` enforced; future-dated
+  rows rejected); outcomes are appended as they mature.
 
-Dry-run mode does not place live Tiger orders. Keep it enabled until the full Claude preview and
-confirmation flow is verified.
+## Daily operation (systemd timers, no scheduler framework)
 
-Tiger credentials are only required when you are ready to call Tiger's preview/order APIs:
+| Timer | When (UTC) | Job |
+|---|---|---|
+| `tradehub-daily-refresh` | Mon–Fri 22:40 | bounded Tiingo/SEC incremental (45/hr quota, resumable) |
+| `tradehub-research-cycle` | Mon/Wed/Fri 23:00 | freshness → universe → Hunters → funnel → scoring → proposals |
+| `tradehub-forward-capture` | Mon–Fri 23:30 | genuine forward predictions (PASS/FAIL/insufficient, idempotent) |
+| `tradehub-outcome-maturation` | Mon–Fri 23:45 | append outcomes for due horizons; predictions never modified |
 
-Tiger credentials come from Tiger's developer portal:
+Reports: deterministic daily (23:00) + weekly (Fri) delivered via
+Hermes/Telegram. **No model calculates P&L**; missing broker values render
+`unavailable`, never `$0`. Tiger account analytics are the accounting source
+of truth; no shadow brokerage ledger.
 
-- `TIGEROPEN_TIGER_ID`
-- `TIGEROPEN_ACCOUNT`
-- RSA private key, either as `TIGEROPEN_PRIVATE_KEY_PATH` or `TIGEROPEN_PRIVATE_KEY`
+## Guarded execution
 
-## Run TradeHub
+- Loopback-only REST (`127.0.0.1:8787`), bearer token, dry-run default,
+  symbol allowlist + notional caps, preview → confirmation-token → submit.
+- Execution credentials exist only in the execution context
+  (`/etc/tradehub/execution.env`, `tradehub-execution` user). Research has
+  **zero** Tiger credentials.
+- `ProtectHome`, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/tradehub`.
 
-```bash
-source .venv/bin/activate
-tradehub
-```
+## Deployment
 
-Open:
+- `/opt/tiger-tradehub` — deployed code (pinned commit in `DEPLOYED_COMMIT`)
+- `/var/lib/tradehub` — execution state · `/var/lib/tradehub-research` — research state
+- Services: `tradehub-execution.service`, `tradehub-research.service`
+  (committee API on `127.0.0.1:8091`), plus the four timer units above.
+- Acceptance: `deploy/fa06_acceptance.py` (start/restart/persistence/
+  rollback/secrets — 19/19 on the live host).
 
-- API docs: `http://127.0.0.1:8787/docs`
-- OpenAPI schema: `http://127.0.0.1:8787/openapi.json`
+## Operator / reporting
 
-Check the API:
+- `python -m tradehub_research.ops.health` — forward-ledger + market-freshness health
+- `python -m tradehub_research.ops.report_cli --period daily|weekly` — deterministic report text
+- Research APIs: committee API `127.0.0.1:8091` (read-only evidence/assessment surface).
 
-```bash
-curl -s http://127.0.0.1:8787/health \
-  -H "Authorization: Bearer $TRADEHUB_API_TOKEN"
-```
+## Docs
 
-## Connect Claude
-
-Run the API first, then add this MCP server to Claude Desktop or Claude Code config:
-
-```json
-{
-  "mcpServers": {
-    "tiger-tradehub": {
-      "command": "/absolute/path/to/tiger-tradehub/.venv/bin/tradehub-mcp",
-      "env": {
-        "TRADEHUB_BASE_URL": "http://127.0.0.1:8787",
-        "TRADEHUB_API_TOKEN": "replace-with-the-execution-token-from-.env",
-        "TRADEHUB_PREVIEW_API_TOKEN": "replace-with-the-preview-token-from-.env"
-      }
-    }
-  }
-}
-```
-
-Use the absolute path to `tradehub-mcp` from this checkout. For example, if the repo is checked out at `/path/to/tiger-tradehub`, use:
-
-```json
-"command": "/path/to/tiger-tradehub/.venv/bin/tradehub-mcp"
-```
-
-Restart Claude after editing the config. Claude should then have TradeHub tools for health checks,
-account reads, order previews, order submission, and cancellation.
-
-The MCP tools call TradeHub's guarded REST API; they do not talk to Tiger directly.
-
-## First Dry-Run Flow
-
-Ask Claude to:
-
-1. Check TradeHub health.
-2. Preview a small limit order, for example one share of `AAPL`.
-3. Show the confirmation token and exact order details.
-4. Submit only after you explicitly confirm.
-
-Expected result in dry-run mode: TradeHub records the preview and confirmation, but returns
-`submitted: false` and does not place a live Tiger order.
-
-## Example REST Calls
-
-The REST API is the shared backend behind the Claude MCP server. These calls are useful for debugging
-or automation.
-
-```bash
-curl -s http://127.0.0.1:8787/orders/preview \
-  -H "Authorization: Bearer $TRADEHUB_PREVIEW_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"AAPL","side":"BUY","quantity":1,"order_type":"LIMIT","limit_price":150,"currency":"USD"}'
-```
-
-```bash
-curl -s http://127.0.0.1:8787/orders/submit \
-  -H "Authorization: Bearer $TRADEHUB_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"confirmation_token":"token-from-preview"}'
-```
-
-### Indeterminate order recovery
-
-An interrupted live submission stays non-retryable until `/orders/submit/reconcile` finds the
-reserved Tiger order or, for a completed-but-indeterminate submit attempt, conclusively finds no
-order. A stale `SUBMITTING` claim remains non-retryable after a negative lookup because its old
-broker call may still be in flight. Legacy claimed confirmations are migrated to
-`INDETERMINATE`; because they have no reserved order number, reconciliation reports
-`manual_reconciliation_required`. After externally verifying the broker account, an operator using
-the same bearer authentication resolves one through `/orders/submit/resolve`, supplying a
-`resolver` name and exactly one of `global_order_id` (mark submitted) or
-`no_submission_occurred: true` (return to retryable `READY`). The resolution is recorded in the
-audit log.
-
-## ChatGPT Actions
-
-For ChatGPT Actions, the service must be reachable from ChatGPT. In practice that means deploying it
-behind HTTPS or exposing it through a carefully controlled tunnel. Do not expose it publicly without
-`TRADEHUB_API_TOKEN`, IP allowlisting, and dry-run/paper-account testing first.
-
-This project is not currently designed as a central multi-user ChatGPT Actions service. The current
-architecture assumes one local user, one Tiger account, one API token, and a local SQLite audit log.
-If ChatGPT support is needed, prefer a per-user deployment rather than a shared central server.
-
-## Telegram
-
-Create a bot with BotFather, then set:
-
-```bash
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_ALLOWED_CHAT_IDS=123456789
-```
-
-Run:
-
-```bash
-tradehub-telegram
-```
-
-Commands:
-
-- `/preview BUY AAPL 1 LIMIT 150`
-- `/buy AAPL 1 150`
-- `/sell AAPL 1 150`
-- `/confirm <token>`
-- `/assets`
-- `/positions [SYMBOL]`
-- `/orders [SYMBOL] [LIMIT]`
-- `/health`
-
-The Telegram bot fails closed: `TELEGRAM_ALLOWED_CHAT_IDS` must contain at least one chat ID when
-`TELEGRAM_BOT_TOKEN` is set.
-
-## Reproducible Installs
-
-`requirements.lock` captures the pinned environment used for local verification. Use it when you
-want a reproducible app environment:
-
-```bash
-pip install -r requirements.lock
-pip install -e ".[mcp]"
-```
-
-## License
-
-Tiger TradeHub is released under the MIT License. See [LICENSE](LICENSE).
-
-## Sources
-
-- Tiger OpenAPI introduction: <https://quant.itigerup.com/openapi/en/python/overview/introduction.html>
-- Tiger Python SDK: <https://github.com/tigerfintech/openapi-python-sdk>
-- Tiger Python quickstart/order example: <https://quant.itigerup.com/openapi/en/python/quickStart/basicFunction.html>
-
-See [docs/comparable-projects.md](docs/comparable-projects.md) for a scan of similar GitHub projects.
+Detailed operator material (deployment, acceptance, migration, validation
+methodology) lives in `docs/`; this README stays a simple orientation.
