@@ -71,35 +71,59 @@ def main() -> int:
     # uvicorn needs a moment to bind; retry briefly instead of racing.
     http_code = "000"
     for _ in range(10):
-        _, http_code = sh(["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}",
-                           "http://127.0.0.1:8091/docs"])
+        _, http_code = sh(
+            [
+                "curl",
+                "-s",
+                "-m",
+                "5",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "http://127.0.0.1:8091/docs",
+            ]
+        )
         if http_code.strip() == "200":
             break
         import time
 
         time.sleep(2)
-    check("research API answers after restart", code == 0 and http_code.strip() == "200",
-          f"http={http_code[:20]}")
+    check(
+        "research API answers after restart",
+        code == 0 and http_code.strip() == "200",
+        f"http={http_code[:20]}",
+    )
 
     # 4. Committee MCP capability surface stays execution-free.
     mcp_code = deploy_dir / ".venv" / "bin" / "tradehub-research-mcp"
     if mcp_code.exists():
-        check("research MCP binary present (no Tiger creds in research env)",
-              "TIGEROPEN" not in Path("/etc/tradehub/research.env").read_text())
+        check(
+            "research MCP binary present (no Tiger creds in research env)",
+            "TIGEROPEN" not in Path("/etc/tradehub/research.env").read_text(),
+        )
     else:
         check("research MCP binary present", False, "binary missing")
 
     # 5. Scheduled jobs: timers enabled and last result ok.
-    for timer in ("tradehub-daily-refresh", "tradehub-research-cycle",
-                  "tradehub-forward-capture", "tradehub-outcome-maturation"):
+    for timer in (
+        "tradehub-daily-refresh",
+        "tradehub-research-cycle",
+        "tradehub-forward-capture",
+        "tradehub-outcome-maturation",
+    ):
         code, _ = sh(["systemctl", "is-enabled", f"{timer}.timer"])
         check(f"timer enabled {timer}", code == 0)
 
     # 6. No duplicate forward prediction (capture dedupe).
-    code, out = sh([
-        "/home/jon/tiger-tradehub-main/.venv/bin/python", "-m",
-        "tradehub_research.ops.forward_capture",
-    ], timeout=600)
+    code, out = sh(
+        [
+            "/home/jon/tiger-tradehub-main/.venv/bin/python",
+            "-m",
+            "tradehub_research.ops.forward_capture",
+        ],
+        timeout=600,
+    )
     try:
         summary = json.loads(out.strip().splitlines()[-1])
         check(
@@ -117,21 +141,43 @@ def main() -> int:
     # 8. Secrets absent from logs: scan for SECRET MATERIAL (key bodies or
     #    token values), not the word "private_key" (paths/filenames are
     #    benign). Filtered to the current boot's service logs.
-    code, out = sh(["journalctl", "-u", "tradehub-execution", "-u", "tradehub-research",
-                    "--no-pager", "--since", "5 minutes ago", "-n", "200"])
-    secret_leaks = [
-        k for k in ("BEGIN RSA PRIVATE KEY", "-----BEGIN", "pk8.pem:") if k in out
-    ]
-    check("no secret MATERIAL in service logs", not secret_leaks,
-          "" if not secret_leaks else str(secret_leaks))
+    code, out = sh(
+        [
+            "journalctl",
+            "-u",
+            "tradehub-execution",
+            "-u",
+            "tradehub-research",
+            "--no-pager",
+            "--since",
+            "5 minutes ago",
+            "-n",
+            "200",
+        ]
+    )
+    secret_leaks = [k for k in ("BEGIN RSA PRIVATE KEY", "-----BEGIN", "pk8.pem:") if k in out]
+    check(
+        "no secret MATERIAL in service logs",
+        not secret_leaks,
+        "" if not secret_leaks else str(secret_leaks),
+    )
 
     # 9. Upgrade procedure: checkout a newer commit (the #39 head, if merged)
     #    and restart -- recorded as the upgrade path. (Rollback is #10.)
     # 10. ROLLBACK procedure: checkout the previous deployed commit and restart.
-    code, out = sh([
-        "sudo", "-u", "jon", "git", "-C", str(deploy_dir), "checkout", "--quiet",
-        "2b11c811baa9a600e04e5408afbab85fd36e04c3",
-    ])
+    code, out = sh(
+        [
+            "sudo",
+            "-u",
+            "jon",
+            "git",
+            "-C",
+            str(deploy_dir),
+            "checkout",
+            "--quiet",
+            "2b11c811baa9a600e04e5408afbab85fd36e04c3",
+        ]
+    )
     check("rollback: checkout previous commit", code == 0)
     code, _ = sh(["systemctl", "restart", "tradehub-execution.service"])
     code2, _ = sh(["systemctl", "restart", "tradehub-research.service"])
