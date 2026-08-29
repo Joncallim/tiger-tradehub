@@ -12,7 +12,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-VALIDATION_SCHEMA_VERSION = 3
+VALIDATION_SCHEMA_VERSION = 4
 
 VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -258,6 +258,21 @@ VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             SELECT 1 FROM experiment_attempt
             WHERE regime_id = NEW.regime_id AND variant_kind = 'HOLDOUT')
         BEGIN SELECT RAISE(ABORT,'regime already has its one final HOLDOUT attempt'); END;
+        """,
+    ),
+    (
+        4,
+        "Forward-time integrity: provenance classification for forward_prediction",
+        """
+        -- A forward prediction is only legitimate when the production
+        -- screen ACTUALLY occurred at as_of (as_of <= collection time).
+        -- The Phase-5 replay grid produced future-dated rows (2026-09-30..
+        -- 2028-11-30) which are bootstrap/replay artifacts, NOT production
+        -- learning observations. This migration classifies them honestly:
+        -- existing rows become 'replay_bootstrap' (excluded from
+        -- forward-evidence calculations); genuine production capture
+        -- inserts 'production' (enforced by the application guard).
+        ALTER TABLE forward_prediction ADD COLUMN provenance TEXT NOT NULL DEFAULT 'replay_bootstrap';
         """,
     ),
 )

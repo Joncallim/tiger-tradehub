@@ -42,8 +42,21 @@ def record_prediction(
     config_hash: str,
     evidence_ids: list[str],
     horizon_sessions: int,
+    collection_date: date | None = None,
+    provenance: str = "production",
 ) -> str:
     """Record ONE immutable forward prediction BEFORE its outcome exists.
+
+    TIME INTEGRITY: a forward prediction is only legitimate when the
+    production screen ACTUALLY occurred at ``as_of`` -- i.e. the outcome
+    did not exist yet. Future-dated screens are REJECTED (never silently
+    clamped): ``as_of <= collection_date`` where collection_date defaults
+    to the current UTC date and may be injected for deterministic tests.
+    Historical/replay screens belong in experiment attempts and replay
+    artifacts, NOT the live forward ledger -- the bulk replay path
+    (``record_all_screen_predictions``) therefore inserts with
+    provenance='replay_bootstrap', which forward-evidence calculations
+    exclude. Genuine production capture inserts provenance='production'.
 
     Idempotent: identical (security, as_of, variant, horizon) predictions
     dedupe (UNIQUE constraint) -- the original row is never overwritten.
@@ -51,6 +64,19 @@ def record_prediction(
     """
     if horizon_sessions not in HORIZON_SESSIONS:
         raise ValueError(f"horizon_sessions must be one of {HORIZON_SESSIONS}")
+    if provenance not in ("production", "replay_bootstrap"):
+        raise ValueError(
+            f"provenance must be 'production' or 'replay_bootstrap', got {provenance!r}"
+        )
+    collection = collection_date or date.fromisoformat(utc_now()[:10])
+    as_of_day = date.fromisoformat(as_of[:10])
+    if as_of_day > collection:
+        raise ValueError(
+            f"future-dated forward prediction rejected: as_of={as_of_day} > "
+            f"collection_date={collection}; a forward prediction records an ACTUAL "
+            "production screen (as_of <= collection). Never clamp timestamps; "
+            "historical/replay screens belong in experiment attempts/replay artifacts."
+        )
     raw_features_hash = hashlib.sha256(
         json.dumps(raw_features, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -76,7 +102,7 @@ def record_prediction(
                 )
             return str(existing[0])
         conn.execute(
-            "INSERT INTO forward_prediction VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO forward_prediction VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 prediction_id,
                 security_id,
@@ -92,6 +118,7 @@ def record_prediction(
                 horizon_sessions,
                 outcome_due,
                 utc_now(),
+                provenance,
             ),
         )
     return prediction_id
@@ -103,10 +130,17 @@ def record_prediction_from_screen(
     screen: dict[str, Any],
     horizon_sessions: int,
     variant_name: str = "production",
+    collection_date: date | None = None,
+    provenance: str = "production",
 ) -> str:
     """Record a forward prediction from ONE replayed/production screen_result
     row (raw features + evidence ids + pass/fail + config hash), for EVERY
-    screened security -- including FAILs and insufficient-data rows."""
+    screened security -- including FAILs and insufficient-data rows.
+
+    ``collection_date`` is injected by callers that capture AFTER the fact
+    (delayed collection -- recorded honestly via created_at); the
+    future-dated guard applies regardless.
+    """
     raw_features = json.loads(screen.get("raw_features_json", "{}"))
     evidence_ids = json.loads(screen.get("evidence_ids_json", "[]"))
     from tradehub_research.validation.replay import screen_observation_date
@@ -124,6 +158,8 @@ def record_prediction_from_screen(
         config_hash=screen.get("config_hash", ""),
         evidence_ids=evidence_ids,
         horizon_sessions=horizon_sessions,
+        collection_date=collection_date,
+        provenance=provenance,
     )
 
 
@@ -148,7 +184,11 @@ def record_all_screen_predictions(
         variant = f"production/{family}"
         for horizon in horizons:
             prediction_id = record_prediction_from_screen(
-                experiment_db, screen=screen, horizon_sessions=horizon, variant_name=variant
+                experiment_db,
+                screen=screen,
+                horizon_sessions=horizon,
+                variant_name=variant,
+                provenance="replay_bootstrap",
             )
             counts.setdefault(screen["security_id"], 0)
             counts[screen["security_id"]] += 1 if prediction_id else 0
