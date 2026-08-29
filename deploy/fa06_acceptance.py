@@ -128,7 +128,10 @@ def main() -> int:
     # 9. Upgrade procedure: checkout a newer commit (the #39 head, if merged)
     #    and restart -- recorded as the upgrade path. (Rollback is #10.)
     # 10. ROLLBACK procedure: checkout the previous deployed commit and restart.
-    code, out = sh(["sudo", "-u", "jon", "git", "-C", str(deploy_dir), "checkout", "--quiet", "2b11c811baa9a600e04e5408afbab85fd36e04c3"])
+    code, out = sh([
+        "sudo", "-u", "jon", "git", "-C", str(deploy_dir), "checkout", "--quiet",
+        "2b11c811baa9a600e04e5408afbab85fd36e04c3",
+    ])
     check("rollback: checkout previous commit", code == 0)
     code, _ = sh(["systemctl", "restart", "tradehub-execution.service"])
     code2, _ = sh(["systemctl", "restart", "tradehub-research.service"])
