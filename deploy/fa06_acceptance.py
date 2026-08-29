@@ -183,6 +183,20 @@ def main() -> int:
     code2, _ = sh(["systemctl", "restart", "tradehub-research.service"])
     check("rollback: services restart on old commit", code == 0 and code2 == 0)
 
+    # 10b. RESTORE the deployed HEAD after the rollback test -- acceptance
+    # must never leave production pinned to the old commit (P1 from the
+    # independent review).
+    code, _ = sh(["sudo", "-u", "jon", "git", "-C", str(deploy_dir), "checkout", "--quiet", head])
+    code2, _ = sh(["systemctl", "restart", "tradehub-execution.service"])
+    code3, _ = sh(["systemctl", "restart", "tradehub-research.service"])
+    restored = code == 0 and code2 == 0 and code3 == 0
+    check("rollback restored the deployed HEAD", restored)
+    if not restored:
+        print(
+            "CRITICAL: rollback restore failed -- /opt/tiger-tradehub may be "
+            f"pinned to {head[:12]}. Fix immediately."
+        )
+
     failed = [name for name, ok, _ in RESULTS if not ok]
     print(f"\nFA-06: {len(RESULTS) - len(failed)}/{len(RESULTS)} passed")
     return 1 if failed else 0
