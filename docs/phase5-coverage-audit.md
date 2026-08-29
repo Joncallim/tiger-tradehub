@@ -75,7 +75,52 @@ Correction (append-only-safe, `reconcile_cohort_identity` in
   erroneous DUPLICATE_CIK ledger rows from the misaligned run remain
   visible append-only (an honest record of the defect).
 
-## Update — real Tiingo/SEC backfill (2026-08-28, in progress)
+## Update — real Tiingo/SEC backfill + real evaluation (2026-08-29, complete)
+
+Backfill (append-only ledger, all attempts recorded):
+- **Tiingo EOD**: 296 symbols fully ingested (903,544 price bars, 2010→2026-08-28);
+  40 UNKNOWN_SYMBOL (delisted/unlisted/too obscure — retained, never replaced);
+  110 PARSE-partial (single final bar rejected mid-session by the PAT guard —
+  ingested evidence confirmed; driver now requests only completed sessions);
+  444/450 symbol quota used (6 reserved). 405/443 eligible cohort securities
+  have real price history.
+- **SEC companyfacts.zip**: 349 CIKs with XBRL facts (283,114 rows, PAT = filing+1d,
+  never guessed); 39 present-but-empty (no aliased entity-level facts);
+  55 NOT_IN_COMPANYFACTS. Total 443 = 443.
+
+Frozen sufficiency table (research-validate audit, 2026-08-29):
+
+| Hunter family | Posture | Evidence |
+|---|---|---|
+| momentum | EVALUABLE | 903K EOD bars |
+| valuation | EVALUABLE | 283K XBRL facts |
+| quality | EVALUABLE | 283K XBRL facts |
+| inflection | EVALUABLE | 283K XBRL facts |
+| event | PARTIAL | 6,638 dividends + 172 splits (structural actions only) |
+| informed_activity | NOT_EVALUABLE | no Form 4 provider configured (never fabricated) |
+
+Real pipeline evaluation (snapshot 96b42b5d, regime e9e88171 sealed, benchmark
+d326f6ab pinned, 29 monthly grid dates 2026-09-30 → 2028-11-30):
+- 77,082 screens over 12,847 observations: **243 PASS / 735 FAIL / 76,104
+  insufficient-data** — every security retained, PASS and FAIL both retained.
+- 51,388 outcome labels (21/63/126/252): **all ENTRY_UNAVAILABLE** — observations
+  sit past the last ingested bar (2026-08-28); nothing fabricated. As real
+  sessions accumulate, labels mature to OBSERVED/CENSORED via re-runs.
+- Baselines B0-B4, ablations, walk-forward folds: every declared variant
+  recorded; all verdicts INSUFFICIENT_DATA (no matured labels — honest).
+- Sealed holdout: exactly one HOLDOUT attempt (B4_EQUAL_SCORING), COMPLETE,
+  INSUFFICIENT_DATA. Regime spec immutable.
+- Forward tracker armed: family-scoped predictions (production/<family>) at 4
+  horizons for all 77,082 screens; immutable; idempotent.
+
+Verdicts (see PR #48):
+- VALIDATION ENGINE: PASS — machinery verified on real data (PIT firewall,
+  snapshot immutability, append-only ledger, sealed one-time holdout, honest
+  INSUFFICIENT handling; RA-00..05 + 485+ tests green; independent review
+  [status]).
+- INVESTMENT EVIDENCE: INSUFFICIENT DATA — a present-day BOOTSTRAP_COHORT has
+  no matured outcomes by construction; the forward tracker + future regimes
+  evaluate labels as they mature. No historical performance claim is made.
 
 1. **Tiingo API key** (owner-supplied) → bounded EOD backfill for the
    BOOTSTRAP_COHORT within the 450-symbol/30-day rolling ceiling
