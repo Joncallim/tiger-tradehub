@@ -35,7 +35,7 @@ def operator_status(
     cycle_log = paths.research_dir / "cycle-log.jsonl"
     last_cycle = None
     if cycle_log.exists():
-        lines = [l for l in cycle_log.read_text().splitlines() if l.strip()]
+        lines = [ln for ln in cycle_log.read_text().splitlines() if ln.strip()]
         if lines:
             try:
                 last_cycle = json.loads(lines[-1])
