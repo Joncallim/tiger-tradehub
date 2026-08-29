@@ -426,8 +426,11 @@ def run_backfill(
             continue
         try:
             fetched = fetch_one(
-                adapter, quota, ticker=ticker, start_date=BACKFILL_START_DATE,
-                end_date=last_completed
+                adapter,
+                quota,
+                ticker=ticker,
+                start_date=BACKFILL_START_DATE,
+                end_date=last_completed,
             )
             records = adapter.parse(fetched.raw_bytes, fetched, ticker=ticker)
             ingest_records(records, store)
