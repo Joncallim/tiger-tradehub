@@ -1,0 +1,10 @@
+[Unit]
+Description=TradeHub daily refresh timer (after the US market session)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 22:40:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

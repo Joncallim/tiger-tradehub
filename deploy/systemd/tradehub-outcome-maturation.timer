@@ -1,0 +1,9 @@
+[Unit]
+Description=TradeHub outcome-maturation timer (daily)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 23:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

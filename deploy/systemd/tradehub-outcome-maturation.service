@@ -1,0 +1,14 @@
+[Unit]
+Description=TradeHub outcome maturation (append due forward outcomes)
+
+[Service]
+Type=oneshot
+User=jon
+Group=jon
+WorkingDirectory=/home/jon/tiger-tradehub-main
+EnvironmentFile=/etc/tradehub/research.env
+Environment=TRADEHUB_RESEARCH_DIR=/home/jon/tiger-tradehub-main/data/research
+ExecStart=/home/jon/tiger-tradehub-main/.venv/bin/python -m tradehub_research.ops.outcome_maturation
+
+[Install]
+WantedBy=multi-user.target
