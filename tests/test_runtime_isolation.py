@@ -34,7 +34,7 @@ def test_research_unit_is_a_distinct_unprivileged_runtime():
     assert research["ProtectHome"] == ["true"]
     inaccessible = {path.lstrip("-") for path in research["InaccessiblePaths"][0].split()}
     assert "/etc/tradehub/execution.env" in inaccessible
-    assert "/etc/tradehub/tiger_private_key.pk8" in inaccessible
+    assert "/var/lib/tradehub/tiger_private_key.pk8.pem" in inaccessible
     assert "/home/jon/tiger-tradehub/.env" in inaccessible
     assert "/home/jon/tiger-tradehub/data/tiger_private_key.pk8.pem" in inaccessible
     assert research["ReadWritePaths"] == ["/var/lib/tradehub-research"]
