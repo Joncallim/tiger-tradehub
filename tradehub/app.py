@@ -95,9 +95,13 @@ def require_preview_auth(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="preview capability is not configured",
         )
+    autonomy = (
+        settings.autonomy_api_token.get_secret_value() if settings.autonomy_api_token else None
+    )
     if token is None or not (
         hmac.compare_digest(token, settings.preview_token)
         or hmac.compare_digest(token, settings.api_token.get_secret_value())
+        or (autonomy is not None and hmac.compare_digest(token, autonomy))
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

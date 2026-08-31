@@ -190,6 +190,12 @@ def _order_payload(proposal: dict, symbol: str, policy: PaperAutonomyPolicy) -> 
     )
     if quantity_microunits <= 0:
         raise AutonomyRefusal("proposal has zero executable quantity")
+    if quantity_microunits % 1_000_000 != 0:
+        raise AutonomyRefusal(
+            "fractional share quantities are not supported (US stocks, whole shares only)"
+        )
+    if quantity_microunits < 1_000_000:
+        raise AutonomyRefusal("quantity below one whole share")
     if action == "SELL":
         current = proposal.get("current_quantity_microunits")
         sellable = proposal.get("sellable_quantity_microunits")
@@ -351,11 +357,19 @@ def run_autonomy(
                 submit_error = None
             except Exception as exc:  # noqa: BLE001 -- indeterminate submit: outcome unknown
                 submit, submit_error = {}, f"{type(exc).__name__}: {exc}"
-            try:
-                reconciliation = client.post("/orders/reconcile", {"confirmation_token": token})
+            if submit.get("dry_run"):
+                # The guarded path never touched the broker: there is no order
+                # to reconcile. Record the dry-run outcome honestly.
+                reconciliation = {"status": "DRY_RUN_NO_ORDER"}
                 reconcile_error = None
-            except Exception as exc:  # noqa: BLE001 -- reconciliation failure is recorded, never fatal
-                reconciliation, reconcile_error = {}, f"{type(exc).__name__}: {exc}"
+            else:
+                try:
+                    reconciliation = client.post(
+                        "/orders/submit/reconcile", {"confirmation_token": token}
+                    )
+                    reconcile_error = None
+                except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
+                    reconciliation, reconcile_error = {}, f"{type(exc).__name__}: {exc}"
             entry = {
                 "proposal_id": proposal_id,
                 "symbol": symbol,

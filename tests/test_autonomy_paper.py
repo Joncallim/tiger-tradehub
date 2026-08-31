@@ -60,7 +60,7 @@ class FakeClient:
             if isinstance(self.submit_response, Exception):
                 raise self.submit_response
             return self.submit_response
-        if path == "/orders/reconcile":
+        if path == "/orders/submit/reconcile":
             return self.reconcile_response
         raise AssertionError(f"unexpected POST {path}")
 
