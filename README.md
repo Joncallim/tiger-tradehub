@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/tiger-tradehub-logo.png" alt="Tiger TradeHub" width="560">
+  <img src="docs/assets/tiger-tradehub-logo.png" alt="Tiger TradeHub" width="320">
 </p>
 
 <h1 align="center">Tiger TradeHub</h1>
@@ -41,6 +41,7 @@ The intended result is **low touch, not low control**. No-action and cash are va
 | PAPER autonomy | Implemented as deterministic code, not an LLM agent. It revalidates PAPER status, policy, freshness, allowlists, holdings, budgets, exposure, and the kill switch before using the existing execution path. |
 | Validation | Implemented: frozen snapshots, replay, baselines, ablations, walk-forward evaluation, sealed holdout, look-ahead canaries, and append-only experiment records. |
 | Forward observation | Active: production predictions are captured before outcomes exist and later matured at 21/63/126/252-session horizons. |
+| Orchestration | Split across narrow surfaces by design. The scheduled `research_cycle` performs PIT universe reconstruction, Hunters, funneling, and deterministic scoring; committee work and portfolio runs are separate authorized steps, and the PAPER runner consumes already-eligible typed proposals. |
 | Live autonomous trading | **Not the current operating mode.** Forward Observation Mode currently keeps broker writes dry-run while evidence matures. |
 
 ## Architecture
@@ -124,6 +125,8 @@ The reference deployment reinforces this with separate `tradehub-execution` and 
 | 9. Preview / execute | The proposal is converted to a constrained USD limit-order intent and sent to the hardened execution API. | Policy is checked before preview and again before submit. |
 | 10. Reconcile | Ambiguous submissions fail closed; actual broker state and fill deltas determine settlement. | TradeHub never guesses that an order landed. |
 | 11. Learn | Predictions are immutable; outcomes are appended later and compared with baselines. | Future adaptation must be evidence-driven, versioned, and reviewable. |
+
+This is the **logical** pipeline, not one monolithic process. In the reference deployment, the scheduled research-cycle module stops after screening/funneling/scoring and surfaces whether committee work is required. Committee assessments, portfolio runs, proposal creation, and the deterministic PAPER runner are separate constrained surfaces so model interpretation never inherits broker authority.
 
 ## Research plane
 
@@ -306,7 +309,7 @@ The reference deployment uses ordinary systemd services/timers rather than a sch
 | Timer | Schedule (UTC) | Role |
 |---|---:|---|
 | `tradehub-daily-refresh` | Mon–Fri 22:40 | Incremental market/SEC refresh under bounded provider quotas. |
-| `tradehub-research-cycle` | Mon/Wed/Fri 23:00 | PIT universe → Hunters → funnel → deterministic scoring/proposal cycle. |
+| `tradehub-research-cycle` | Mon/Wed/Fri 23:00 | PIT universe → Hunters → candidate funnel → deterministic scoring; reports committee-needed candidates rather than embedding model calls. |
 | `tradehub-paper-autonomy` | Mon/Wed/Fri 23:20 | Consume eligible typed PAPER proposals through the deterministic autonomy gate. Current deployment is dry-run. |
 | `tradehub-forward-capture` | Mon–Fri 23:30 | Record genuine production predictions idempotently. |
 | `tradehub-outcome-maturation` | Mon–Fri 23:45 | Append any outcomes whose horizons have matured. |
