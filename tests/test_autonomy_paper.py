@@ -23,7 +23,7 @@ NOW = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 PAPER_PROOF = {
     "environment": "LIVE",
     "account": "21155143479478282",
-    "account_type": "PAPER",  # broker's own assertion (Tiger paper accounts live on the production API)
+    "account_type": "PAPER",  # broker's own assertion (Tiger paper accounts on the production API)
     "account_status": "Funded",
     "assets_ok": True,
     "proven_at": "2026-09-01T11:59:00Z",
