@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from tradehub_research.autonomy import kill_switch, policy
-from tradehub_research.autonomy.policy import PaperAutonomyPolicy
-from tradehub_research.autonomy.runner import run_autonomy
+from tradehub.autonomy import kill_switch, policy
+from tradehub.autonomy.policy import PaperAutonomyPolicy
+from tradehub.autonomy.runner import run_autonomy
 from tradehub_research.config import ResearchSettings
 
 NOW = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
@@ -340,9 +340,7 @@ def test_fixture_proposal_requires_marked_tag(ctx):
 
 
 def test_runner_has_no_llm_and_no_raw_evidence(tmp_path):
-    src = (
-        Path(__file__).parent.parent / "tradehub_research" / "autonomy" / "runner.py"
-    ).read_text()
+    src = (Path(__file__).parent.parent / "tradehub" / "autonomy" / "runner.py").read_text()
     for token in ("openai", "anthropic", "claude", "delegate_task", "httpx.post("):
         assert token not in src.lower(), f"runner must not reference {token!r}"
     # The runner consumes typed proposals only -- no evidence/file fields.

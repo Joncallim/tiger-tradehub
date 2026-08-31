@@ -2224,6 +2224,8 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_phase4_runtime_production_seam.py",
         "tests/test_runtime_isolation.py",
         "tests/test_research_adapters.py",
+        # #51 autonomous-PAPER runner tests (execution-plane capability)
+        "tests/test_autonomy_paper.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of
         # execution vocabulary in the research capability profile
         "tests/test_research_capability.py",

@@ -28,9 +28,9 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from tradehub_research.autonomy import kill_switch
-from tradehub_research.autonomy.budgets import BUDGET_DB, charge, daily_usage
-from tradehub_research.autonomy.policy import POLICY_FILE, PaperAutonomyPolicy, load_policy
+from tradehub.autonomy import kill_switch
+from tradehub.autonomy.budgets import BUDGET_DB, charge, daily_usage
+from tradehub.autonomy.policy import POLICY_FILE, PaperAutonomyPolicy, load_policy
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
 

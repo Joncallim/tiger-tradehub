@@ -267,7 +267,7 @@ def submit_order(
     # the broker-facing boundary, so even a duplicated/buggy runner cannot
     # submit while autonomous writes are disabled.
     if request.autonomous:
-        from tradehub_research.autonomy.kill_switch import is_blocked
+        from tradehub.autonomy.kill_switch import is_blocked
 
         if is_blocked():
             store.record_event("autonomous_submit_block", {"reason": "kill switch engaged"})
