@@ -127,111 +127,59 @@ def _pct_of(value: float | None, nav: float | None) -> float | None:
 
 
 def render_daily_report(data: dict[str, Any]) -> str:
-    """Deterministic daily report (B5 shape, steering 2026-08-29).
+    """Deterministic daily report (observation-mode shape, 2026-08-31).
 
     Broker-sourced fields may be None -- missing values render as
-    ``unavailable``, never $0. Unit convention: ``*_pct`` fields are
-    PERCENT units (0.25 means 0.25%). Sections render only when present.
+    ``unavailable``, never $0. ``*_pct`` fields are PERCENT units.
     """
     lines: list[str] = ["TRADEHUB · DAILY", ""]
-    today_pnl = data.get("daily_pnl")
-    today_pct = data.get("daily_pnl_pct")
-    lines.append(f"Today      {_signed_usd(today_pnl)} ({_signed_pct(today_pct)})")
-    nav = data.get("asset_value")
-    if nav is not None:
-        lines.append(f"NAV        {_usd(nav)}")
-        lines.append("")
-        lines.append("BOOK")
-        cash = data.get("cash")
-        gross = data.get("gross_position_value")
-        cash_pct = _pct_of(cash, nav)
-        gross_pct = _pct_of(gross, nav)
-        cash_txt = f"{cash_pct:.0f}%" if cash_pct is not None else MISSING
-        gross_txt = f"{gross_pct:.0f}%" if gross_pct is not None else MISSING
-        lines.append(
-            f"Cash {cash_txt} · Gross {gross_txt} · {data.get('position_count', MISSING)} positions"
-        )
-        lines.append(
-            f"Realized {_signed_usd(data.get('realized_pnl'))} · "
-            f"Unrealized {_signed_usd(data.get('unrealized_pnl'))} · "
-            f"Fees {_usd(data.get('fees'))}"
-        )
-    trades = data.get("trades_today")
-    if trades is not None:
-        lines.append("")
-        lines.append("ACTIONS")
-        lines.append(
-            f"{trades.get('entries', 0)} entries / {trades.get('adds', 0)} adds / "
-            f"{trades.get('trims', 0)} trims / {trades.get('exits', 0)} exits / "
-            f"{trades.get('blocked', 0)} blocked"
-        )
-    research = data.get("research_health")
-    if research:
-        lines.append("")
-        lines.append("RESEARCH")
-        lines.append(str(research))
-    learning = data.get("learning")
-    if learning:
-        lines.append("")
-        lines.append("LEARNING")
-        lines.append(str(learning))
-    data_health = data.get("data_health")
-    if data_health:
-        lines.append("")
-        lines.append("DATA")
-        lines.append(str(data_health))
+    lines.append(f"Portfolio: {_usd(data.get('asset_value'))}")
+    lines.append(
+        f"Today: {_signed_usd(data.get('daily_pnl'))} ({_signed_pct(data.get('daily_pnl_pct'))})"
+    )
+    lines.append(f"Realized: {_signed_usd(data.get('realized_pnl'))}")
+    lines.append(f"Unrealized: {_signed_usd(data.get('unrealized_pnl'))}")
+    lines.append(f"Cash: {_usd(data.get('cash_balance'))}")
     lines.append("")
-    lines.append("STATUS")
-    lines.append(data.get("status", "No action required."))
+    lines.append("Actions:")
+    lines.append(str(data.get("actions") or "No action"))
+    lines.append("")
+    lines.append("Learning:")
+    lines.append(f"Predictions: {data.get('predictions', 0)}")
+    lines.append(f"New matured outcomes: {data.get('new_matured', 0)}")
+    lines.append(f"Data/system health: {data.get('system_health', 'healthy')}")
     return "\n".join(lines)
 
 
 def render_weekly_report(data: dict[str, Any]) -> str:
-    """Deterministic weekly report (B5 shape, steering 2026-08-29).
+    """Deterministic weekly report (observation-mode shape, 2026-08-31).
 
-    All P&L / % arithmetic is computed HERE from broker-sourced inputs;
-    model prose never calculates numbers. Missing values render as
-    ``unavailable``. ``*_pct`` fields are PERCENT units.
+    All P&L / % arithmetic is computed by deterministic code from
+    broker-sourced inputs; model prose never calculates numbers.
+    Missing values render ``unavailable``.
     """
-    lines: list[str] = ["TRADEHUB · WEEK", ""]
+    lines: list[str] = ["TRADEHUB · WEEKLY", ""]
+    lines.append(f"Portfolio: {_usd(data.get('asset_value'))}")
     lines.append(
-        f"P&L        {_signed_usd(data.get('period_pnl'))} "
-        f"({_signed_pct(data.get('period_pnl_pct'))})"
+        f"Week: {_signed_usd(data.get('week_pnl'))} ({_signed_pct(data.get('week_pnl_pct'))})"
     )
-    nav = data.get("asset_value")
-    if nav is not None:
-        lines.append(f"NAV        {_usd(nav)}")
-    benchmark = data.get("benchmark_pct")
-    if benchmark is not None:
-        period_pct = data.get("period_pnl_pct")
-        active = None if period_pct is None else period_pct - benchmark
-        lines.append(f"Benchmark  {_signed_pct(benchmark)}")
-        lines.append(f"Active     {_signed_pp(active)}")
-    if data.get("max_drawdown_pct") is not None:
-        lines.append(f"Max DD     {_signed_pct(data.get('max_drawdown_pct'))}")
-    if data.get("turnover_pct") is not None:
-        lines.append(f"Turnover   {data.get('turnover_pct'):.0f}%")
-    if data.get("fees") is not None:
-        lines.append(f"Fees       {_usd(data.get('fees'))}")
-    decisions = data.get("decisions")
-    if decisions is not None:
-        lines.append("")
-        lines.append("DECISIONS")
-        lines.append(
-            f"{decisions.get('entries', 0)} entries / {decisions.get('adds', 0)} adds / "
-            f"{decisions.get('trims', 0)} trims / {decisions.get('exits', 0)} exits / "
-            f"{decisions.get('blocked', 0)} blocked"
-        )
-    contributors = data.get("contributors")
-    if contributors:
-        best = f"{contributors.get('best', '?')} {_signed_usd(contributors.get('best_pnl'))}"
-        worst = f"{contributors.get('worst', '?')} {_signed_usd(contributors.get('worst_pnl'))}"
-        lines.append("")
-        lines.append("CONTRIBUTORS")
-        lines.append(f"best {best} · worst {worst}")
-    research = data.get("research_health")
-    if research:
-        lines.append("")
-        lines.append("RESEARCH")
-        lines.append(str(research))
+    lines.append(
+        f"Since start: {_signed_usd(data.get('since_start_pnl'))} "
+        f"({_signed_pct(data.get('since_start_pct'))})"
+    )
+    lines.append("")
+    lines.append(f"Benchmark: {_signed_pct(data.get('benchmark_pct'))}")
+    lines.append(f"Relative: {_signed_pp(data.get('relative_pp'))}")
+    lines.append("")
+    lines.append(f"Trades: {data.get('trades', 0)}")
+    lines.append(f"Blocked/refused: {data.get('blocked', 0)}")
+    lines.append(f"No-action cycles: {data.get('no_action_cycles', 0)}")
+    lines.append("")
+    lines.append("Learning:")
+    lines.append(f"Predictions: {data.get('predictions', 0)}")
+    for horizon in ("21", "63", "126", "252"):
+        lines.append(f"{horizon}-session matured: {data.get(f'matured_{horizon}', 0)}")
+    lines.append("")
+    lines.append("System:")
+    lines.append(str(data.get("system") or "healthy"))
     return "\n".join(lines)
