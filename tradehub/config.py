@@ -14,6 +14,9 @@ class Settings(BaseSettings):
 
     api_token: SecretStr = Field(alias="TRADEHUB_API_TOKEN")
     preview_api_token: SecretStr | None = Field(default=None, alias="TRADEHUB_PREVIEW_API_TOKEN")
+    # Scoped credential for the deterministic autonomous-PAPER runner (issue
+    # #51): authorizes the execution API but is never a Tiger credential.
+    autonomy_api_token: SecretStr | None = Field(default=None, alias="TRADEHUB_AUTONOMY_TOKEN")
     dry_run: bool = Field(default=True, alias="TRADEHUB_DRY_RUN")
     bind_host: str = Field(default="127.0.0.1", alias="TRADEHUB_BIND_HOST")
     port: int = Field(default=8787, alias="TRADEHUB_PORT")

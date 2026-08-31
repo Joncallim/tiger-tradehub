@@ -68,7 +68,13 @@ def require_auth(
         if len(parts) == 2 and parts[0].lower() == "bearer":
             token = parts[1]
     expected = settings.api_token.get_secret_value()
-    if token is None or not hmac.compare_digest(token, expected):
+    autonomy = (
+        settings.autonomy_api_token.get_secret_value() if settings.autonomy_api_token else None
+    )
+    if token is None or not (
+        hmac.compare_digest(token, expected)
+        or (autonomy is not None and hmac.compare_digest(token, autonomy))
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid bearer token",
@@ -253,6 +259,23 @@ def submit_order(
     store: AuditStore = Depends(get_store),
     gateway: TigerGateway = Depends(get_gateway),
 ):
+    # Autonomous writes (issue #51 E): the kill switch is enforced HERE at
+    # the broker-facing boundary, so even a duplicated/buggy runner cannot
+    # submit while autonomous writes are disabled.
+    if request.autonomous:
+        from tradehub_research.autonomy.kill_switch import is_blocked
+
+        if is_blocked():
+            store.record_event("autonomous_submit_block", {"reason": "kill switch engaged"})
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="autonomous writes BLOCKED by kill switch",
+            )
+        if not (request.autonomy_tag or "").startswith("autonomous-paper-"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="autonomous submit requires an autonomy_tag",
+            )
     try:
         intent, tiger_preview, submit_lease_id = store.claim_confirmation(
             request.confirmation_token
@@ -591,6 +614,38 @@ def account_assets(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
     store.record_event("read_account_assets", {})
     return AccountAssetsResponse(tiger_configured=True, assets=assets)
+
+
+@app.get(
+    "/account/proof",
+    dependencies=[Depends(require_auth)],
+)
+def account_proof(
+    settings: Settings = Depends(get_settings),
+    store: AuditStore = Depends(get_store),
+    gateway: TigerGateway = Depends(get_gateway),
+):
+    """Live PAPER-environment proof (issue #51 F): the broker-facing service
+    asserts the sandbox environment + performs a live managed-account and
+    assets round-trip. Consumers must treat environment != 'PAPER_SANDBOX'
+    as NO TRADE."""
+    proof = gateway.proof_paper_environment()
+    store.record_event(
+        "account_proof",
+        {"environment": proof.get("environment"), "assets_ok": proof.get("assets_ok")},
+    )
+    return proof
+
+
+@app.get(
+    "/config/allowlist",
+    dependencies=[Depends(require_auth)],
+)
+def config_allowlist(
+    settings: Settings = Depends(get_settings),
+):
+    """Sanitized execution symbol allowlist (no credentials)."""
+    return {"symbols": sorted(str(s).upper() for s in settings.symbol_allowlist)}
 
 
 @app.get(

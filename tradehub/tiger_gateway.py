@@ -122,6 +122,50 @@ class TigerGateway:
         response = self.trade_client.get_assets(account=self.settings.tiger_account)
         return normalize(response)
 
+    def proof_paper_environment(self) -> dict[str, Any]:
+        """Live broker assertion of the account environment (issue #51 F).
+
+        The PAPER-ness is established by the BROKER ENVIRONMENT the client is
+        connected to (sandbox = paper) plus a live managed-account + assets
+        round-trip against the configured account. Never inferred from
+        account-number format, config prose, or cached artifacts. The caller
+        must treat environment != 'PAPER_SANDBOX' as NO TRADE."""
+        if not self.is_configured():
+            return {
+                "environment": "NOT_CONFIGURED",
+                "account": None,
+                "account_status": None,
+                "assets_ok": False,
+                "proven_at": None,
+            }
+        environment = "PAPER_SANDBOX" if self.settings.tiger_sandbox else "LIVE"
+        try:
+            profiles = self.trade_client.get_managed_accounts(account=self.settings.tiger_account)
+            status = None
+            for profile in profiles or []:
+                if getattr(profile, "account", None) == self.settings.tiger_account:
+                    status = getattr(profile, "status", None)
+                    break
+            if status is None and profiles:
+                status = getattr(profiles[0], "status", None)
+            assets = self.get_assets()
+            return {
+                "environment": environment,
+                "account": self.settings.tiger_account,
+                "account_status": status,
+                "assets_ok": assets is not None,
+                "proven_at": __import__("tradehub_research.db", fromlist=["utc_now"]).utc_now(),
+            }
+        except Exception as exc:  # noqa: BLE001 -- proof failures must be surfaced, not swallowed
+            return {
+                "environment": environment,
+                "account": self.settings.tiger_account,
+                "account_status": None,
+                "assets_ok": False,
+                "proven_at": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
     def get_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
         if not self.is_configured():
             raise RuntimeError("Tiger credentials are not configured")

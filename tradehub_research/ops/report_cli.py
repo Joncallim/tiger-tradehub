@@ -78,6 +78,11 @@ def build_daily_report(
             f"{fwd.get('predictions_due', 0)} due, matured "
             f"{sum(fwd.get('matured', {}).values())}"
         )
+        matured = fwd.get("matured", {})
+        data["learning"] = (
+            f"{fwd['production_predictions']} real predictions · "
+            f"{sum(matured.values())} outcomes matured"
+        )
     data["status"] = "No action required."
     return render_daily_report(data)
 
