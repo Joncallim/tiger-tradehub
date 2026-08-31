@@ -332,7 +332,9 @@ def test_past_screen_with_delayed_collection_is_honest(tmp_path):
         ).fetchone()
     assert row["as_of"] == "2026-08-28"
     assert row["provenance"] == "production"
-    assert row["created_at"].startswith("2026-08-29")  # collection time recorded honestly
+    # created_at records the REAL collection time (never the injected as_of):
+    # delayed collection is recorded honestly.
+    assert row["created_at"] and row["created_at"] >= "2026-08-29"
 
 
 def test_dedupe_and_immutability_survive_the_guard(tmp_path):
