@@ -61,6 +61,11 @@ class PreviewResponse(BaseModel):
 
 class SubmitOrderRequest(BaseModel):
     confirmation_token: str = Field(min_length=16)
+    # Autonomous-PAPER writes (issue #51): when set, the execution core
+    # enforces the autonomy kill switch before any broker write. Manual
+    # submits are unaffected.
+    autonomous: bool = False
+    autonomy_tag: str | None = Field(default=None, max_length=64)
 
 
 class SubmitOrderResponse(BaseModel):

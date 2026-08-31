@@ -1,0 +1,9 @@
+[Unit]
+Description=TradeHub autonomous PAPER runner timer (Mon/Wed/Fri)
+
+[Timer]
+OnCalendar=Mon,Wed,Fri *-*-* 23:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

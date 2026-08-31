@@ -61,6 +61,8 @@ SANCTIONED_FILES = {
     "tests/test_phase4_execution.py",
     "tests/test_phase4_runtime.py",
     "tests/test_phase4_runtime_production_seam.py",
+    # #51 autonomous-PAPER runner tests (execution-plane capability)
+    "tests/test_autonomy_paper.py",
     # the oracle module itself (hex-encoded terms; RA-03 repeats this pattern)
     "tests/test_portfolio_boundary.py",
 }

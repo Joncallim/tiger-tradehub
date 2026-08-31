@@ -170,6 +170,11 @@ def render_daily_report(data: dict[str, Any]) -> str:
         lines.append("")
         lines.append("RESEARCH")
         lines.append(str(research))
+    learning = data.get("learning")
+    if learning:
+        lines.append("")
+        lines.append("LEARNING")
+        lines.append(str(learning))
     data_health = data.get("data_health")
     if data_health:
         lines.append("")
