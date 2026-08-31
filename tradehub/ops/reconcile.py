@@ -30,9 +30,12 @@ def _num(value) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None  # SDK inf/NaN sentinels are UNKNOWN, never numbers
+    return number
 
 
 def _summary(assets: dict | list | None) -> dict:

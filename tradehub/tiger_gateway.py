@@ -120,9 +120,27 @@ class TigerGateway:
         if not self.is_configured():
             raise RuntimeError("Tiger credentials are not configured")
         response = self.trade_client.get_assets(account=self.settings.tiger_account)
-        # The SDK returns a LIST of PortfolioAccount objects; normalize() would
-        # stringify it, so the collection path is used.
-        return normalize_collection(response)
+        # PortfolioAccount exposes account/summary via PROPERTIES over private
+        # attrs; normalize() would drop them, so map explicitly. The SDK's
+        # Account uses float('inf') as the missing-value sentinel.
+        out: list[dict[str, Any]] = []
+        for account in response or []:
+            summary = getattr(account, "summary", None)
+            summary_dict = (
+                summary.to_dict()
+                if hasattr(summary, "to_dict")
+                else (vars(summary) if hasattr(summary, "__dict__") else {})
+            )
+            out.append(
+                {
+                    "account": getattr(account, "account", None),
+                    "summary": {
+                        key: (None if value == float("inf") else value)
+                        for key, value in summary_dict.items()
+                    },
+                }
+            )
+        return out
 
     def proof_paper_environment(self) -> dict[str, Any]:
         """Live broker assertion of the account environment (issue #51 F).
