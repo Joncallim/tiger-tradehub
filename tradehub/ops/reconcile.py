@@ -35,21 +35,38 @@ def _num(value) -> float | None:
         return None
 
 
-def _build_row(assets: dict, proof: dict | None) -> dict:
-    """Map the broker's normalized assets into the analytics contract row."""
+def _summary(assets: dict | list | None) -> dict:
+    """Extract the portfolio-account summary dict (SDK shape agnostic)."""
+    if isinstance(assets, list):
+        assets = assets[0] if assets else {}
+    if not isinstance(assets, dict):
+        return {}
+    summary = assets.get("summary")
+    if isinstance(summary, dict):
+        return summary
+    return assets
+
+
+def _build_row(assets: dict | list | None, proof: dict | None) -> dict:
+    """Map the broker's assets into the analytics contract row.
+
+    asset_value uses the account's net liquidation value when available.
+    Missing broker fields stay null (UNKNOWN).
+    """
+    summary = _summary(assets)
     return {
         "date": datetime.now(timezone.utc).date().isoformat(),
         "asset_value": _num(
-            assets.get("net_asset_value")
-            or assets.get("total_market_value")
-            or assets.get("equity")
+            summary.get("net_liquidation")
+            or summary.get("equity_with_loan")
+            or summary.get("net_asset_value")
         ),
-        "daily_pnl": _num(assets.get("day_pnl")),
+        "daily_pnl": _num(summary.get("day_pnl")),
         "daily_pnl_pct": None,  # the broker does not report the pct in assets
-        "cash_balance": _num(assets.get("available_funds") or assets.get("cash")),
-        "gross_position_value": _num(assets.get("gross_position_value")),
-        "realized_pnl": _num(assets.get("realized_pnl")),
-        "unrealized_pnl": _num(assets.get("unrealized_pnl")),
+        "cash_balance": _num(summary.get("available_funds") or summary.get("cash")),
+        "gross_position_value": _num(summary.get("gross_position_value")),
+        "realized_pnl": _num(summary.get("realized_pnl")),
+        "unrealized_pnl": _num(summary.get("unrealized_pnl")),
         "deposits": None,  # not reported by the assets endpoint; UNKNOWN
         "withdrawals": None,
         "account_type": proof.get("account_type") if proof else None,

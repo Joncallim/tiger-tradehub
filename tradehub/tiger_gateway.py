@@ -116,11 +116,13 @@ class TigerGateway:
         )
         return normalize(response)
 
-    def get_assets(self) -> dict[str, Any] | None:
+    def get_assets(self) -> list[dict[str, Any]] | None:
         if not self.is_configured():
             raise RuntimeError("Tiger credentials are not configured")
         response = self.trade_client.get_assets(account=self.settings.tiger_account)
-        return normalize(response)
+        # The SDK returns a LIST of PortfolioAccount objects; normalize() would
+        # stringify it, so the collection path is used.
+        return normalize_collection(response)
 
     def proof_paper_environment(self) -> dict[str, Any]:
         """Live broker assertion of the account environment (issue #51 F).
@@ -157,7 +159,7 @@ class TigerGateway:
                 "account": self.settings.tiger_account,
                 "account_type": account_type,  # broker's own assertion (PAPER for paper accounts)
                 "account_status": status,
-                "assets_ok": assets is not None,
+                "assets_ok": bool(assets),  # non-empty assets round-trip
                 "proven_at": __import__("tradehub_research.db", fromlist=["utc_now"]).utc_now(),
             }
         except Exception as exc:  # noqa: BLE001 -- proof failures must be surfaced, not swallowed
