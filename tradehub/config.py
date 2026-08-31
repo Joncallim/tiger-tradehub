@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # Scoped credential for the deterministic autonomous-PAPER runner (issue
     # #51): authorizes the execution API but is never a Tiger credential.
     autonomy_api_token: SecretStr | None = Field(default=None, alias="TRADEHUB_AUTONOMY_TOKEN")
+    # Writable state dir for SDK token/config files (the deployed service
+    # runs ProtectSystem=strict; only /var/lib/tradehub is writable).
+    state_dir: Path = Field(default=Path("/var/lib/tradehub"), alias="TRADEHUB_STATE_DIR")
     dry_run: bool = Field(default=True, alias="TRADEHUB_DRY_RUN")
     bind_host: str = Field(default="127.0.0.1", alias="TRADEHUB_BIND_HOST")
     port: int = Field(default=8787, alias="TRADEHUB_PORT")

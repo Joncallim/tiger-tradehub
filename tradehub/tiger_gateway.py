@@ -203,7 +203,10 @@ class TigerGateway:
         from tigeropen.tiger_open_config import TigerOpenClientConfig
         from tigeropen.trade.trade_client import TradeClient
 
-        config = TigerOpenClientConfig(sandbox_debug=self.settings.tiger_sandbox)
+        config = TigerOpenClientConfig(
+            sandbox_debug=self.settings.tiger_sandbox,
+            props_path=str(self.settings.state_dir),
+        )
         config.tiger_id = self.settings.tiger_id
         config.account = self.settings.tiger_account
         if self.settings.tiger_license:
