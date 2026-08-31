@@ -21,7 +21,7 @@ def _alert(message: str) -> None:
 
 def check_cycle_health(paths) -> None:
     """Scheduled cycle missed / duplicate cycle (M/W/F cadence)."""
-    log = paths.cycle_log
+    log = paths.research_dir / "cycle-log.jsonl"
     if not log.exists():
         _alert("research cycle log missing")
         return
@@ -46,9 +46,21 @@ def check_cycle_health(paths) -> None:
     # M/W/F cadence: a healthy gap is <= ~3.5 days (Fri->Mon). 4.5 days is missed.
     if age_hours > 4.5 * 24:
         _alert(f"research cycle missed: last cycle {age_hours:.0f}h ago")
-    as_ofs = [str(e.get("as_of", "")) for e in entries if e.get("as_of")]
-    if len(as_ofs) != len(set(as_ofs)) and entries:
-        _alert("duplicate cycle as_of detected (duplicate run)")
+    as_of_by_day: dict[str, set] = {}
+    for entry in entries:
+        day = str(entry.get("created_at", ""))[:10]
+        as_of = str(entry.get("as_of", ""))
+        if day and as_of:
+            as_of_by_day.setdefault(day, set()).add(as_of)
+    for day, as_ofs in as_of_by_day.items():
+        # TWO cycles on the SAME day for the SAME as_of = a scheduler
+        # duplicate. The Monday cycle legitimately re-screens Friday's as_of
+        # (no new completed session over the weekend) -- cross-day repeats
+        # are expected, not duplicates.
+        if len(entries) >= 2 and len(as_ofs) < sum(
+            1 for e in entries if str(e.get("created_at", ""))[:10] == day
+        ):
+            _alert(f"duplicate cycle on {day} (as_of {sorted(as_ofs)})")
 
 
 def check_data_freshness(settings, paths) -> None:
