@@ -32,7 +32,9 @@ PAPER_PROVISIONAL_DEFAULTS: dict = {
     "max_notional_per_day_microusd": 20_000_000_000,  # $20,000 PAPER_PROVISIONAL
     "max_per_position_exposure_ppm": 100_000,  # 10% of NAV PAPER_PROVISIONAL
     "proposal_max_age_seconds": 3600 * 26,  # 26h: proposals from the prior M/W/F cycle
-    "data_max_age_seconds": 3600 * 30,  # 30h: market data no older than ~2 sessions
+    # 78h covers the longest M/W/F gap (Friday session -> Monday cycle);
+    # a timer firing without fresh data refuses rather than manufacturing.
+    "data_max_age_seconds": 3600 * 78,
     "kill_switch": False,  # file-based kill switch is the authoritative control
     "policy_version": POLICY_VERSION,
     "label": "PAPER_PROVISIONAL",
