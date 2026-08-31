@@ -44,6 +44,12 @@ def forward_health(
             "JOIN forward_prediction p ON p.prediction_id=o.prediction_id "
             "WHERE p.provenance='production' GROUP BY outcome_status"
         ).fetchall()
+        matured_by_horizon = conn.execute(
+            "SELECT p.horizon_sessions, COUNT(*) FROM forward_outcome o "
+            "JOIN forward_prediction p ON p.prediction_id=o.prediction_id "
+            "WHERE p.provenance='production' "
+            "GROUP BY p.horizon_sessions ORDER BY p.horizon_sessions"
+        ).fetchall()
         last_screen = conn.execute(
             "SELECT MAX(as_of) FROM forward_prediction WHERE provenance='production'"
         ).fetchone()[0]
@@ -52,6 +58,7 @@ def forward_health(
         "by_horizon": {str(r[0]): r[1] for r in by_horizon},
         "predictions_due": due_count,
         "matured": {str(r[0]): r[1] for r in matured},
+        "matured_by_horizon": {str(r[0]): r[1] for r in matured_by_horizon},
         "last_production_screen": last_screen,
         "generated_at": utc_now(),
     }

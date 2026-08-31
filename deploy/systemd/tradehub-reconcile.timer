@@ -1,0 +1,9 @@
+[Unit]
+Description=TradeHub broker reconciliation timer (daily after the US session settles)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 00:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

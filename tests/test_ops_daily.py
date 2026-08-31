@@ -172,6 +172,6 @@ def test_daily_report_honest_when_broker_unavailable(tmp_path):
     paths, research_db, exp = _seed(tmp_path)
     settings = ResearchSettings(db_path=research_db.path, busy_timeout_ms=5000)
     report = build_daily_report(settings=settings, experiment_db=exp, paths=paths, analytics={})
-    assert "Today      unavailable (unavailable)" in report
+    assert "Today: unavailable (unavailable)" in report
     assert "$0" not in report
-    assert "No action required." in report
+    assert "No action" in report

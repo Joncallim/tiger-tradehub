@@ -1,0 +1,10 @@
+[Unit]
+Description=TradeHub broker reconciliation (sanitized analytics snapshot)
+
+[Service]
+Type=oneshot
+User=tradehub-execution
+Group=tradehub-execution
+WorkingDirectory=/opt/tiger-tradehub
+EnvironmentFile=/etc/tradehub/execution.env
+ExecStart=/opt/tiger-tradehub/.venv/bin/python -m tradehub.ops.reconcile
