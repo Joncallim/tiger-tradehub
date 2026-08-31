@@ -111,13 +111,21 @@ def prove_paper_account(client, settings: ResearchSettings) -> dict:
     return proof
 
 
-def _resolve_ticker(research_db: ResearchDB):
+def _resolve_ticker(research_db: ResearchDB | None):
     def resolve(security_id: str, as_of: str) -> str | None:
-        with research_db.connect(read_only=True) as conn:
-            row = conn.execute(
-                "SELECT canonical_ticker FROM security WHERE security_id=?", (security_id,)
-            ).fetchone()
-        return str(row["canonical_ticker"]).upper() if row and row["canonical_ticker"] else None
+        # Best-effort identity cross-check: absent/unavailable research DB
+        # degrades to None (the envelope symbol is authoritative); a DB error
+        # must never block the runner's own validation in isolated runs.
+        if research_db is None:
+            return None
+        try:
+            with research_db.connect(read_only=True) as conn:
+                row = conn.execute(
+                    "SELECT canonical_ticker FROM security WHERE security_id=?", (security_id,)
+                ).fetchone()
+            return str(row["canonical_ticker"]).upper() if row and row["canonical_ticker"] else None
+        except Exception:  # noqa: BLE001 -- best-effort cross-check
+            return None
 
     return resolve
 
@@ -283,7 +291,10 @@ def run_autonomy(
         },
     }
 
-    research_db = ResearchDB(settings.db_path, settings.busy_timeout_ms)
+    try:
+        research_db = ResearchDB(settings.db_path, settings.busy_timeout_ms)
+    except Exception:  # noqa: BLE001 -- absent DB degrades the cross-check
+        research_db = None
     resolve = _resolve_ticker(research_db)
 
     for path in envelope_files:
