@@ -21,9 +21,10 @@ from tradehub_research.config import ResearchSettings
 
 NOW = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 PAPER_PROOF = {
-    "environment": "PAPER_SANDBOX",
-    "account": "20161327",
-    "account_status": "Open",
+    "environment": "LIVE",
+    "account": "21155143479478282",
+    "account_type": "PAPER",  # broker's own assertion (Tiger paper accounts live on the production API)
+    "account_status": "Funded",
     "assets_ok": True,
     "proven_at": "2026-09-01T11:59:00Z",
 }
@@ -194,7 +195,7 @@ def test_kill_switch_survives_restart(ctx):
 
 
 def test_non_paper_environment_yields_zero_writes(ctx):
-    ctx["client"].proof = {**PAPER_PROOF, "environment": "LIVE"}
+    ctx["client"].proof = {**PAPER_PROOF, "account_type": "LIVE_ACCOUNT"}
     _write_inbox(ctx, _envelope())
     summary = _run(ctx)
     assert summary["status"] == "REFUSED"

@@ -38,7 +38,7 @@ INBOX_DIR = Path("/var/lib/tradehub/autonomy/proposals")
 PROCESSED_DIR = INBOX_DIR / "processed"
 LEDGER_FILE = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
 
-EXECUTION_API = "http://127.0.0.1:8787"
+EXECUTION_API = __import__("os").getenv("TRADEHUB_EXECUTION_API", "http://127.0.0.1:8787")
 AUTONOMOUS_TAG = "autonomous-paper-v1"
 
 
@@ -88,16 +88,21 @@ def prove_paper_account(client, settings: ResearchSettings) -> dict:
     """Positively establish the broker account is PAPER (issue #51 F).
 
     The proof is a LIVE broker query performed by the execution service
-    (which holds the credentials): environment must be PAPER_SANDBOX (the
-    broker's sandbox endpoint), and the managed-account + assets round-trip
-    must succeed against the configured account. Never inferred from account
-    number format, config prose, or a cached artifact. Failure -> NO TRADE.
+    (which holds the credentials): the BROKER's own account_type must be
+    PAPER (Tiger's paper accounts live on the production API since the
+    sandbox was deprecated), OR the environment must be the legacy
+    PAPER_SANDBOX; plus a live managed-account + assets round-trip must
+    succeed. Never inferred from account-number format, config prose, or a
+    cached artifact. Failure -> NO TRADE.
     """
     proof = client.get("/account/proof")
-    if proof.get("environment") != "PAPER_SANDBOX":
+    broker_paper = proof.get("account_type") == "PAPER"
+    sandbox = proof.get("environment") == "PAPER_SANDBOX"
+    if not (broker_paper or sandbox):
         raise AutonomyRefusal(
-            f"PAPER proof failed: environment={proof.get('environment')!r} "
-            "(not the broker sandbox); refusing any autonomous write"
+            f"PAPER proof failed: broker account_type={proof.get('account_type')!r} "
+            f"environment={proof.get('environment')!r} (not a paper account); "
+            "refusing any autonomous write"
         )
     if not proof.get("assets_ok"):
         raise AutonomyRefusal("PAPER proof failed: live assets round-trip did not succeed")

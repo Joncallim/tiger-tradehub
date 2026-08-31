@@ -142,16 +142,20 @@ class TigerGateway:
         try:
             profiles = self.trade_client.get_managed_accounts(account=self.settings.tiger_account)
             status = None
+            account_type = None
             for profile in profiles or []:
                 if getattr(profile, "account", None) == self.settings.tiger_account:
                     status = getattr(profile, "status", None)
+                    account_type = getattr(profile, "account_type", None)
                     break
             if status is None and profiles:
                 status = getattr(profiles[0], "status", None)
+                account_type = getattr(profiles[0], "account_type", None)
             assets = self.get_assets()
             return {
                 "environment": environment,
                 "account": self.settings.tiger_account,
+                "account_type": account_type,  # broker's own assertion (PAPER for paper accounts)
                 "account_status": status,
                 "assets_ok": assets is not None,
                 "proven_at": __import__("tradehub_research.db", fromlist=["utc_now"]).utc_now(),
@@ -160,6 +164,7 @@ class TigerGateway:
             return {
                 "environment": environment,
                 "account": self.settings.tiger_account,
+                "account_type": None,
                 "account_status": None,
                 "assets_ok": False,
                 "proven_at": None,
