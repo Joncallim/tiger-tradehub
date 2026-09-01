@@ -80,7 +80,7 @@ def refresh_health(
     """
     paths = paths or research_paths()
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
-    from tradehub_research.ops.daily_refresh import REFRESH_STALENESS_DAYS
+    from tradehub_research.ops.daily_refresh import REFRESH_STALENESS_DAYS, retired_tickers
 
     as_of = (as_of or last_completed_us_session()).isoformat()
     freshness_cutoff = (
@@ -98,10 +98,12 @@ def refresh_health(
             "  WHERE s2.supersedes_id=m.id)"
         ).fetchall()
     with_data = [r for r in rows if r["last_bar"]]
+    retired = retired_tickers()
     stale = [
         {"ticker": r["canonical_ticker"], "last_bar": r["last_bar"]}
         for r in with_data
         if r["last_bar"] < freshness_cutoff
+        and str(r["canonical_ticker"] or "").upper() not in retired
     ]
     return {
         "as_of": as_of,

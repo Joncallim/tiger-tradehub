@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from tradehub_research.adapters.base import ingest_records
 from tradehub_research.adapters.tiingo import TiingoEodAdapter, TiingoQuota
@@ -43,6 +44,47 @@ INCREMENTAL_LOOKBACK_SESSIONS = 10
 ACTIVE_SET_MAX_REQUESTS = 60
 ROTATION_REQUESTS_PER_RUN = 40
 REFRESH_STALENESS_DAYS = 7
+# A symbol whose fetch returns 0 bars despite a data gap this long is treated
+# as delisted/unresolvable (Tiingo returns 200-with-empty for delisted names).
+RETIRE_GAP_DAYS = 14
+RETIRED_FILE = Path("/var/lib/tradehub-research/autonomy/retired_securities.json")
+
+
+def _load_retired() -> set[str]:
+    """Tickers the refresh has retired as delisted/unresolvable."""
+    if not RETIRED_FILE.exists():
+        return set()
+    try:
+        data = json.loads(RETIRED_FILE.read_text())
+    except (ValueError, OSError):
+        return set()
+    return {str(item.get("ticker", "")).upper() for item in data if isinstance(item, dict)}
+
+
+def retired_tickers() -> set[str]:
+    """Public read-only accessor (health + watch exclude these from staleness)."""
+    return _load_retired()
+
+
+def _retire(ticker: str, last_bar: str | None, reason: str) -> None:
+    """Record a ticker as retired (idempotent, append-only file)."""
+    RETIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        items = json.loads(RETIRED_FILE.read_text()) if RETIRED_FILE.exists() else []
+    except (ValueError, OSError):
+        items = []
+    existing = {str(item.get("ticker", "")).upper() for item in items if isinstance(item, dict)}
+    if ticker.upper() in existing:
+        return
+    items.append(
+        {
+            "ticker": ticker.upper(),
+            "last_bar": last_bar,
+            "reason": reason,
+            "retired_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    RETIRED_FILE.write_text(json.dumps(items, sort_keys=True, indent=2) + "\n")
 
 
 def _active_securities(research_db: ResearchDB, days: int = 14) -> set[str]:
@@ -76,6 +118,29 @@ def _needs_fresh(research_db: ResearchDB, security_id: str, as_of: str) -> bool:
     return last is None or last < as_of
 
 
+def _maybe_retire(research_db: ResearchDB, ticker: str) -> None:
+    """Retire a ticker whose fetch returned 0 bars AND whose data is already
+    older than RETIRE_GAP_DAYS (a delisted name, not a transient gap)."""
+    try:
+        with research_db.connect(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT MAX(json_extract(structured_fields, '$.session_date')) AS d "
+                "FROM evidence_event e JOIN security s ON s.security_id=e.security_id "
+                "WHERE upper(s.canonical_ticker)=upper(?) AND e.source_id='tiingo_eod'",
+                (ticker,),
+            ).fetchone()
+        last_bar = row["d"] if row and row["d"] else None
+    except Exception:  # noqa: BLE001 -- never fatal to the refresh
+        return
+    if last_bar is None:
+        return
+    try:
+        if (date.today() - date.fromisoformat(str(last_bar)[:10])).days > RETIRE_GAP_DAYS:
+            _retire(ticker, last_bar, "fetch returns 0 bars; data older than the retire gap")
+    except ValueError:
+        return
+
+
 def _refresh_one(
     adapter: TiingoEodAdapter,
     quota: TiingoQuota,
@@ -95,6 +160,22 @@ def _refresh_one(
             end_date=as_of.isoformat(),
         )
         records = adapter.parse(fetched.raw_bytes, fetched, ticker=ticker)
+        if not records:
+            # 200 with zero bars = the ticker no longer has EOD data (delisted).
+            # Recorded as ERROR (the attempt yielded no usable data) with a
+            # descriptive class; the summary tracks EMPTY separately for the
+            # daily report.
+            record_attempt(
+                experiment_db,
+                ticker=ticker,
+                status="ERROR",
+                http_status=fetched.status,
+                bytes_count=len(fetched.raw_bytes),
+                error="EMPTY: 0 bars parsed (delisted/unresolvable)",
+            )
+            summary["EMPTY"] += 1
+            _maybe_retire(research_db, ticker)
+            return
         ids = ingest_records(records, store)
         record_attempt(
             experiment_db,
@@ -152,6 +233,7 @@ def run_daily_refresh(
         "as_of": as_of.isoformat(),
         "SUCCESS": 0,
         "ERROR": 0,
+        "EMPTY": 0,
         "SKIPPED_FRESH": 0,
         "records": 0,
         "active_refreshed": 0,
@@ -169,9 +251,12 @@ def run_daily_refresh(
             summary["active_refreshed"] += 1
         # 2. Rotation: cohort symbols not refreshed within REFRESH_STALENESS_DAYS.
         rotated = 0
+        retired = _load_retired()
         for ticker in sorted(by_ticker):
             if rotated >= rotation_budget:
                 break
+            if ticker.upper() in retired:
+                continue  # delisted/unresolvable -- no longer fetched
             sid = by_ticker[ticker]
             last = _last_bar_date(research_db, sid)
             if (
