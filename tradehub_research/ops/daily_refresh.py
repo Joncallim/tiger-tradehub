@@ -100,7 +100,7 @@ def _refresh_one(
             experiment_db,
             ticker=ticker,
             status="SUCCESS",
-            http_status=fetched.http_status,
+            http_status=fetched.status,
             bytes_count=len(fetched.raw_bytes),
             error=None,
         )
