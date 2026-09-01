@@ -42,7 +42,7 @@ owner authorization (an ADAPTIVE READINESS REVIEW first).
 ## IMPROVEMENT LOG (recorded, NOT applied)
 
 - (empty)
-- (2026-09-01) daily refresh: symbols that return 200-with-zero-bars (delisted, e.g. TALMF) are retried every rotation (1 req/day). Consider an unresolvable back-off ledger after N empty responses.
+- (2026-09-01) [RESOLVED] delisted 200-empty symbols (TALMF) are now retired automatically (retired_securities.json) and excluded from refresh + staleness.
 
 ## EVIDENCE BASELINE (entering observation mode)
 
