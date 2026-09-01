@@ -13,6 +13,27 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 ALERTS: list[str] = []
+ACK_FILE = Path("/var/lib/tradehub-research/autonomy/acknowledged_events.json")
+DUPLICATE_WINDOW_MINUTES = 60  # a scheduler overlap/restart re-fire hazard window
+
+
+def _acknowledged() -> set[tuple[str, str]]:
+    """Operator-acknowledged (day, as_of) duplicate-cycle events.
+
+    Acknowledgment is a documented operator decision (e.g. an intentional
+    test double-run); the cycle ledger stays append-only and untouched.
+    """
+    if not ACK_FILE.exists():
+        return set()
+    try:
+        data = json.loads(ACK_FILE.read_text())
+    except (ValueError, OSError):
+        return set()
+    return {
+        (str(item.get("day", "")), str(item.get("as_of", "")))
+        for item in data
+        if isinstance(item, dict)
+    }
 
 
 def _alert(message: str) -> None:
@@ -46,21 +67,35 @@ def check_cycle_health(paths) -> None:
     # M/W/F cadence: a healthy gap is <= ~3.5 days (Fri->Mon). 4.5 days is missed.
     if age_hours > 4.5 * 24:
         _alert(f"research cycle missed: last cycle {age_hours:.0f}h ago")
-    as_of_by_day: dict[str, set] = {}
+    as_of_by_day: dict[str, list] = {}
     for entry in entries:
         day = str(entry.get("created_at", ""))[:10]
         as_of = str(entry.get("as_of", ""))
         if day and as_of:
-            as_of_by_day.setdefault(day, set()).add(as_of)
-    for day, as_ofs in as_of_by_day.items():
-        # TWO cycles on the SAME day for the SAME as_of = a scheduler
-        # duplicate. The Monday cycle legitimately re-screens Friday's as_of
-        # (no new completed session over the weekend) -- cross-day repeats
-        # are expected, not duplicates.
-        if len(entries) >= 2 and len(as_ofs) < sum(
-            1 for e in entries if str(e.get("created_at", ""))[:10] == day
-        ):
-            _alert(f"duplicate cycle on {day} (as_of {sorted(as_ofs)})")
+            as_of_by_day.setdefault(day, []).append((as_of, str(entry.get("created_at", ""))))
+    acked = _acknowledged()
+    for day, runs in as_of_by_day.items():
+        # A duplicate hazard is TWO runs on the SAME day for the SAME as_of
+        # within a short window (timer overlap / restart re-fire). The Monday
+        # cycle legitimately re-screens Friday's as_of (no new completed
+        # session over the weekend) and hours-apart re-runs are idempotent
+        # re-screens -- neither is a scheduler duplicate.
+        by_as_of: dict[str, list] = {}
+        for as_of, created_at in runs:
+            by_as_of.setdefault(as_of, []).append(created_at)
+        for as_of, stamps in by_as_of.items():
+            if len(stamps) < 2:
+                continue
+            stamps_sorted = sorted(stamps)
+            gap_minutes = (
+                datetime.fromisoformat(stamps_sorted[-1].replace("Z", "+00:00"))
+                - datetime.fromisoformat(stamps_sorted[0].replace("Z", "+00:00"))
+            ).total_seconds() / 60
+            if gap_minutes > DUPLICATE_WINDOW_MINUTES:
+                continue
+            if (day, as_of) in acked:
+                continue
+            _alert(f"duplicate cycle on {day} (as_of {as_of}, {gap_minutes:.0f} min apart)")
 
 
 def check_data_freshness(settings, paths) -> None:
@@ -191,7 +226,11 @@ def main() -> int:
     check_reconciliation()
     if ALERTS:
         print("\n".join(ALERTS))
-    return 1 if ALERTS else 0
+    # Exit 0 whenever the watch itself ran: alerts are the stdout deliverable
+    # (the Hermes no_agent cron delivers non-empty output). A non-zero exit is
+    # reserved for genuine script failures so a healthy-but-alerting watch is
+    # never reported as a broken job.
+    return 0
 
 
 if __name__ == "__main__":

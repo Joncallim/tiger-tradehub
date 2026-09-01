@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date, timedelta
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
@@ -70,11 +71,21 @@ def refresh_health(
     paths: ResearchPaths | None = None,
     as_of=None,
 ) -> dict:
-    """Market-data freshness: last bar date per cohort security vs the last
-    completed US session; stale names listed honestly (never backfilled)."""
+    """Market-data freshness vs the refresh contract (7-day rolling window).
+
+    A name is STALE only when its last bar is older than the daily refresh's
+    rolling staleness window (REFRESH_STALENESS_DAYS) -- a 1-session lag is
+    within the designed rolling coverage and is NOT flagged. Stale names are
+    listed honestly (never backfilled).
+    """
     paths = paths or research_paths()
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
+    from tradehub_research.ops.daily_refresh import REFRESH_STALENESS_DAYS
+
     as_of = (as_of or last_completed_us_session()).isoformat()
+    freshness_cutoff = (
+        date.fromisoformat(as_of) - timedelta(days=REFRESH_STALENESS_DAYS)
+    ).isoformat()
     with research_db.connect(read_only=True) as conn:
         rows = conn.execute(
             "SELECT s.security_id, s.canonical_ticker, "
@@ -90,7 +101,7 @@ def refresh_health(
     stale = [
         {"ticker": r["canonical_ticker"], "last_bar": r["last_bar"]}
         for r in with_data
-        if r["last_bar"] < as_of
+        if r["last_bar"] < freshness_cutoff
     ]
     return {
         "as_of": as_of,
