@@ -42,7 +42,8 @@ owner authorization (an ADAPTIVE READINESS REVIEW first).
 ## IMPROVEMENT LOG (recorded, NOT applied)
 
 - (empty)
-- (2026-09-01) [RESOLVED] delisted 200-empty symbols (TALMF) are now retired automatically (retired_securities.json) and excluded from refresh + staleness.
+- (2026-09-01) [RESOLVED] delisted 200-empty symbols (TALMF) now retired automatically
+- (2026-09-04) [RESOLVED] replay_bootstrap grid blocked production captures for as_of >= 2026-09-01 (provenance now in UNIQUE constraint, schema v5) (retired_securities.json) and excluded from refresh + staleness.
 
 ## EVIDENCE BASELINE (entering observation mode)
 
