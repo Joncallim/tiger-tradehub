@@ -12,7 +12,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-VALIDATION_SCHEMA_VERSION = 4
+VALIDATION_SCHEMA_VERSION = 5
 
 VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -273,6 +273,44 @@ VALIDATION_MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         -- forward-evidence calculations); genuine production capture
         -- inserts 'production' (enforced by the application guard).
         ALTER TABLE forward_prediction ADD COLUMN provenance TEXT NOT NULL DEFAULT 'replay_bootstrap';
+        """,
+    ),
+    (
+        5,
+        "Provenance in the forward_prediction uniqueness contract",
+        """
+        -- The replay_bootstrap grid (as_of 2026-09-01+) and production rows
+        -- share the same variant_names; the existing UNIQUE constraint on
+        -- (security_id, as_of, variant_name, horizon_sessions) caused
+        -- production captures to collide with replay rows. Adding provenance
+        -- to the UNIQUE separates them while preserving immutability.
+        DROP TRIGGER IF EXISTS forward_prediction_no_update;
+        DROP TRIGGER IF EXISTS forward_prediction_no_delete;
+        CREATE TABLE forward_prediction_v5 (
+            prediction_id TEXT PRIMARY KEY,
+            security_id TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            variant_name TEXT NOT NULL,
+            score_value REAL,
+            state TEXT,
+            screen_passed INTEGER CHECK(screen_passed IS NULL OR screen_passed IN (0,1)),
+            sufficient_data INTEGER CHECK(sufficient_data IS NULL OR sufficient_data IN (0,1)),
+            raw_features_hash TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL CHECK(json_valid(evidence_ids_json)),
+            horizon_sessions INTEGER NOT NULL CHECK(horizon_sessions IN (21,63,126,252)),
+            outcome_due_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            provenance TEXT NOT NULL DEFAULT 'replay_bootstrap',
+            UNIQUE(security_id, as_of, variant_name, horizon_sessions, provenance)
+        );
+        INSERT INTO forward_prediction_v5 SELECT * FROM forward_prediction;
+        DROP TABLE forward_prediction;
+        ALTER TABLE forward_prediction_v5 RENAME TO forward_prediction;
+        CREATE TRIGGER forward_prediction_no_update BEFORE UPDATE ON forward_prediction
+        BEGIN SELECT RAISE(ABORT,'forward_prediction is immutable before outcome'); END;
+        CREATE TRIGGER forward_prediction_no_delete BEFORE DELETE ON forward_prediction
+        BEGIN SELECT RAISE(ABORT,'forward_prediction is append-only'); END;
         """,
     ),
 )

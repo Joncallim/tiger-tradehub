@@ -85,8 +85,9 @@ def record_prediction(
     with experiment_db.connect() as conn:
         existing = conn.execute(
             "SELECT prediction_id, raw_features_hash, config_hash FROM forward_prediction "
-            "WHERE security_id=? AND as_of=? AND variant_name=? AND horizon_sessions=?",
-            (security_id, as_of[:10], variant_name, horizon_sessions),
+            "WHERE security_id=? AND as_of=? AND variant_name=? AND horizon_sessions=? "
+            "AND provenance=?",
+            (security_id, as_of[:10], variant_name, horizon_sessions, provenance),
         ).fetchone()
         if existing is not None:
             # Dedupe must never alias different content: the FIRST recorded
