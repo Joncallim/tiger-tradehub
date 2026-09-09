@@ -1,0 +1,11 @@
+[Unit]
+Description=TradeHub temporary hourly stale-data recovery (2026-09-10)
+
+[Timer]
+# 10 bounded recovery ticks. Ends automatically after 17:05 SGT; it is not
+# a permanent second scheduler.
+OnCalendar=2026-09-10 08..17:05:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

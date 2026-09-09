@@ -9,6 +9,24 @@ from typing import Any
 from tradehub_research.db import ResearchDB, normalize_ts, utc_now
 
 
+def _retry_stable_fields(value: str) -> str:
+    """Canonicalize evidence content for an idempotent source-record retry.
+
+    ``source_envelope`` is retrieval lineage, not the economic/regulatory
+    observation identified by ``source_record_id``. It legitimately changes
+    on a repeat provider fetch (retrieved_at, ETag, raw cache hash). The
+    first append-only row retains that original lineage; retry equality must
+    compare the stable parsed observation rather than rejecting the retry.
+    """
+    try:
+        fields = json.loads(value)
+    except (TypeError, ValueError):
+        return value
+    if isinstance(fields, dict):
+        fields.pop("source_envelope", None)
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+
+
 class EvidenceStore:
     def __init__(self, database: ResearchDB):
         self.database = database
@@ -139,7 +157,22 @@ class EvidenceStore:
                         strict=True,
                     )
                 )
-                if any(existing[key] != submitted[key] for key in comparable):
+                # A provider-supplied source_record_id identifies the stable
+                # parsed observation (Tiingo's includes the bar payload hash).
+                # Its content hash changes only because the source_envelope's
+                # retrieval lineage changes; compare that envelope-stripped
+                # observation and retain the first immutable raw lineage.
+                retry_comparable = tuple(
+                    key
+                    for key in comparable
+                    if not (source_record_id is not None and key == "content_hash")
+                )
+                if any(
+                    (_retry_stable_fields(existing[key]) != _retry_stable_fields(submitted[key]))
+                    if key == "structured_fields"
+                    else existing[key] != submitted[key]
+                    for key in retry_comparable
+                ):
                     raise ValueError("identity retry metadata does not match existing evidence")
                 return str(existing["evidence_id"])
         return identifier
