@@ -85,6 +85,39 @@ def test_duplicate_is_idempotent_per_source_and_security(store):
         assert db.execute("SELECT COUNT(*) FROM evidence_event").fetchone()[0] == 1
 
 
+def test_source_record_retry_ignores_volatile_retrieval_envelope(store):
+    """A Tiingo re-fetch of unchanged bar data is idempotent even though its
+    retrieval timestamp/raw-cache lineage has changed; the first row remains
+    the immutable record."""
+    fields = {
+        "record_type": "price_bar",
+        "close": 10.0,
+        "source_envelope": {"retrieved_at": "2025-01-06T00:00:00Z", "raw_content_hash": "one"},
+    }
+    first = add(
+        store,
+        fields,
+        "2025-01-05",
+        source_record_id="TEST:2025-01-05:price_bar:stable",
+    )
+    retry = {
+        **fields,
+        "source_envelope": {"retrieved_at": "2025-01-07T00:00:00Z", "raw_content_hash": "two"},
+    }
+    second = add(
+        store,
+        retry,
+        "2025-01-05",
+        source_record_id="TEST:2025-01-05:price_bar:stable",
+    )
+    assert second == first
+    with store.database.connect(read_only=True) as db:
+        row = db.execute(
+            "SELECT structured_fields FROM evidence_event WHERE evidence_id=?", (first,)
+        ).fetchone()
+    assert "2025-01-06" in row["structured_fields"]  # first lineage remains immutable
+
+
 def test_caller_hash_cannot_bypass_canonical_content_deduplication(store):
     first = add(store, {"same": True}, "2025-01-05", content_hash="claimed-one")
     second = add(store, {"same": True}, "2025-01-05", content_hash="claimed-two")
