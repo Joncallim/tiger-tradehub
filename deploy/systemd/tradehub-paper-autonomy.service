@@ -3,12 +3,19 @@ Description=TradeHub autonomous PAPER runner (after the M/W/F research cycle)
 
 [Service]
 Type=oneshot
-User=jon
-Group=jon
-WorkingDirectory=/home/jon/tiger-tradehub-main
-EnvironmentFile=/etc/tradehub/research.env
-Environment=TRADEHUB_RESEARCH_DIR=/home/jon/tiger-tradehub-main/data/research
-ExecStart=/home/jon/tiger-tradehub-main/.venv/bin/python -m tradehub.autonomy.runner
+User=tradehub-autonomy
+Group=tradehub-autonomy
+WorkingDirectory=/opt/tiger-tradehub
+EnvironmentFile=/etc/tradehub/autonomy.env
+Environment=TRADEHUB_RESEARCH_DIR=/var/lib/tradehub-research
+ExecStart=/opt/tiger-tradehub/.venv/bin/python -m tradehub.autonomy.runner
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tradehub-research/autonomy /var/lib/tradehub/autonomy/proposals
+ReadOnlyPaths=/var/lib/tradehub/autonomy/kill_switch
+InaccessiblePaths=/etc/tradehub/execution.env /etc/tradehub/research.env /etc/tradehub/tiger_private_key.pk8
 # The runner is the deterministic autonomous-PAPER actor: zero eligible
 # proposals => zero orders; every write goes through the guarded execution
 # API with autonomous=True (kill-switch enforced at the broker boundary).

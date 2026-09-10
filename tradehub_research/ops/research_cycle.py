@@ -22,7 +22,11 @@ from tradehub_research.ops.common import ResearchPaths, last_completed_us_sessio
 from tradehub_research.screen_store import ScreenStore
 from tradehub_research.screening import ScreeningConfig, run_screening
 from tradehub_research.validation.experiment_db import ExperimentDB
-from tradehub_research.validation.scoring_replay import replay_scoring
+from tradehub_research.ops.decision_pipeline import (
+    persist_ready_scores,
+    queue_committee_work,
+    run_portfolio_decision,
+)
 
 CYCLE_ALGORITHM = "research-cycle-v1"
 
@@ -63,6 +67,7 @@ def run_research_cycle(
     """Run one deterministic research cycle. Returns the cycle summary."""
     paths = paths or research_paths()
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
+    research_db.migrate()
     as_of_str = (as_of or last_completed_us_session()).isoformat()
     as_of_ts = f"{as_of_str}T20:15:00Z"
 
@@ -81,16 +86,6 @@ def run_research_cycle(
     store = ScreenStore(research_db)
     results = store.load_results_for_funnel(run_id)
     logical_material = store.logical_material(run_id)
-
-    # Full semantic rows for scoring (raw features + evidence + reason codes).
-    with research_db.connect(read_only=True) as conn:
-        full_rows = conn.execute(
-            "SELECT sr.*, sd.family FROM screen_result sr "
-            "JOIN screen_definition sd ON sd.config_hash=sr.config_hash "
-            "WHERE sr.run_id=? ORDER BY sr.security_id, sd.family",
-            (run_id,),
-        ).fetchall()
-    full_screens = [dict(r) for r in full_rows]
 
     # Convert the store's dict rows into funnel-facing result rows.
     from tradehub_research.funnel import FunnelResultRow
@@ -128,44 +123,16 @@ def run_research_cycle(
         cluster_lookup={},
     )
 
-    # Deterministic scoring over the screened population (per security; the
-    # scoring layer consumes ONE security's family rows at a time). Only
-    # securities with sufficient data are scored; the rest are recorded as
-    # insufficient in the summary.
-
-    def _semantic_screen(raw: dict) -> dict:
-        return {
-            "family": raw["family"],
-            "screen_id": raw.get("screen_id", raw.get("family", "unknown")),
-            "screen_version": raw.get("screen_version", "v1"),
-            "feature_schema_version": raw.get("feature_schema_version", "v1"),
-            "config_hash": raw["config_hash"],
-            "sufficient_data": bool(raw.get("sufficient_data")),
-            "passed": bool(raw.get("passed")),
-            "confidence": float(raw.get("confidence") or 0.0),
-            "data_quality": float(raw.get("data_quality") or 0.0),
-            "reason_codes": json.loads(raw.get("reason_codes_json") or "[]"),
-            "evidence_ids": json.loads(raw.get("evidence_ids_json") or "[]"),
-            "raw_features": json.loads(raw.get("raw_features_json") or "{}"),
-        }
-
-    by_security: dict[str, list[dict]] = {}
-    for raw in full_screens:
-        by_security.setdefault(str(raw["security_id"]), []).append(_semantic_screen(raw))
-
-    scores: dict[str, dict] = {}
-    insufficient_count = 0
-    for security_id, family_screens in sorted(by_security.items()):
-        if not any(s["sufficient_data"] for s in family_screens):
-            insufficient_count += 1
-            continue
-        try:
-            scores[security_id] = replay_scoring(screens=family_screens, evidence=[])
-        except Exception:  # noqa: BLE001 -- a scoring defect must not kill the cycle
-            scores[security_id] = {"scoring_error": True}
-
     candidate_ids = [c.security_id for c in candidates]
-    {sid: scores.get(sid, {}) for sid in candidate_ids}
+    # Phase 2 owns score persistence.  The old replay-only calculation was a
+    # validation helper masquerading as an operational score and left the
+    # decision ledger empty.  Queue actual committee work, score only READY
+    # committee runs, then call the existing Phase-3 engine.
+    committee = queue_committee_work(research_db, run_id)
+    scores = persist_ready_scores(research_db, run_id)
+    decision = run_portfolio_decision(
+        research_db, pipeline_run_id=run_id, decision_as_of=as_of_ts
+    )
 
     summary = {
         "status": "OK",
@@ -177,18 +144,11 @@ def run_research_cycle(
         "candidates": candidate_ids[:50],
         "candidate_count": len(candidate_ids),
         "blocking_flags": flags,
-        "scored_securities": len(scores),
-        "insufficient_securities": insufficient_count,
-        "candidate_scores": {
-            sid: {
-                k: v
-                for k, v in (scores.get(sid) or {}).items()
-                if k
-                in ("base", "missing", "low_quality", "staleness", "conviction", "scoring_error")
-            }
-            for sid in candidate_ids
-        },
-        "committee_needed": bool(candidates),
+        "committee": committee,
+        "score_snapshot_ids": scores["score_snapshots"],
+        "committee_pending": scores["committee_pending"],
+        "decision": decision,
+        "committee_needed": bool(committee["committee_runs"]),
         "created_at": utc_now(),
     }
 

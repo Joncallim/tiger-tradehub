@@ -42,7 +42,7 @@ def operator_status(
             except ValueError:
                 last_cycle = None
 
-    # Proposals: latest portfolio_run row (if any).
+    # Decision ledger: a no-proposal run is first-class, not an error.
     proposal = None
     with research_db.connect(read_only=True) as conn:
         try:
@@ -99,8 +99,14 @@ def operator_status(
             else {"last_cycle": None}
         ),
         "candidates_current": (last_cycle.get("candidates", []) if last_cycle else []),
-        "portfolio_status": {"last_proposal": proposal},
-        "proposal_status": {"pending_approvals": 0, "note": "no autonomous paper (#51)"},
+        "portfolio_status": {
+            "last_run": proposal,
+            "decision_status": (last_cycle or {}).get("decision", {}).get("status"),
+        },
+        "proposal_status": {
+            "eligible_exports": len((last_cycle or {}).get("decision", {}).get("eligible_exports", [])),
+            "classification": (last_cycle or {}).get("decision", {}).get("status"),
+        },
         "validation_forward": {
             "production_predictions": fwd["production_predictions"],
             "predictions_due": fwd["predictions_due"],
