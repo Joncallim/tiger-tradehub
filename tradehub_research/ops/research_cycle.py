@@ -130,9 +130,7 @@ def run_research_cycle(
     # committee runs, then call the existing Phase-3 engine.
     committee = queue_committee_work(research_db, run_id)
     scores = persist_ready_scores(research_db, run_id)
-    decision = run_portfolio_decision(
-        research_db, pipeline_run_id=run_id, decision_as_of=as_of_ts
-    )
+    decision = run_portfolio_decision(research_db, pipeline_run_id=run_id, decision_as_of=as_of_ts)
 
     summary = {
         "status": "OK",

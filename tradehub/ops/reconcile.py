@@ -17,6 +17,7 @@ State:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,9 @@ from pathlib import Path
 ANALYTICS_DIR = Path("/var/lib/tradehub/analytics")
 HISTORY = ANALYTICS_DIR / "history.jsonl"
 LATEST = ANALYTICS_DIR / "latest.json"
+# Execution writes this credential-free handoff; research reads it but never
+# gains broker credentials or the execution audit DB.
+RESEARCH_HANDOFF = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.json")
 
 
 def _num(value) -> float | None:
@@ -98,12 +102,51 @@ def _persist(row: dict) -> None:
     LATEST.write_text(json.dumps(row, sort_keys=True, indent=2) + "\n")
 
 
+def _sanitize_position(value: dict) -> dict:
+    """Allow-list broker position fields; never copy account/credential data."""
+    allowed = {
+        "symbol",
+        "quantity",
+        "available_quantity",
+        "market_value",
+        "average_cost",
+        "latest_price",
+        "currency",
+    }
+    return {key: value.get(key) for key in sorted(allowed) if key in value}
+
+
+def _handoff_payload(row: dict, positions: list[dict]) -> dict:
+    """Credential-free execution→research PAPER portfolio state contract."""
+    return {
+        "schema_version": "paper-portfolio-handoff-v1",
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "account_type": row.get("account_type"),
+        "account_status": row.get("account_status"),
+        "asset_value": row.get("asset_value"),
+        "cash_balance": row.get("cash_balance"),
+        "positions": [_sanitize_position(item) for item in positions if isinstance(item, dict)],
+    }
+
+
+def _persist_research_handoff(payload: dict, path: Path | None = None) -> None:
+    """Atomic replace; a partial handoff is never visible to research."""
+    path = path or RESEARCH_HANDOFF
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    os.chmod(temporary, 0o640)
+    temporary.replace(path)
+
+
 def reconcile(gateway) -> dict:
-    """Query the broker (read-only) and persist the sanitized snapshot."""
+    """Read broker state and persist analytics plus a sanitized research handoff."""
     proof = gateway.proof_paper_environment()
     assets = gateway.get_assets() or {}
+    positions = gateway.get_positions()
     row = _build_row(assets, proof)
     _persist(row)
+    _persist_research_handoff(_handoff_payload(row, positions))
     return row
 
 

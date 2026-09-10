@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
@@ -197,3 +200,65 @@ def test_research_cycle_queues_real_committee_work_and_never_fakes_score(tmp_pat
         assert conn.execute("SELECT count(*) FROM portfolio_run").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM trade_proposal").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM committee_run").fetchone()[0] >= 0
+
+
+def test_sanitized_empty_paper_handoff_builds_known_empty_snapshot(tmp_path):
+    from tradehub_research.ops.decision_pipeline import load_sanitized_paper_snapshot
+
+    handoff = tmp_path / "paper.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "schema_version": "paper-portfolio-handoff-v1",
+                "as_of": "2026-08-28T19:00:00Z",
+                "account_type": "PAPER",
+                "account_status": "Funded",
+                "asset_value": 1_000_000.0,
+                "cash_balance": 1_000_000.0,
+                "positions": [],
+            }
+        )
+    )
+    snapshot = load_sanitized_paper_snapshot(
+        decision_as_of="2026-08-28T20:15:00Z", pipeline_run_id="run", path=handoff
+    )
+    assert snapshot.cash_microusd == 1_000_000_000_000
+    assert snapshot.nav_microusd == 1_000_000_000_000
+    assert snapshot.holdings_status.value == "KNOWN"
+    assert snapshot.holdings == ()
+
+
+@pytest.mark.parametrize(
+    "handoff",
+    [
+        {},
+        {
+            "as_of": "2026-08-28T19:00:00Z",
+            "account_type": "LIVE",
+            "account_status": "Funded",
+            "asset_value": 1,
+            "cash_balance": 1,
+            "positions": [],
+        },
+        {
+            "as_of": "2026-08-28T19:00:00Z",
+            "account_type": "PAPER",
+            "account_status": "Funded",
+            "asset_value": 1,
+            "cash_balance": 1,
+            "positions": [{"symbol": "AAPL"}],
+        },
+    ],
+)
+def test_bad_sanitized_handoff_fails_closed(tmp_path, handoff):
+    from tradehub_research.ops.decision_pipeline import (
+        PortfolioStateUnavailable,
+        load_sanitized_paper_snapshot,
+    )
+
+    path = tmp_path / "paper.json"
+    path.write_text(json.dumps(handoff))
+    with pytest.raises(PortfolioStateUnavailable):
+        load_sanitized_paper_snapshot(
+            decision_as_of="2026-08-28T20:15:00Z", pipeline_run_id="run", path=path
+        )

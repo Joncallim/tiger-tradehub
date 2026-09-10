@@ -18,6 +18,8 @@ install -d -o root -g root -m 0755 /opt/tiger-tradehub
 # The service identities need read/execute access to this root-owned tree.
 install -d -o tradehub-execution -g tradehub-execution -m 0750 /var/lib/tradehub
 install -d -o tradehub-research -g tradehub-research -m 0750 /var/lib/tradehub-research
+# Setgid handoff: execution owns writes; research group has read-only access.
+install -d -o tradehub-execution -g tradehub-research -m 2750 /var/lib/tradehub-research/handoff
 install -d -o tradehub-execution -g tradehub-autonomy -m 0750 /var/lib/tradehub/autonomy
 install -d -o tradehub-autonomy -g tradehub-autonomy -m 0770 /var/lib/tradehub/autonomy/proposals
 install -d -o tradehub-autonomy -g tradehub-autonomy -m 0750 /var/lib/tradehub-research/autonomy

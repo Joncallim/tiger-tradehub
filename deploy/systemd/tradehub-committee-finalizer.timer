@@ -1,0 +1,11 @@
+[Unit]
+Description=TradeHub asynchronous committee decision finalizer timer
+
+[Timer]
+# Asynchronous committee submissions may arrive after the M/W/F cycle. This
+# timer only finalizes persisted READY_TO_SCORE work; it never invokes a model.
+OnCalendar=*:05/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target

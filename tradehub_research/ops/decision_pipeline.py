@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,87 @@ from tradehub_research.portfolio.types import PolicyStatus
 
 PAPER_PROVISIONAL_POLICY_VERSION = "paper-provisional-v1"
 DEFAULT_AUTONOMY_INBOX = Path("/var/lib/tradehub/autonomy/proposals")
+DEFAULT_PORTFOLIO_HANDOFF = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.json")
+
+
+class PortfolioStateUnavailable(ValueError):
+    """The execution-owned portfolio handoff cannot prove a usable PAPER state."""
+
+
+def _microusd(value: Any, field: str) -> int:
+    """Strict dollars -> micro-USD conversion; floats never silently round."""
+    try:
+        decimal = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise PortfolioStateUnavailable(f"{field} is not a decimal amount") from exc
+    if not decimal.is_finite() or decimal < 0:
+        raise PortfolioStateUnavailable(f"{field} must be a finite non-negative amount")
+    return int((decimal * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def load_sanitized_paper_snapshot(
+    *,
+    decision_as_of: str,
+    pipeline_run_id: str,
+    path: Path | None = None,
+):
+    """Load the execution-owned, credential-free PAPER portfolio handoff.
+
+    Research never calls the broker or reads execution credentials. A missing,
+    stale, malformed, non-PAPER, or nonempty-unmapped handoff is fail-closed.
+    An explicitly empty broker positions list is a known empty book and is a
+    valid no-action portfolio snapshot.
+    """
+    path = path or Path(os.environ.get("TRADEHUB_PORTFOLIO_HANDOFF", DEFAULT_PORTFOLIO_HANDOFF))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise PortfolioStateUnavailable(
+            f"sanitized portfolio handoff unavailable: {type(exc).__name__}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PortfolioStateUnavailable("sanitized portfolio handoff is not an object")
+    if payload.get("account_type") != "PAPER":
+        raise PortfolioStateUnavailable(
+            "sanitized portfolio handoff does not prove PAPER account type"
+        )
+    if payload.get("account_status") not in {"Open", "Funded", "New"}:
+        raise PortfolioStateUnavailable("sanitized portfolio handoff account status is unusable")
+    handoff_as_of = str(payload.get("as_of", ""))
+    try:
+        handoff_time = datetime.fromisoformat(handoff_as_of.replace("Z", "+00:00"))
+        decision_time = datetime.fromisoformat(normalize_ts(decision_as_of).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PortfolioStateUnavailable("sanitized portfolio handoff as_of is invalid") from exc
+    if handoff_time > decision_time:
+        raise PortfolioStateUnavailable("sanitized portfolio handoff is after decision_as_of")
+    # One market-session / weekend buffer.  The runner separately rejects
+    # stale market data; the portfolio state is deliberately conservative.
+    if (decision_time - handoff_time).total_seconds() > 78 * 3600:
+        raise PortfolioStateUnavailable("sanitized portfolio handoff is stale")
+    positions = payload.get("positions")
+    if not isinstance(positions, list):
+        raise PortfolioStateUnavailable("sanitized portfolio positions are missing")
+    if positions:
+        # Symbol->security mapping and trustworthy position valuation are not
+        # yet handed off. Never interpret a nonempty book as empty.
+        raise PortfolioStateUnavailable("nonempty broker positions lack a typed research mapping")
+    return build_snapshot(
+        normalize_ts(decision_as_of),
+        cash_microusd=_microusd(payload.get("cash_balance"), "cash_balance"),
+        cash_status="KNOWN",
+        nav_microusd=_microusd(payload.get("asset_value"), "asset_value"),
+        valuation_status="KNOWN",
+        holdings_status="KNOWN",
+        provenance={
+            "kind": "execution_sanitized_paper_handoff_v1",
+            "pipeline_run_id": pipeline_run_id,
+            "handoff_as_of": handoff_as_of,
+            "handoff_path": str(path),
+        },
+        holdings=[],
+        market_inputs=[],
+    )
 
 
 def _policy_spec() -> dict[str, Any]:
@@ -147,6 +230,18 @@ def export_eligible_proposals(
     inbox = inbox or Path(os.environ.get("TRADEHUB_AUTONOMY_INBOX", DEFAULT_AUTONOMY_INBOX))
     exported: list[str] = []
     with database.connect(read_only=True) as conn:
+        total = conn.execute(
+            "SELECT count(*) FROM trade_proposal p "
+            "JOIN portfolio_state_observation o ON o.decision_id=p.decision_id "
+            "WHERE o.run_id=?",
+            (run_id,),
+        ).fetchone()[0]
+        blocked_human_approval = conn.execute(
+            "SELECT count(*) FROM trade_proposal p "
+            "JOIN portfolio_state_observation o ON o.decision_id=p.decision_id "
+            "WHERE o.run_id=? AND p.requires_human_approval=1",
+            (run_id,),
+        ).fetchone()[0]
         rows = conn.execute(
             "SELECT p.*, s.canonical_ticker, ps.as_of AS data_as_of, m.mark_price_microusd, "
             "h.quantity_microunits AS current_quantity_microunits, "
@@ -161,7 +256,8 @@ def export_eligible_proposals(
             "LEFT JOIN portfolio_holding h ON h.snapshot_id=p.portfolio_snapshot_id "
             "AND h.security_id=p.security_id "
             "WHERE o.run_id=? AND pp.policy_status!='FIXTURE' "
-            "AND p.proposal_mode='PAPER' ORDER BY p.proposal_id",
+            "AND p.proposal_mode='PAPER' AND p.requires_human_approval=0 "
+            "ORDER BY p.proposal_id",
             (run_id,),
         ).fetchall()
     inbox.mkdir(parents=True, exist_ok=True)
@@ -198,7 +294,11 @@ def export_eligible_proposals(
             temporary.write_text(body, encoding="utf-8")
             temporary.replace(path)
         exported.append(str(row["proposal_id"]))
-    return {"eligible_exports": exported}
+    return {
+        "proposal_count": total,
+        "blocked_human_approval": blocked_human_approval,
+        "eligible_exports": exported,
+    }
 
 
 def run_portfolio_decision(
@@ -227,10 +327,18 @@ def run_portfolio_decision(
         ).fetchone()[0]
     if not score_count:
         return {"status": "BLOCKED_NO_VALID_SCORE", "portfolio_run": None, "eligible_exports": []}
-    missing_portfolio_state = snapshot is None
-    snapshot = snapshot or unknown_portfolio_snapshot(
-        decision_as_of=decision_as_of, pipeline_run_id=pipeline_run_id
-    )
+    try:
+        snapshot = snapshot or load_sanitized_paper_snapshot(
+            decision_as_of=decision_as_of,
+            pipeline_run_id=pipeline_run_id,
+        )
+    except PortfolioStateUnavailable as exc:
+        return {
+            "status": "BLOCKED_MISSING_PORTFOLIO_STATE",
+            "reason": str(exc),
+            "portfolio_run": None,
+            "eligible_exports": [],
+        }
     summary = PortfolioEngine(database).run(
         pipeline_run_id=pipeline_run_id,
         policy_version=policy_version,
@@ -240,12 +348,98 @@ def run_portfolio_decision(
         allow_fixture=False,
     )
     exported = export_eligible_proposals(database, run_id=summary.run_id, inbox=inbox)
+    if exported["eligible_exports"]:
+        status = "PROPOSALS_EXPORTED"
+    elif exported["blocked_human_approval"]:
+        status = "BLOCKED_REQUIRES_HUMAN_APPROVAL"
+    else:
+        status = "HEALTHY_ZERO_ACTION"
     return {
-        "status": (
-            "BLOCKED_MISSING_PORTFOLIO_STATE"
-            if missing_portfolio_state
-            else ("HEALTHY_ZERO_ACTION" if summary.proposal_count == 0 else "PROPOSALS_EXPORTED")
-        ),
+        "status": status,
         "portfolio_run": summary.as_dict(),
         **exported,
     }
+
+
+def finalize_async_committee_decisions(
+    database: ResearchDB,
+    *,
+    inbox: Path | None = None,
+    handoff: Path | None = None,
+) -> dict[str, Any]:
+    """Advance asynchronous committee work without calling a model.
+
+    Committee workers submit independently through the existing API. This
+    finalizer periodically detects only their persisted READY_TO_SCORE result,
+    creates immutable score snapshots, then runs the existing portfolio engine
+    and proposal exporter. Any invalid/missing state becomes an explicit
+    blocked result; it never manufactures an assessment, score, proposal, or
+    executable order.
+    """
+    with database.connect(read_only=True) as conn:
+        runs = conn.execute(
+            "SELECT DISTINCT pipeline_run_id FROM committee_run ORDER BY pipeline_run_id"
+        ).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in runs:
+        pipeline_run_id = str(row["pipeline_run_id"])
+        scores = persist_ready_scores(database, pipeline_run_id)
+        if not scores["score_snapshots"]:
+            results.append(
+                {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": "PENDING_COMMITTEE",
+                    **scores,
+                    "eligible_exports": [],
+                }
+            )
+            continue
+        with database.connect(read_only=True) as conn:
+            run_row = conn.execute(
+                "SELECT as_of FROM pipeline_run WHERE run_id=?", (pipeline_run_id,)
+            ).fetchone()
+        if run_row is None:
+            results.append(
+                {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": "BLOCKED_MISSING_PIPELINE_RUN",
+                    **scores,
+                    "eligible_exports": [],
+                }
+            )
+            continue
+        try:
+            decision = run_portfolio_decision(
+                database,
+                pipeline_run_id=pipeline_run_id,
+                decision_as_of=str(run_row["as_of"]),
+                inbox=inbox,
+                snapshot=(
+                    load_sanitized_paper_snapshot(
+                        decision_as_of=str(run_row["as_of"]),
+                        pipeline_run_id=pipeline_run_id,
+                        path=handoff,
+                    )
+                    if handoff is not None
+                    else None
+                ),
+            )
+        except (ValueError, OSError) as exc:
+            decision = {
+                "status": "BLOCKED_FINALIZER_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "eligible_exports": [],
+            }
+        results.append({"pipeline_run_id": pipeline_run_id, **scores, **decision})
+    return {"status": "OK", "finalized": results, "created_at": utc_now()}
+
+
+__all__ = [
+    "ensure_paper_provisional_policy",
+    "export_eligible_proposals",
+    "finalize_async_committee_decisions",
+    "load_sanitized_paper_snapshot",
+    "persist_ready_scores",
+    "queue_committee_work",
+    "run_portfolio_decision",
+]
