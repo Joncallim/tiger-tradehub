@@ -102,7 +102,8 @@ def persist_ready_scores(database: ResearchDB, pipeline_run_id: str) -> dict[str
     pending = 0
     with database.connect(read_only=True) as conn:
         rows = conn.execute(
-            "SELECT committee_run_id FROM committee_run WHERE pipeline_run_id=? ORDER BY committee_run_id",
+            "SELECT committee_run_id FROM committee_run WHERE pipeline_run_id=? "
+            "ORDER BY committee_run_id",
             (pipeline_run_id,),
         ).fetchall()
     for row in rows:

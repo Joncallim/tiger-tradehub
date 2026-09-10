@@ -104,7 +104,9 @@ def operator_status(
             "decision_status": (last_cycle or {}).get("decision", {}).get("status"),
         },
         "proposal_status": {
-            "eligible_exports": len((last_cycle or {}).get("decision", {}).get("eligible_exports", [])),
+            "eligible_exports": len(
+                (last_cycle or {}).get("decision", {}).get("eligible_exports", [])
+            ),
             "classification": (last_cycle or {}).get("decision", {}).get("status"),
         },
         "validation_forward": {

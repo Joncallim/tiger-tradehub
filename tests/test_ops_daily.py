@@ -10,10 +10,10 @@ from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
 from tradehub_research.ops.common import ResearchPaths, last_completed_us_session
 from tradehub_research.ops.forward_capture import capture_production_predictions
-from tradehub_research.ops.research_cycle import run_research_cycle
 from tradehub_research.ops.health import forward_health
 from tradehub_research.ops.outcome_maturation import mature_due_outcomes
 from tradehub_research.ops.report_cli import build_daily_report
+from tradehub_research.ops.research_cycle import run_research_cycle
 from tradehub_research.screening import ScreeningConfig, run_screening
 from tradehub_research.validation.experiment_db import ExperimentDB
 
