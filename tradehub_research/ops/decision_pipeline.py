@@ -35,6 +35,9 @@ from tradehub_research.portfolio.types import PolicyStatus
 PAPER_PROVISIONAL_POLICY_VERSION = "paper-provisional-v1"
 DEFAULT_AUTONOMY_INBOX = Path("/var/lib/tradehub/autonomy/proposals")
 DEFAULT_PORTFOLIO_HANDOFF = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.json")
+DEFAULT_PORTFOLIO_HANDOFF_HISTORY = Path(
+    "/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.jsonl"
+)
 
 
 class PortfolioStateUnavailable(ValueError):
@@ -52,6 +55,39 @@ def _microusd(value: Any, field: str) -> int:
     return int((decimal * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
 
 
+def _load_handoff_at_or_before(
+    *,
+    decision_as_of: str,
+    path: Path | None,
+) -> dict[str, Any]:
+    """Choose the latest sanitized handoff knowable at decision_as_of."""
+    if path is not None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PortfolioStateUnavailable(
+                f"sanitized portfolio handoff unavailable: {type(exc).__name__}"
+            ) from exc
+        return payload
+    try:
+        decision_time = datetime.fromisoformat(normalize_ts(decision_as_of).replace("Z", "+00:00"))
+        candidates = []
+        for line in DEFAULT_PORTFOLIO_HANDOFF_HISTORY.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            observed = datetime.fromisoformat(str(item.get("as_of", "")).replace("Z", "+00:00"))
+            if observed <= decision_time:
+                candidates.append((observed, item))
+    except (OSError, ValueError) as exc:
+        raise PortfolioStateUnavailable(
+            f"sanitized portfolio handoff history unavailable: {type(exc).__name__}"
+        ) from exc
+    if not candidates:
+        raise PortfolioStateUnavailable("no sanitized portfolio handoff precedes decision_as_of")
+    return max(candidates, key=lambda pair: pair[0])[1]
+
+
 def load_sanitized_paper_snapshot(
     *,
     decision_as_of: str,
@@ -65,13 +101,7 @@ def load_sanitized_paper_snapshot(
     An explicitly empty broker positions list is a known empty book and is a
     valid no-action portfolio snapshot.
     """
-    path = path or Path(os.environ.get("TRADEHUB_PORTFOLIO_HANDOFF", DEFAULT_PORTFOLIO_HANDOFF))
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise PortfolioStateUnavailable(
-            f"sanitized portfolio handoff unavailable: {type(exc).__name__}"
-        ) from exc
+    payload = _load_handoff_at_or_before(decision_as_of=decision_as_of, path=path)
     if not isinstance(payload, dict):
         raise PortfolioStateUnavailable("sanitized portfolio handoff is not an object")
     if payload.get("account_type") != "PAPER":

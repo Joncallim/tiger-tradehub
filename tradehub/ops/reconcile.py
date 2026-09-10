@@ -28,6 +28,7 @@ LATEST = ANALYTICS_DIR / "latest.json"
 # Execution writes this credential-free handoff; research reads it but never
 # gains broker credentials or the execution audit DB.
 RESEARCH_HANDOFF = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.json")
+RESEARCH_HANDOFF_HISTORY = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.jsonl")
 
 
 def _num(value) -> float | None:
@@ -130,7 +131,7 @@ def _handoff_payload(row: dict, positions: list[dict]) -> dict:
 
 
 def _persist_research_handoff(payload: dict, path: Path | None = None) -> None:
-    """Atomic replace; a partial handoff is never visible to research."""
+    """Atomic replace for the operator-visible latest snapshot."""
     path = path or RESEARCH_HANDOFF
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -139,14 +140,25 @@ def _persist_research_handoff(payload: dict, path: Path | None = None) -> None:
     temporary.replace(path)
 
 
+def _append_research_handoff(payload: dict, path: Path | None = None) -> None:
+    """Append immutable sanitized snapshots for PIT portfolio reconstruction."""
+    path = path or RESEARCH_HANDOFF_HISTORY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    os.chmod(path, 0o640)
+
+
 def reconcile(gateway) -> dict:
     """Read broker state and persist analytics plus a sanitized research handoff."""
     proof = gateway.proof_paper_environment()
     assets = gateway.get_assets() or {}
     positions = gateway.get_positions()
     row = _build_row(assets, proof)
+    payload = _handoff_payload(row, positions)
     _persist(row)
-    _persist_research_handoff(_handoff_payload(row, positions))
+    _persist_research_handoff(payload)
+    _append_research_handoff(payload)
     return row
 
 

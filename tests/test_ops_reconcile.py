@@ -73,13 +73,16 @@ def test_reconcile_roundtrip_with_fake_gateway(tmp_path):
     rec.HISTORY = rec.ANALYTICS_DIR / "history.jsonl"
     rec.LATEST = rec.ANALYTICS_DIR / "latest.json"
     rec.RESEARCH_HANDOFF = tmp_path / "research" / "paper_portfolio_snapshot.json"
+    rec.RESEARCH_HANDOFF_HISTORY = tmp_path / "research" / "paper_portfolio_snapshot.jsonl"
     row = rec.reconcile(FakeGateway())
     assert row["asset_value"] == 100_000.0
     assert row["account_type"] == "PAPER"
     assert rec.LATEST.exists()
     handoff = json.loads(rec.RESEARCH_HANDOFF.read_text())
+    history = [json.loads(line) for line in rec.RESEARCH_HANDOFF_HISTORY.read_text().splitlines()]
     assert handoff["account_type"] == "PAPER"
     assert handoff["positions"] == []
+    assert len(history) == 1
     assert "account" not in handoff  # account identifiers never cross the boundary
 
 

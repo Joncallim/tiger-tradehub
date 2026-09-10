@@ -262,3 +262,38 @@ def test_bad_sanitized_handoff_fails_closed(tmp_path, handoff):
         load_sanitized_paper_snapshot(
             decision_as_of="2026-08-28T20:15:00Z", pipeline_run_id="run", path=path
         )
+
+
+def test_handoff_history_selects_only_snapshot_known_at_decision(tmp_path, monkeypatch):
+    import tradehub_research.ops.decision_pipeline as bridge
+
+    history = tmp_path / "paper.jsonl"
+    history.write_text(
+        "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "as_of": "2026-08-28T19:00:00Z",
+                    "account_type": "PAPER",
+                    "account_status": "Funded",
+                    "asset_value": 100.0,
+                    "cash_balance": 100.0,
+                    "positions": [],
+                },
+                {
+                    "as_of": "2026-08-29T19:00:00Z",
+                    "account_type": "PAPER",
+                    "account_status": "Funded",
+                    "asset_value": 200.0,
+                    "cash_balance": 200.0,
+                    "positions": [],
+                },
+            )
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(bridge, "DEFAULT_PORTFOLIO_HANDOFF_HISTORY", history)
+    snapshot = bridge.load_sanitized_paper_snapshot(
+        decision_as_of="2026-08-28T20:15:00Z", pipeline_run_id="run"
+    )
+    assert snapshot.nav_microusd == 100_000_000
