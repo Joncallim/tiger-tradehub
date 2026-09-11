@@ -130,6 +130,69 @@ def _resolve_ticker(research_db: ResearchDB | None):
     return resolve
 
 
+def _validate_persisted_proposal(
+    research_db: ResearchDB | None, envelope: dict, *, fixture: bool
+) -> None:
+    """Bind a runnable envelope to the immutable research decision ledger.
+
+    Files in the shared inbox are transport, not authority.  Real proposals
+    must exist in the same research database, remain PAPER/non-FIXTURE, be
+    explicitly autonomous-eligible, and agree on all order-driving identity
+    fields.  Only marked acceptance fixtures bypass this database check.
+    """
+    if fixture:
+        return
+    if research_db is None:
+        raise AutonomyRefusal("research ledger unavailable; refusing non-fixture envelope")
+    proposal = envelope.get("proposal")
+    if not isinstance(proposal, dict):
+        raise AutonomyRefusal("envelope has no typed proposal")
+    proposal_id = proposal.get("proposal_id")
+    if not isinstance(proposal_id, str) or not proposal_id:
+        raise AutonomyRefusal("proposal missing proposal_id")
+    try:
+        with research_db.connect(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT p.proposal_id,p.security_id,p.action,p.max_quantity_microunits,"
+                "p.completion_quantity_microunits,p.max_notional_microusd,p.target_weight_ppm,"
+                "p.current_weight_ppm,p.score_snapshot_id,p.portfolio_snapshot_id,"
+                "p.policy_version,p.sizing_policy_version,p.proposal_mode,"
+                "p.requires_human_approval,s.canonical_ticker,ps.as_of AS data_as_of,"
+                "pp.policy_status FROM trade_proposal p "
+                "JOIN portfolio_policy pp ON pp.policy_version=p.policy_version "
+                "JOIN security s ON s.security_id=p.security_id "
+                "JOIN portfolio_snapshot ps ON ps.snapshot_id=p.portfolio_snapshot_id "
+                "WHERE p.proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001 -- closed boundary on ledger failure
+        raise AutonomyRefusal(f"research ledger lookup failed: {type(exc).__name__}") from exc
+    if row is None:
+        raise AutonomyRefusal("proposal is absent from persisted research ledger")
+    if row["proposal_mode"] != "PAPER" or row["policy_status"] == "FIXTURE":
+        raise AutonomyRefusal("persisted proposal is not eligible PAPER/non-FIXTURE")
+    if str(envelope.get("symbol", "")).upper() != str(row["canonical_ticker"]).upper():
+        raise AutonomyRefusal("envelope symbol does not match persisted proposal")
+    if str(envelope.get("data_as_of", ""))[:10] != str(row["data_as_of"])[:10]:
+        raise AutonomyRefusal("envelope data_as_of does not match persisted proposal")
+    fields = (
+        "security_id",
+        "action",
+        "max_quantity_microunits",
+        "completion_quantity_microunits",
+        "max_notional_microusd",
+        "target_weight_ppm",
+        "current_weight_ppm",
+        "score_snapshot_id",
+        "portfolio_snapshot_id",
+        "policy_version",
+        "sizing_policy_version",
+    )
+    for field in fields:
+        if proposal.get(field) != row[field]:
+            raise AutonomyRefusal(f"envelope {field} does not match persisted proposal")
+
+
 def _proposal_age_ok(proposal: dict, policy: PaperAutonomyPolicy, now: datetime) -> bool:
     created = proposal.get("created_at") or proposal.get("exported_at")
     if not created:
@@ -310,6 +373,11 @@ def run_autonomy(
         proposal_id = proposal.get("proposal_id", path.stem)
         try:
             _validate_envelope(envelope, policy, now)
+            _validate_persisted_proposal(
+                research_db,
+                envelope,
+                fixture=bool(envelope.get("fixture")),
+            )
             _validate_exposure(proposal, policy)
             symbol = str(envelope.get("symbol") or "").upper()
             if not symbol:

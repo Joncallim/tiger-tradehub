@@ -71,7 +71,7 @@ def _envelope(
     action: str = "BUY",
     symbol: str = "AAPL",
     data_as_of: str = "2026-08-31",
-    fixture: bool = False,
+    fixture: bool = True,
     fixture_tag: str | None = None,
     created_at: str | None = None,
     quantity: int = 100_000_000,

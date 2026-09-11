@@ -33,7 +33,7 @@ from tradehub_research.portfolio.handoff import (
     load_paper_portfolio_snapshot_payload,
 )
 from tradehub_research.portfolio.policy import PolicyRegistry, build_policy
-from tradehub_research.portfolio.snapshot import build_snapshot
+from tradehub_research.portfolio.snapshot import build_signal_input, build_snapshot
 from tradehub_research.portfolio.types import PolicyStatus
 
 PAPER_PROVISIONAL_POLICY_VERSION = "paper-provisional-v1"
@@ -291,12 +291,51 @@ def export_eligible_proposals(
         exported.append(str(row["proposal_id"]))
     return {
         "proposal_count": total,
-        # Phase-3's requires_human_approval is an immutable proposal lineage
-        # fact. Phase-6 independently decides autonomous PAPER eligibility;
-        # it must not be repurposed into a hidden second policy gate here.
         "blocked_human_approval": 0,
         "eligible_exports": exported,
     }
+
+
+def load_persisted_signal_inputs(database: ResearchDB, *, decision_as_of: str) -> list:
+    """Load only independently persisted, PIT-valid signal inputs.
+
+    This bridge creates no signals and interprets no score into an opportunity.
+    It takes the latest already-recorded SignalInput per security at or before
+    the decision timestamp.  An empty table is valid and preserves zero action.
+    """
+    as_of = normalize_ts(decision_as_of)
+    with database.connect(read_only=True) as conn:
+        rows = conn.execute(
+            "WITH ranked AS ("
+            " SELECT *, ROW_NUMBER() OVER (PARTITION BY security_id ORDER BY as_of DESC, "
+            " recorded_at DESC, signal_input_id DESC) AS ordinal "
+            " FROM portfolio_signal_input WHERE as_of<=?"
+            ") SELECT * FROM ranked WHERE ordinal=1 ORDER BY security_id",
+            (as_of,),
+        ).fetchall()
+    signals = []
+    for row in rows:
+        try:
+            evidence_ids = json.loads(row["evidence_ids_json"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"persisted signal {row['signal_input_id']} has invalid evidence ids"
+            ) from exc
+        signal = build_signal_input(
+            security_id=str(row["security_id"]),
+            as_of=str(row["as_of"]),
+            remaining_opportunity_ppm=row["remaining_opportunity_ppm"],
+            opportunity_status=str(row["opportunity_status"]),
+            source_kind=str(row["source_kind"]),
+            evidence_ids=evidence_ids,
+        )
+        if (
+            signal.input_hash != row["input_hash"]
+            or signal.signal_input_id != row["signal_input_id"]
+        ):
+            raise ValueError(f"persisted signal {row['signal_input_id']} fails identity validation")
+        signals.append(signal)
+    return signals
 
 
 def run_portfolio_decision(
@@ -338,14 +377,24 @@ def run_portfolio_decision(
             "portfolio_run": None,
             "eligible_exports": [],
         }
-    summary = PortfolioEngine(database).run(
-        pipeline_run_id=pipeline_run_id,
-        policy_version=policy_version,
-        snapshot=snapshot,
-        decision_as_of=decision_as_of,
-        allow_provisional=True,
-        allow_fixture=False,
-    )
+    try:
+        signals = load_persisted_signal_inputs(database, decision_as_of=decision_as_of)
+        summary = PortfolioEngine(database).run(
+            pipeline_run_id=pipeline_run_id,
+            policy_version=policy_version,
+            snapshot=snapshot,
+            decision_as_of=decision_as_of,
+            signals=signals,
+            allow_provisional=True,
+            allow_fixture=False,
+        )
+    except ValueError as exc:
+        return {
+            "status": "BLOCKED_INVALID_SIGNAL_INPUT",
+            "reason": str(exc),
+            "portfolio_run": None,
+            "eligible_exports": [],
+        }
     exported = export_eligible_proposals(database, run_id=summary.run_id, inbox=inbox)
     if exported["eligible_exports"]:
         status = "PROPOSALS_EXPORTED"

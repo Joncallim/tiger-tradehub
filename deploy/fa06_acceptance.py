@@ -118,7 +118,7 @@ def main() -> int:
     # 6. No duplicate forward prediction (capture dedupe).
     code, out = sh(
         [
-            "/home/jon/tiger-tradehub-main/.venv/bin/python",
+            str(deploy_dir / ".venv" / "bin" / "python"),
             "-m",
             "tradehub_research.ops.forward_capture",
         ],
