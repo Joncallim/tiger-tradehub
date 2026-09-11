@@ -473,6 +473,17 @@ def run_autonomy(
                 {"proposal_id": proposal_id, "reason": f"unexpected: {type(exc).__name__}: {exc}"}
             )
 
+    _record_ledger(
+        {
+            "kind": "runner_run_receipt_v1",
+            "status": summary["status"],
+            "orders": summary["orders"],
+            "proposals_seen": summary["proposals_seen"],
+            "refusal_count": len(summary["refusals"]),
+            "at": summary["at"],
+        },
+        ledger_path=ledger,
+    )
     return summary
 
 
