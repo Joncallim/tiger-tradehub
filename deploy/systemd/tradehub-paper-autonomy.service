@@ -15,7 +15,7 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/tradehub-research/autonomy /var/lib/tradehub/autonomy/proposals
 ReadOnlyPaths=/var/lib/tradehub/autonomy/kill_switch
-InaccessiblePaths=/etc/tradehub/execution.env /etc/tradehub/research.env /etc/tradehub/tiger_private_key.pk8
+InaccessiblePaths=/etc/tradehub/execution.env /etc/tradehub/research.env -/etc/tradehub/tiger_private_key.pk8
 # The runner is the deterministic autonomous-PAPER actor: zero eligible
 # proposals => zero orders; every write goes through the guarded execution
 # API with autonomous=True (kill-switch enforced at the broker boundary).

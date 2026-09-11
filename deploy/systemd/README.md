@@ -23,6 +23,8 @@ install -d -o tradehub-execution -g tradehub-research -m 2750 /var/lib/tradehub-
 install -d -o tradehub-execution -g tradehub-autonomy -m 0750 /var/lib/tradehub/autonomy
 install -d -o tradehub-autonomy -g tradehub-autonomy -m 0770 /var/lib/tradehub/autonomy/proposals
 install -d -o tradehub-autonomy -g tradehub-autonomy -m 0750 /var/lib/tradehub-research/autonomy
+# Execution writes the handoff but only traverses the research-owned parent.
+setfacl -m u:tradehub-execution:--x /var/lib/tradehub-research
 # The research exporter can traverse the execution-owned parents and create
 # proposal envelopes, but cannot list/change either parent or read/change the
 # execution-owned kill switch.  Both parent traversal ACLs are required.
