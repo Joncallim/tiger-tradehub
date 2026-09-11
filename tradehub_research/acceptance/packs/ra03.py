@@ -2220,6 +2220,11 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_telegram_bot.py",
         "tests/test_tiger_gateway.py",
         "tests/test_ops_reconcile.py",
+        # Credential-free execution→research handoff and the end-to-end
+        # envelope→deterministic-runner contract deliberately cross the plane
+        # boundary.  They are execution integration tests, not research code.
+        "tests/test_portfolio_handoff.py",
+        "tests/test_decision_pipeline_autonomy_e2e.py",
         "tests/test_phase4_execution.py",
         "tests/test_phase4_runtime.py",
         "tests/test_phase4_runtime_production_seam.py",

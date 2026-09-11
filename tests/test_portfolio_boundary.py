@@ -59,6 +59,8 @@ SANCTIONED_FILES = {
     "tests/test_telegram_bot.py",
     "tests/test_tiger_gateway.py",
     "tests/test_ops_reconcile.py",  # execution-owned broker handoff contract
+    "tests/test_portfolio_handoff.py",  # cross-plane handoff contract test
+    "tests/test_decision_pipeline_autonomy_e2e.py",  # execution-envelope integration test
     "tests/test_phase4_execution.py",
     "tests/test_phase4_runtime.py",
     "tests/test_phase4_runtime_production_seam.py",

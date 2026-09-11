@@ -90,7 +90,29 @@ def load_paper_portfolio_snapshot(
     only when every ticker maps uniquely to research identity and its broker
     valuation exactly reconciles with cash and NAV.
     """
-    payload = _read_payload(path)
+    return load_paper_portfolio_snapshot_payload(
+        database,
+        decision_as_of=decision_as_of,
+        pipeline_run_id=pipeline_run_id,
+        payload=_read_payload(path),
+    )
+
+
+def load_paper_portfolio_snapshot_payload(
+    database: ResearchDB,
+    *,
+    decision_as_of: str,
+    pipeline_run_id: str,
+    payload: dict[str, Any],
+) -> PortfolioSnapshot:
+    """Validate an already-selected v2 handoff and construct a snapshot.
+
+    The execution handoff history is immutable.  Keeping selection outside of
+    the parser lets the decision pipeline choose the last observation known at
+    its decision time rather than accidentally reading a later live file.
+    """
+    if not isinstance(payload, dict):
+        raise PortfolioHandoffUnavailable("portfolio handoff is not an object")
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise PortfolioHandoffUnavailable("unexpected portfolio handoff schema")
     if payload.get("account_type") != "PAPER" or payload.get("environment") not in {

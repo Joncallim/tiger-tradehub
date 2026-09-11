@@ -23,9 +23,14 @@ install -d -o tradehub-execution -g tradehub-research -m 2750 /var/lib/tradehub-
 install -d -o tradehub-execution -g tradehub-autonomy -m 0750 /var/lib/tradehub/autonomy
 install -d -o tradehub-autonomy -g tradehub-autonomy -m 0770 /var/lib/tradehub/autonomy/proposals
 install -d -o tradehub-autonomy -g tradehub-autonomy -m 0750 /var/lib/tradehub-research/autonomy
-# The research exporter can create proposal envelopes but cannot read or
-# change the execution-owned kill switch.  Use an ACL only on this subdir.
-setfacl -m u:tradehub-research:rwx /var/lib/tradehub/autonomy/proposals
+# The research exporter can traverse the execution-owned parents and create
+# proposal envelopes, but cannot list/change either parent or read/change the
+# execution-owned kill switch.  Both parent traversal ACLs are required.
+setfacl -m u:tradehub-research:--x /var/lib/tradehub /var/lib/tradehub/autonomy
+setfacl -m u:tradehub-research:rwx,m::rwx /var/lib/tradehub/autonomy/proposals
+# Research-created envelopes must remain readable by the autonomy runner even
+# under a restrictive umask.  The exporter also creates files mode 0640.
+setfacl -m d:u:tradehub-autonomy:r-x,d:m::rwx /var/lib/tradehub/autonomy/proposals
 # Provision the files with explicit modes; do not rely on the caller's umask.
 install -o root -g tradehub-execution -m 0640 /path/to/execution.env /etc/tradehub/execution.env
 install -o root -g tradehub-research -m 0640 /path/to/research.env /etc/tradehub/research.env
@@ -41,8 +46,12 @@ private key at `/etc/tradehub/tiger_private_key.pk8`, mode `0640`, owner
 execution environment file.
 
 Store research-only values in `/etc/tradehub/research.env`, mode `0640`,
-owner `root:tradehub-research`; set `RESEARCH_API_TOKEN` to a strong random research-only bearer and `RESEARCH_DB_PATH=/var/lib/tradehub-research/research.db` there. Set `TRADEHUB_DRY_RUN=true`; it must contain only `RESEARCH_*` settings and
-must not contain execution or Tiger credentials.
+owner `root:tradehub-research`; set `RESEARCH_API_TOKEN` to a strong random research-only bearer and `RESEARCH_DB_PATH=/var/lib/tradehub-research/research.db` there. It must contain only `RESEARCH_*` settings and must not contain execution or Tiger credentials.
+
+Set `TRADEHUB_DRY_RUN=true` in `/etc/tradehub/autonomy.env`, the environment
+read by the only process that calls the guarded execution API.  This is the
+authoritative execution-boundary setting; a value in `research.env` has no
+broker-write effect.
 
 Install and enable the units:
 

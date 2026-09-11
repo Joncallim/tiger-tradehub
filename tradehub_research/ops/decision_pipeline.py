@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +30,7 @@ from tradehub_research.portfolio.engine import PortfolioEngine
 from tradehub_research.portfolio.handoff import (
     PortfolioHandoffUnavailable,
     load_paper_portfolio_snapshot,
+    load_paper_portfolio_snapshot_payload,
 )
 from tradehub_research.portfolio.policy import PolicyRegistry, build_policy
 from tradehub_research.portfolio.snapshot import build_snapshot
@@ -46,17 +46,6 @@ DEFAULT_PORTFOLIO_HANDOFF_HISTORY = Path(
 
 class PortfolioStateUnavailable(ValueError):
     """The execution-owned portfolio handoff cannot prove a usable PAPER state."""
-
-
-def _microusd(value: Any, field: str) -> int:
-    """Strict dollars -> micro-USD conversion; floats never silently round."""
-    try:
-        decimal = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise PortfolioStateUnavailable(f"{field} is not a decimal amount") from exc
-    if not decimal.is_finite() or decimal < 0:
-        raise PortfolioStateUnavailable(f"{field} must be a finite non-negative amount")
-    return int((decimal * 1_000_000).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _load_handoff_at_or_before(
@@ -106,13 +95,19 @@ def load_sanitized_paper_snapshot(
     An explicitly empty broker positions list is a known empty book and is a
     valid no-action portfolio snapshot.
     """
-    selected_path = path or DEFAULT_PORTFOLIO_HANDOFF
     try:
-        return load_paper_portfolio_snapshot(
+        if path is not None:
+            return load_paper_portfolio_snapshot(
+                database=database,
+                decision_as_of=decision_as_of,
+                pipeline_run_id=pipeline_run_id,
+                path=path,
+            )
+        return load_paper_portfolio_snapshot_payload(
             database=database,
             decision_as_of=decision_as_of,
             pipeline_run_id=pipeline_run_id,
-            path=selected_path,
+            payload=_load_handoff_at_or_before(decision_as_of=decision_as_of, path=None),
         )
     except PortfolioHandoffUnavailable as exc:
         raise PortfolioStateUnavailable(str(exc)) from exc
@@ -287,6 +282,11 @@ def export_eligible_proposals(
         else:
             temporary = path.with_suffix(".json.tmp")
             temporary.write_text(body, encoding="utf-8")
+            # The research writer may use a restrictive umask.  The
+            # execution-owned autonomy identity needs read-only access to the
+            # completed, atomically-renamed envelope; it never needs write
+            # access to research output.
+            temporary.chmod(0o640)
             temporary.replace(path)
         exported.append(str(row["proposal_id"]))
     return {
