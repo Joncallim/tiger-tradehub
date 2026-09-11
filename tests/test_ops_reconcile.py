@@ -98,4 +98,13 @@ def test_handoff_allowlists_position_fields():
         },
         [{"symbol": "AAPL", "quantity": 2, "account": "secret", "private_key": "nope"}],
     )
-    assert handoff["positions"] == [{"quantity": 2, "symbol": "AAPL"}]
+    assert handoff["positions"] == [
+        {
+            "ticker": "AAPL",
+            "quantity": 2,
+            "sellable_quantity": None,
+            "market_value": None,
+            "mark_price": None,
+            "currency": None,
+        }
+    ]

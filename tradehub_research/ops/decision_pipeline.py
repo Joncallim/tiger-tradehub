@@ -28,6 +28,10 @@ from tradehub_research.committee.scoring import Scorer
 from tradehub_research.committee.store import CommitteeStore
 from tradehub_research.db import ResearchDB, normalize_ts, utc_now
 from tradehub_research.portfolio.engine import PortfolioEngine
+from tradehub_research.portfolio.handoff import (
+    PortfolioHandoffUnavailable,
+    load_paper_portfolio_snapshot,
+)
 from tradehub_research.portfolio.policy import PolicyRegistry, build_policy
 from tradehub_research.portfolio.snapshot import build_snapshot
 from tradehub_research.portfolio.types import PolicyStatus
@@ -89,6 +93,7 @@ def _load_handoff_at_or_before(
 
 
 def load_sanitized_paper_snapshot(
+    database: ResearchDB,
     *,
     decision_as_of: str,
     pipeline_run_id: str,
@@ -101,50 +106,16 @@ def load_sanitized_paper_snapshot(
     An explicitly empty broker positions list is a known empty book and is a
     valid no-action portfolio snapshot.
     """
-    payload = _load_handoff_at_or_before(decision_as_of=decision_as_of, path=path)
-    if not isinstance(payload, dict):
-        raise PortfolioStateUnavailable("sanitized portfolio handoff is not an object")
-    if payload.get("account_type") != "PAPER":
-        raise PortfolioStateUnavailable(
-            "sanitized portfolio handoff does not prove PAPER account type"
-        )
-    if payload.get("account_status") not in {"Open", "Funded", "New"}:
-        raise PortfolioStateUnavailable("sanitized portfolio handoff account status is unusable")
-    handoff_as_of = str(payload.get("as_of", ""))
+    selected_path = path or DEFAULT_PORTFOLIO_HANDOFF
     try:
-        handoff_time = datetime.fromisoformat(handoff_as_of.replace("Z", "+00:00"))
-        decision_time = datetime.fromisoformat(normalize_ts(decision_as_of).replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise PortfolioStateUnavailable("sanitized portfolio handoff as_of is invalid") from exc
-    if handoff_time > decision_time:
-        raise PortfolioStateUnavailable("sanitized portfolio handoff is after decision_as_of")
-    # One market-session / weekend buffer.  The runner separately rejects
-    # stale market data; the portfolio state is deliberately conservative.
-    if (decision_time - handoff_time).total_seconds() > 78 * 3600:
-        raise PortfolioStateUnavailable("sanitized portfolio handoff is stale")
-    positions = payload.get("positions")
-    if not isinstance(positions, list):
-        raise PortfolioStateUnavailable("sanitized portfolio positions are missing")
-    if positions:
-        # Symbol->security mapping and trustworthy position valuation are not
-        # yet handed off. Never interpret a nonempty book as empty.
-        raise PortfolioStateUnavailable("nonempty broker positions lack a typed research mapping")
-    return build_snapshot(
-        normalize_ts(decision_as_of),
-        cash_microusd=_microusd(payload.get("cash_balance"), "cash_balance"),
-        cash_status="KNOWN",
-        nav_microusd=_microusd(payload.get("asset_value"), "asset_value"),
-        valuation_status="KNOWN",
-        holdings_status="KNOWN",
-        provenance={
-            "kind": "execution_sanitized_paper_handoff_v1",
-            "pipeline_run_id": pipeline_run_id,
-            "handoff_as_of": handoff_as_of,
-            "handoff_path": str(path),
-        },
-        holdings=[],
-        market_inputs=[],
-    )
+        return load_paper_portfolio_snapshot(
+            database=database,
+            decision_as_of=decision_as_of,
+            pipeline_run_id=pipeline_run_id,
+            path=selected_path,
+        )
+    except PortfolioHandoffUnavailable as exc:
+        raise PortfolioStateUnavailable(str(exc)) from exc
 
 
 def _policy_spec() -> dict[str, Any]:
@@ -266,12 +237,6 @@ def export_eligible_proposals(
             "WHERE o.run_id=?",
             (run_id,),
         ).fetchone()[0]
-        blocked_human_approval = conn.execute(
-            "SELECT count(*) FROM trade_proposal p "
-            "JOIN portfolio_state_observation o ON o.decision_id=p.decision_id "
-            "WHERE o.run_id=? AND p.requires_human_approval=1",
-            (run_id,),
-        ).fetchone()[0]
         rows = conn.execute(
             "SELECT p.*, s.canonical_ticker, ps.as_of AS data_as_of, m.mark_price_microusd, "
             "h.quantity_microunits AS current_quantity_microunits, "
@@ -286,7 +251,7 @@ def export_eligible_proposals(
             "LEFT JOIN portfolio_holding h ON h.snapshot_id=p.portfolio_snapshot_id "
             "AND h.security_id=p.security_id "
             "WHERE o.run_id=? AND pp.policy_status!='FIXTURE' "
-            "AND p.proposal_mode='PAPER' AND p.requires_human_approval=0 "
+            "AND p.proposal_mode='PAPER' "
             "ORDER BY p.proposal_id",
             (run_id,),
         ).fetchall()
@@ -326,7 +291,10 @@ def export_eligible_proposals(
         exported.append(str(row["proposal_id"]))
     return {
         "proposal_count": total,
-        "blocked_human_approval": blocked_human_approval,
+        # Phase-3's requires_human_approval is an immutable proposal lineage
+        # fact. Phase-6 independently decides autonomous PAPER eligibility;
+        # it must not be repurposed into a hidden second policy gate here.
+        "blocked_human_approval": 0,
         "eligible_exports": exported,
     }
 
@@ -359,6 +327,7 @@ def run_portfolio_decision(
         return {"status": "BLOCKED_NO_VALID_SCORE", "portfolio_run": None, "eligible_exports": []}
     try:
         snapshot = snapshot or load_sanitized_paper_snapshot(
+            database,
             decision_as_of=decision_as_of,
             pipeline_run_id=pipeline_run_id,
         )
@@ -473,6 +442,7 @@ def finalize_async_committee_decisions(
                 inbox=inbox,
                 snapshot=(
                     load_sanitized_paper_snapshot(
+                        database,
                         decision_as_of=str(run_row["as_of"]),
                         pipeline_run_id=pipeline_run_id,
                         path=handoff,

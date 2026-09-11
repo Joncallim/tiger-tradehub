@@ -81,7 +81,7 @@ def test_typed_nonempty_paper_handoff_maps_to_snapshot(tmp_path):
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda p: p.update({"environment": "LIVE"}),
+        lambda p: p.update({"environment": "UNKNOWN"}),
         lambda p: p.update({"as_of": "2026-09-01T00:00:00Z"}),
         lambda p: p.update({"positions": [{"ticker": "AAPL"}]}),
         lambda p: p["positions"][0].update({"market_value": "99"}),

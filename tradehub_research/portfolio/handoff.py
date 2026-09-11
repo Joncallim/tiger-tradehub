@@ -93,8 +93,11 @@ def load_paper_portfolio_snapshot(
     payload = _read_payload(path)
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise PortfolioHandoffUnavailable("unexpected portfolio handoff schema")
-    if payload.get("environment") != "PAPER_SANDBOX" or payload.get("account_type") != "PAPER":
-        raise PortfolioHandoffUnavailable("handoff does not prove PAPER sandbox account")
+    if payload.get("account_type") != "PAPER" or payload.get("environment") not in {
+        "PAPER_SANDBOX",
+        "LIVE",
+    }:
+        raise PortfolioHandoffUnavailable("handoff does not prove PAPER account")
     if payload.get("account_status") not in _USABLE_ACCOUNT_STATUSES:
         raise PortfolioHandoffUnavailable("handoff account status is unusable")
     observed_at = _parse_time(payload.get("as_of"), "handoff as_of")

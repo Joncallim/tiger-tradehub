@@ -22,6 +22,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tradehub.ops.portfolio_handoff import sanitized_paper_portfolio_handoff
+
 ANALYTICS_DIR = Path("/var/lib/tradehub/analytics")
 HISTORY = ANALYTICS_DIR / "history.jsonl"
 LATEST = ANALYTICS_DIR / "latest.json"
@@ -119,15 +121,11 @@ def _sanitize_position(value: dict) -> dict:
 
 def _handoff_payload(row: dict, positions: list[dict]) -> dict:
     """Credential-free execution→research PAPER portfolio state contract."""
-    return {
-        "schema_version": "paper-portfolio-handoff-v1",
-        "as_of": datetime.now(timezone.utc).isoformat(),
-        "account_type": row.get("account_type"),
-        "account_status": row.get("account_status"),
-        "asset_value": row.get("asset_value"),
-        "cash_balance": row.get("cash_balance"),
-        "positions": [_sanitize_position(item) for item in positions if isinstance(item, dict)],
-    }
+    # Compatibility wrapper for direct unit callers; reconcile supplies the
+    # broker proof below for the canonical v2 handoff.
+    return sanitized_paper_portfolio_handoff(
+        account_summary=row, paper_proof={}, positions=positions
+    )
 
 
 def _persist_research_handoff(payload: dict, path: Path | None = None) -> None:
@@ -155,7 +153,9 @@ def reconcile(gateway) -> dict:
     assets = gateway.get_assets() or {}
     positions = gateway.get_positions()
     row = _build_row(assets, proof)
-    payload = _handoff_payload(row, positions)
+    payload = sanitized_paper_portfolio_handoff(
+        account_summary=row, paper_proof=proof, positions=positions
+    )
     _persist(row)
     _persist_research_handoff(payload)
     _append_research_handoff(payload)
