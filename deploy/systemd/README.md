@@ -86,3 +86,32 @@ no-action result. The paper runner consumes only equality-checked envelopes in
 autonomy bearer belongs only in `/etc/tradehub/autonomy.env` (readable only by
 `tradehub-autonomy`); the committee/research service never receives it. Keep
 the kill switch execution-owned. The runner receives only read access to it.
+
+Install the decision services and timers together; the finalizer is what
+continues committee work completed after the M/W/F cycle returns:
+
+```bash
+install -m 0644 deploy/systemd/tradehub-research-cycle.service deploy/systemd/tradehub-research-cycle.timer /etc/systemd/system/
+install -m 0644 deploy/systemd/tradehub-committee-finalizer.service deploy/systemd/tradehub-committee-finalizer.timer /etc/systemd/system/
+install -m 0644 deploy/systemd/tradehub-reconcile.service deploy/systemd/tradehub-reconcile.timer /etc/systemd/system/
+install -m 0644 deploy/systemd/tradehub-paper-autonomy.service deploy/systemd/tradehub-paper-autonomy.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now tradehub-reconcile.timer tradehub-research-cycle.timer tradehub-committee-finalizer.timer tradehub-paper-autonomy.timer
+```
+
+Before enabling a production timer, prove the loaded service identity and the
+actual filesystem boundary (these probes create only a hidden non-envelope
+file and do not contact a broker):
+
+```bash
+systemctl show tradehub-research-cycle.service tradehub-committee-finalizer.service -p User -p Group -p ReadWritePaths -p InaccessiblePaths -p ProtectSystem -p ProtectHome
+probe=/var/lib/tradehub/autonomy/proposals/.acl-probe.$$
+runuser -u tradehub-research -- sh -ceu 'p="$1"; test -x /var/lib/tradehub; test -x /var/lib/tradehub/autonomy; test -w /var/lib/tradehub/autonomy/proposals; : > "$p"; chmod 0640 "$p"; test ! -r /var/lib/tradehub/autonomy/kill_switch; test ! -w /var/lib/tradehub/autonomy/kill_switch; test ! -r /etc/tradehub/execution.env; test ! -r /etc/tradehub/autonomy.env' sh "$probe"
+runuser -u tradehub-autonomy -- test -r "$probe"
+rm -f "$probe"
+grep -qx 'TRADEHUB_DRY_RUN=true' /etc/tradehub/autonomy.env
+```
+
+The last check is mandatory execution-boundary evidence. It is not satisfied
+by a research environment setting or by a dry-run value merely documented in
+source control.

@@ -1,8 +1,12 @@
 [Unit]
-Description=TradeHub autonomous PAPER runner timer (Mon/Wed/Fri)
+Description=TradeHub autonomous PAPER runner timer (consumes finalized PAPER envelopes)
 
 [Timer]
-OnCalendar=Mon,Wed,Fri *-*-* 23:20:00
+# Committee assessments arrive asynchronously.  A short deterministic poll
+# consumes only already-exported envelopes; empty inboxes are healthy zero
+# action and no model is ever invoked here.
+OnBootSec=5min
+OnUnitActiveSec=5min
 Persistent=true
 
 [Install]
