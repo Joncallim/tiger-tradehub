@@ -406,15 +406,42 @@ def finalize_async_committee_decisions(
     blocked result; it never manufactures an assessment, score, proposal, or
     executable order.
     """
+    # Do not revisit every historical pending committee run on every timer
+    # tick.  A pipeline is eligible for continuation only when it has a run
+    # whose latest durable state is READY_TO_SCORE, or when a score has
+    # already been written.  The latter is important: a crash (or a missing
+    # execution-side handoff) after scoring must be recoverable on a later
+    # tick without creating a second score or stranding the original
+    # pipeline_run_id.
     with database.connect(read_only=True) as conn:
         runs = conn.execute(
-            "SELECT DISTINCT pipeline_run_id FROM committee_run ORDER BY pipeline_run_id"
+            "WITH latest_state AS ("
+            " SELECT committee_run_id, to_state, "
+            " ROW_NUMBER() OVER (PARTITION BY committee_run_id ORDER BY rowid DESC) AS ordinal "
+            " FROM committee_transition"
+            ") "
+            "SELECT DISTINCT c.pipeline_run_id FROM committee_run c "
+            "LEFT JOIN latest_state state ON state.committee_run_id=c.committee_run_id "
+            " AND state.ordinal=1 "
+            "LEFT JOIN score_snapshot score ON score.committee_run_id=c.committee_run_id "
+            "WHERE state.to_state='READY_TO_SCORE' OR score.snapshot_id IS NOT NULL "
+            "ORDER BY c.pipeline_run_id"
         ).fetchall()
     results: list[dict[str, Any]] = []
     for row in runs:
         pipeline_run_id = str(row["pipeline_run_id"])
         scores = persist_ready_scores(database, pipeline_run_id)
-        if not scores["score_snapshots"]:
+        # create_snapshot is idempotent, but only reports a snapshot while a
+        # run is READY_TO_SCORE.  Count durable snapshots separately so a
+        # retry resumes a previously scored original pipeline run.
+        with database.connect(read_only=True) as conn:
+            persisted_score_count = conn.execute(
+                "SELECT count(*) FROM score_snapshot s "
+                "JOIN committee_run c ON c.committee_run_id=s.committee_run_id "
+                "WHERE c.pipeline_run_id=?",
+                (pipeline_run_id,),
+            ).fetchone()[0]
+        if not persisted_score_count:
             results.append(
                 {
                     "pipeline_run_id": pipeline_run_id,
