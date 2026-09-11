@@ -232,6 +232,15 @@ def test_untyped_envelope_yields_zero_writes(ctx):
     assert any("typed proposal" in r["reason"] for r in summary["refusals"])
 
 
+def test_nonfixture_envelope_requires_persisted_ledger_proposal(ctx):
+    """Shared inbox transport is never authority for a real PAPER action."""
+    _write_inbox(ctx, _envelope(fixture=False))
+    summary = _run(ctx)
+    assert summary["orders"] == 0
+    assert any("research ledger" in r["reason"] for r in summary["refusals"])
+    assert not any(path == "/orders/preview" for path, _ in ctx["client"].calls)
+
+
 def test_daily_order_count_budget(ctx):
     payload = policy.default_policy_payload()
     payload["max_order_count_per_day"] = 1
