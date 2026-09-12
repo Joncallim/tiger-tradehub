@@ -143,8 +143,13 @@ def check_paper_proof_and_kill_switch() -> None:
             _alert(f"PAPER proof unreachable: {type(exc).__name__}")
     switch = Path("/var/lib/tradehub/autonomy/kill_switch")
     if switch.exists():
-        content = switch.read_text().strip().upper()
-        if content not in ("BLOCKED", "CLEARED", ""):
+        try:
+            content = switch.read_text().strip().upper()
+        except PermissionError:
+            # Expected under research/runtime isolation: the execution-owned
+            # kill switch is enforced again at the execution boundary.
+            content = None
+        if content is not None and content not in ("BLOCKED", "CLEARED", ""):
             _alert(f"kill-switch file has unexpected content: {content!r}")
     ledger = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
     if ledger.exists():
