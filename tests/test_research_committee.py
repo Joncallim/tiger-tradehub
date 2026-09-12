@@ -1293,6 +1293,46 @@ def test_ready_to_score_status_recovers_after_injected_score_failure(tmp_path):
         )
 
 
+def test_async_finalizer_resumes_already_scored_original_pipeline_once(tmp_path, monkeypatch):
+    """A post-score crash must not strand the original pipeline on timer retry."""
+    from tradehub_research.ops import decision_pipeline
+
+    store, run, pack_hash = _committee(tmp_path / "finalizer-retry.db")
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+    claims = [_claim("valuation_vs_history", "bullish")]
+    router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_a", "provider-a", claims))
+    assert (
+        router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_b", "provider-b", claims))[
+            "state"
+        ]
+        == "SCORED"
+    )
+
+    resumed: list[str] = []
+
+    def resume(database, *, pipeline_run_id, decision_as_of, **_kwargs):
+        assert database is store.database
+        assert decision_as_of == "2025-02-01T00:00:00Z"
+        resumed.append(pipeline_run_id)
+        return {"status": "HEALTHY_ZERO_ACTION", "eligible_exports": []}
+
+    monkeypatch.setattr(decision_pipeline, "run_portfolio_decision", resume)
+    first = decision_pipeline.finalize_async_committee_decisions(store.database)
+    second = decision_pipeline.finalize_async_committee_decisions(store.database)
+
+    assert [item["pipeline_run_id"] for item in first["finalized"]] == ["run"]
+    assert [item["pipeline_run_id"] for item in second["finalized"]] == ["run"]
+    assert resumed == ["run", "run"]
+    with store.database.connect(read_only=True) as db:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 1
+        )
+
+
 @pytest.mark.parametrize("surface", ["status", "get_work", "retry"])
 def test_second_neutral_commit_boundary_recovers_once(tmp_path, surface):
     store, run, pack_hash = _committee(tmp_path / f"neutral-recover-{surface}.db")

@@ -17,7 +17,6 @@ Read-only except for the deliberate restart/rollback actions it performs.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -115,23 +114,17 @@ def main() -> int:
         code, _ = sh(["systemctl", "is-enabled", f"{timer}.timer"])
         check(f"timer enabled {timer}", code == 0)
 
-    # 6. No duplicate forward prediction (capture dedupe).
-    code, out = sh(
-        [
-            "/home/jon/tiger-tradehub-main/.venv/bin/python",
-            "-m",
-            "tradehub_research.ops.forward_capture",
-        ],
-        timeout=600,
+    # 6. No duplicate forward prediction (capture dedupe) through the actual
+    # deployed service environment, never a developer/home-worktree Python.
+    code, _ = sh(["systemctl", "start", "tradehub-forward-capture.service"], timeout=600)
+    result_code, result = sh(
+        ["systemctl", "show", "tradehub-forward-capture.service", "-p", "Result", "--value"]
     )
-    try:
-        summary = json.loads(out.strip().splitlines()[-1])
-        check(
-            "forward capture idempotent (no dupes)",
-            summary.get("counts", {}).get("rejected") == 0,
-        )
-    except Exception:  # noqa: BLE001
-        check("forward capture idempotent (no dupes)", False, out[-200:])
+    check(
+        "forward capture idempotent (no dupes)",
+        code == 0 and result_code == 0 and result.strip() == "success",
+        result[-200:],
+    )
 
     # 7. No duplicate broker action: execution dry-run invariant.
     code, out = sh(["systemctl", "show", "tradehub-execution.service", "-p", "ActiveState"])

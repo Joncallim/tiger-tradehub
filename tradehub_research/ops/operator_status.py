@@ -12,12 +12,44 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.ops.common import ResearchPaths, research_paths
 from tradehub_research.ops.health import forward_health, refresh_health
 from tradehub_research.validation.experiment_db import ExperimentDB
+
+RUNNER_RECEIPTS = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
+
+
+def _runner_receipts() -> dict[str, Any]:
+    """Sanitized receipt count/latest entry; malformed lines never imply success."""
+    if not RUNNER_RECEIPTS.exists():
+        return {"count": 0, "latest": None, "status": "unavailable"}
+    latest = None
+    count = 0
+    for line in RUNNER_RECEIPTS.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return {"count": count, "latest": latest, "status": "malformed"}
+        count += 1
+        latest = {
+            key: item.get(key)
+            for key in (
+                "proposal_id",
+                "decision",
+                "dry_run",
+                "submitted",
+                "order_id",
+                "reconcile_status",
+                "at",
+            )
+        }
+    return {"count": count, "latest": latest, "status": "ok"}
 
 
 def operator_status(
@@ -42,15 +74,28 @@ def operator_status(
             except ValueError:
                 last_cycle = None
 
-    # Proposals: latest portfolio_run row (if any).
+    # Decision ledger: a no-proposal run is first-class, not an error.
     proposal = None
+    chain = {"portfolio_runs": 0, "proposals": 0, "eligible_exports": 0}
     with research_db.connect(read_only=True) as conn:
         try:
             row = conn.execute(
                 "SELECT run_id, created_at FROM portfolio_run ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
             if row:
-                proposal = {"run_id": str(row["run_id"]), "created_at": str(row["created_at"])}
+                run_id = str(row["run_id"])
+                proposal = {"run_id": run_id, "created_at": str(row["created_at"])}
+                chain["portfolio_runs"] = 1
+                chain["proposals"] = conn.execute(
+                    "SELECT count(*) FROM trade_proposal WHERE decision_id IN "
+                    "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
+                    (run_id,),
+                ).fetchone()[0]
+                chain["eligible_exports"] = sum(
+                    1
+                    for item in (last_cycle or {}).get("decision", {}).get("eligible_exports", [])
+                    if isinstance(item, str)
+                )
         except Exception:  # noqa: BLE001 -- optional table
             proposal = None
 
@@ -99,8 +144,19 @@ def operator_status(
             else {"last_cycle": None}
         ),
         "candidates_current": (last_cycle.get("candidates", []) if last_cycle else []),
-        "portfolio_status": {"last_proposal": proposal},
-        "proposal_status": {"pending_approvals": 0, "note": "no autonomous paper (#51)"},
+        "portfolio_status": {
+            "last_run": proposal,
+            "decision_status": (last_cycle or {}).get("decision", {}).get("status"),
+        },
+        "proposal_status": {
+            "eligible_exports": chain["eligible_exports"],
+            "classification": (last_cycle or {}).get("decision", {}).get("status"),
+        },
+        "decision_chain": {
+            "research_cycle": (last_cycle or {}).get("status"),
+            **chain,
+            "runner_receipts": _runner_receipts(),
+        },
         "validation_forward": {
             "production_predictions": fwd["production_predictions"],
             "predictions_due": fwd["predictions_due"],

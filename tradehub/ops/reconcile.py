@@ -17,13 +17,20 @@ State:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tradehub.ops.portfolio_handoff import sanitized_paper_portfolio_handoff
+
 ANALYTICS_DIR = Path("/var/lib/tradehub/analytics")
 HISTORY = ANALYTICS_DIR / "history.jsonl"
 LATEST = ANALYTICS_DIR / "latest.json"
+# Execution writes this credential-free handoff; research reads it but never
+# gains broker credentials or the execution audit DB.
+RESEARCH_HANDOFF = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.json")
+RESEARCH_HANDOFF_HISTORY = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.jsonl")
 
 
 def _num(value) -> float | None:
@@ -98,12 +105,60 @@ def _persist(row: dict) -> None:
     LATEST.write_text(json.dumps(row, sort_keys=True, indent=2) + "\n")
 
 
+def _sanitize_position(value: dict) -> dict:
+    """Allow-list broker position fields; never copy account/credential data."""
+    allowed = {
+        "symbol",
+        "quantity",
+        "available_quantity",
+        "market_value",
+        "average_cost",
+        "latest_price",
+        "currency",
+    }
+    return {key: value.get(key) for key in sorted(allowed) if key in value}
+
+
+def _handoff_payload(row: dict, positions: list[dict]) -> dict:
+    """Credential-free execution→research PAPER portfolio state contract."""
+    # Compatibility wrapper for direct unit callers; reconcile supplies the
+    # broker proof below for the canonical v2 handoff.
+    return sanitized_paper_portfolio_handoff(
+        account_summary=row, paper_proof={}, positions=positions
+    )
+
+
+def _persist_research_handoff(payload: dict, path: Path | None = None) -> None:
+    """Atomic replace for the operator-visible latest snapshot."""
+    path = path or RESEARCH_HANDOFF
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    os.chmod(temporary, 0o640)
+    temporary.replace(path)
+
+
+def _append_research_handoff(payload: dict, path: Path | None = None) -> None:
+    """Append immutable sanitized snapshots for PIT portfolio reconstruction."""
+    path = path or RESEARCH_HANDOFF_HISTORY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    os.chmod(path, 0o640)
+
+
 def reconcile(gateway) -> dict:
-    """Query the broker (read-only) and persist the sanitized snapshot."""
+    """Read broker state and persist analytics plus a sanitized research handoff."""
     proof = gateway.proof_paper_environment()
     assets = gateway.get_assets() or {}
+    positions = gateway.get_positions()
     row = _build_row(assets, proof)
+    payload = sanitized_paper_portfolio_handoff(
+        account_summary=row, paper_proof=proof, positions=positions
+    )
     _persist(row)
+    _persist_research_handoff(payload)
+    _append_research_handoff(payload)
     return row
 
 

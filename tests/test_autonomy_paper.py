@@ -71,7 +71,7 @@ def _envelope(
     action: str = "BUY",
     symbol: str = "AAPL",
     data_as_of: str = "2026-08-31",
-    fixture: bool = False,
+    fixture: bool = True,
     fixture_tag: str | None = None,
     created_at: str | None = None,
     quantity: int = 100_000_000,
@@ -230,6 +230,15 @@ def test_untyped_envelope_yields_zero_writes(ctx):
     summary = _run(ctx)
     assert summary["orders"] == 0
     assert any("typed proposal" in r["reason"] for r in summary["refusals"])
+
+
+def test_nonfixture_envelope_requires_persisted_ledger_proposal(ctx):
+    """Shared inbox transport is never authority for a real PAPER action."""
+    _write_inbox(ctx, _envelope(fixture=False))
+    summary = _run(ctx)
+    assert summary["orders"] == 0
+    assert any("research ledger" in r["reason"] for r in summary["refusals"])
+    assert not any(path == "/orders/preview" for path, _ in ctx["client"].calls)
 
 
 def test_daily_order_count_budget(ctx):

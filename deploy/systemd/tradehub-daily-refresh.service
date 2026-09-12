@@ -5,11 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=jon
-Group=jon
-WorkingDirectory=/home/jon/tiger-tradehub-main
+User=tradehub-research
+Group=tradehub-research
+WorkingDirectory=/opt/tiger-tradehub
 EnvironmentFile=/etc/tradehub/research.env
-Environment=TRADEHUB_RESEARCH_DIR=/home/jon/tiger-tradehub-main/data/research
-ExecStart=/home/jon/tiger-tradehub-main/.venv/bin/python -m tradehub_research.ops.daily_refresh
-# Bound by the Tiingo quota (45/hr); a quota-exhausted tick exits 2 and is
-# retried at the next tick -- never duplicated, always resumable.
+Environment=TRADEHUB_RESEARCH_DIR=/var/lib/tradehub-research
+ExecStart=/opt/tiger-tradehub/.venv/bin/python -m tradehub_research.ops.daily_refresh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tradehub-research
+InaccessiblePaths=/etc/tradehub/execution.env /etc/tradehub/autonomy.env -/etc/tradehub/tiger_private_key.pk8

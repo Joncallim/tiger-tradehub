@@ -9,7 +9,7 @@ Never modifies state; never tunes anything.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 ALERTS: list[str] = []
@@ -143,8 +143,13 @@ def check_paper_proof_and_kill_switch() -> None:
             _alert(f"PAPER proof unreachable: {type(exc).__name__}")
     switch = Path("/var/lib/tradehub/autonomy/kill_switch")
     if switch.exists():
-        content = switch.read_text().strip().upper()
-        if content not in ("BLOCKED", "CLEARED", ""):
+        try:
+            content = switch.read_text().strip().upper()
+        except PermissionError:
+            # Expected under research/runtime isolation: the execution-owned
+            # kill switch is enforced again at the execution boundary.
+            content = None
+        if content is not None and content not in ("BLOCKED", "CLEARED", ""):
             _alert(f"kill-switch file has unexpected content: {content!r}")
     ledger = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
     if ledger.exists():
@@ -196,18 +201,19 @@ def check_services() -> None:
 
 
 def check_reconciliation() -> None:
-    """Broker reconciliation failure: no fresh sanitized snapshot."""
-    latest = Path("/var/lib/tradehub/analytics/latest.json")
-    if not latest.exists():
-        _alert("no broker analytics snapshot (reconciliation never ran)")
+    """Broker reconciliation health via the research-readable sanitized handoff."""
+    handoff = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.json")
+    if not handoff.exists():
+        _alert("no sanitized broker handoff (reconciliation never ran)")
         return
     try:
-        row = json.loads(latest.read_text())
-        age_days = (date.today() - date.fromisoformat(str(row.get("date", ""))[:10])).days
-        if age_days > 2:
-            _alert(f"broker analytics snapshot {age_days} days old (reconciliation stale)")
+        row = json.loads(handoff.read_text())
+        observed = datetime.fromisoformat(str(row.get("as_of", "")).replace("Z", "+00:00"))
+        age_hours = (datetime.now(timezone.utc) - observed).total_seconds() / 3600
+        if age_hours > 60:
+            _alert(f"sanitized broker handoff {age_hours:.0f}h old (reconciliation stale)")
     except (ValueError, OSError):
-        _alert("broker analytics snapshot unreadable")
+        _alert("sanitized broker handoff unreadable")
 
 
 def main() -> int:

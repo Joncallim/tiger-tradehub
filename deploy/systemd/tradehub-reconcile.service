@@ -8,3 +8,12 @@ Group=tradehub-execution
 WorkingDirectory=/opt/tiger-tradehub
 EnvironmentFile=/etc/tradehub/execution.env
 ExecStart=/opt/tiger-tradehub/.venv/bin/python -m tradehub.ops.reconcile
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tradehub /var/lib/tradehub-research/handoff
+# This is the execution-owned read-only broker observer.  It must retain the
+# Tiger key supplied by execution.env in order to write the sanitized handoff;
+# research/autonomy secrets remain inaccessible.
+InaccessiblePaths=/etc/tradehub/research.env /etc/tradehub/autonomy.env
