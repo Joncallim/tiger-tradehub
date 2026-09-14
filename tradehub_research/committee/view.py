@@ -32,7 +32,6 @@ from typing import Any
 
 from tradehub_research.committee.bounds import (
     MAX_BODY_BYTES,
-    MAX_FEATURE_SOURCES,
     MAX_SERIES_REPRESENTATIVES,
     MAX_VIEW_EVIDENCE_ROWS,
     SCORING_PROJECTION_VERSION,
@@ -143,10 +142,20 @@ def aggregate_series(
     aggregates: list[dict[str, Any]],
     aggregated_ids: set[str],
 ) -> Any:
-    """Replace any over-long ``sources`` list with a deterministic aggregate."""
+    """Replace every observation series with a deterministic aggregate.
+
+    Every ``sources`` list is aggregated, regardless of size (review finding P2,
+    round 2). A size threshold would leave small series serialized verbatim
+    inside ``raw_features``, so their observation ids would be visible to the
+    model yet absent from ``body["evidence"]`` -- uncitable, and counted as
+    "not presented" by the artifact's own honesty accounting. Aggregating all of
+    them makes the two sets agree exactly: every series observation is either a
+    published representative row (visible and citable) or an explicitly counted
+    aggregate omission (invisible).
+    """
     if isinstance(value, dict):
         sources = value.get("sources")
-        if isinstance(sources, list) and len(sources) > MAX_FEATURE_SOURCES:
+        if isinstance(sources, list):
             aggregate = _series_aggregate(value, sources)
             aggregated_ids.update(series_observation_ids(value))
             aggregates.append(
@@ -372,38 +381,36 @@ class CommitteeViewBuilder:
         presented_ids: list[str] = []
         reasons: dict[str, int] = {}
         running = 0
-        for evidence_id in interpretive:
+
+        def _admit(evidence_id: str) -> bool:
+            nonlocal running
             if len(presented_ids) >= MAX_VIEW_EVIDENCE_ROWS:
                 reasons["row_cap"] = reasons.get("row_cap", 0) + 1
-                continue
+                return False
             probe = self._evidence_row(inputs, evidence_id, {}, truncations)
             if probe is None:
                 reasons["structured_row_oversize"] = reasons.get("structured_row_oversize", 0) + 1
-                continue
+                return False
             size = len(canonical_json(probe).encode())
             if running + size > budget:
                 reasons["byte_budget"] = reasons.get("byte_budget", 0) + 1
-                continue
+                return False
             presented_ids.append(evidence_id)
             running += size
+            return True
+
+        # Aggregate representatives are admitted FIRST. They are the only visible
+        # form of the series, so the aggregate's "observations_presented" claim
+        # must never be undone by interpretive rows consuming the cap afterwards
+        # (which would leave advertised representatives uncitable).
         representatives_presented = 0
         for evidence_id in representative_ids:
             if evidence_id in presented_ids or evidence_id not in inputs.evidence_rows:
                 continue
-            if len(presented_ids) >= MAX_VIEW_EVIDENCE_ROWS:
-                reasons["row_cap"] = reasons.get("row_cap", 0) + 1
-                continue
-            probe = self._evidence_row(inputs, evidence_id, {}, truncations)
-            if probe is None:
-                reasons["structured_row_oversize"] = reasons.get("structured_row_oversize", 0) + 1
-                continue
-            size = len(canonical_json(probe).encode())
-            if running + size > budget:
-                reasons["byte_budget"] = reasons.get("byte_budget", 0) + 1
-                continue
-            presented_ids.append(evidence_id)
-            running += size
-            representatives_presented += 1
+            if _admit(evidence_id):
+                representatives_presented += 1
+        for evidence_id in interpretive:
+            _admit(evidence_id)
         # Supersession is view-local: it may only point at an observation that is
         # actually visible here (v1 semantics), so it is resolved after the
         # visible set is fixed.

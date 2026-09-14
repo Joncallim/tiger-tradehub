@@ -459,11 +459,14 @@ def test_work_is_pinned_to_one_artifact_and_races_fail_closed(tmp_path):
     assert old_work["body"]["pack_spec_version"] == 1
     assert old_work["pack_hash"] == pinned_v1
     assert old_work["representation"] == "LEGACY_SCORING_PACK"
-    # A different existing artifact for the same candidate is refused while the
-    # outstanding work is pinned elsewhere: fail closed before any model spend.
-    with pytest.raises(ValueError, match="not the pin of any outstanding committee work"):
-        resolve_evidence_artifact(database, candidate_id, view.pack_hash)
-    # Once the newer run's own work is issued, its own pin resolves.
+    # A different artifact is only admissible if it is some live or outstanding
+    # pin. The newer run exists (live) but has issued no work yet, so its view is
+    # a legitimate pin for its own worker while the stale legacy pack would still
+    # be refused if it were not also an issued pin:
+    assert resolve_evidence_artifact(database, candidate_id, view.pack_hash)["pack_hash"] == (
+        view.pack_hash
+    )
+    # ...and once the newer run's own work is issued, its pin resolves normally.
     router.initialize(new_run)
     new_envelope = router.get_work(new_run)
     assert new_envelope is not None
@@ -473,10 +476,10 @@ def test_work_is_pinned_to_one_artifact_and_races_fail_closed(tmp_path):
     assert new_work["pinned"] is True
     assert new_work["lineage_hash"] == lineage.lineage_hash
 
-    # Wrong or unknown pins fail closed (here with outstanding work, the refusal
-    # is the stronger "not the pin of any outstanding committee work" check), and
-    # unpinned lookups are refused while work is outstanding.
-    with pytest.raises(ValueError, match="not the pin of any outstanding committee work"):
+    # Wrong or unknown pins fail closed (the refusal names the live/outstanding
+    # pin requirement), and unpinned lookups are refused while work is
+    # outstanding.
+    with pytest.raises(ValueError, match="not the pin of any live or outstanding"):
         resolve_evidence_artifact(database, candidate_id, "0" * 64)
     with pytest.raises(ValueError, match="unpinned evidence lookup refused"):
         resolve_evidence_artifact(database, candidate_id)

@@ -305,8 +305,23 @@ def _mcp_pack_round_trip(path: Path) -> tuple[list[dict], dict]:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
+    from tradehub_research.db import ResearchDB
+
     env = os.environ.copy()
     env["RESEARCH_DB_PATH"] = str(path)
+
+    # Committee work is pinned. An unpinned lookup is refused while a candidate
+    # has live or outstanding committee work, and a pin that matches no live or
+    # outstanding work is refused too, so the harness pins exactly the way a
+    # committee worker must: with the pack_hash of the candidate's run.
+    with ResearchDB(path).connect(read_only=True) as db:
+        row = db.execute(
+            "SELECT pack_hash FROM committee_run WHERE candidate_id='candidate' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    arguments: dict[str, object] = {"candidate_id": "candidate"}
+    if row is not None:
+        arguments["pack_hash"] = row[0]
 
     async def run() -> tuple[list[dict], dict]:
         params = StdioServerParameters(
@@ -316,7 +331,7 @@ def _mcp_pack_round_trip(path: Path) -> tuple[list[dict], dict]:
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = [tool.model_dump() for tool in (await session.list_tools()).tools]
-                result = await session.call_tool("get_evidence_pack", {"candidate_id": "candidate"})
+                result = await session.call_tool("get_evidence_pack", arguments)
                 return tools, result.model_dump(by_alias=True)
 
     return anyio.run(run)

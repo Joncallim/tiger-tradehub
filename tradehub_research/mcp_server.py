@@ -32,12 +32,26 @@ def resolve_evidence_artifact(
                 (candidate_id,),
             )
         }
+        # Runs that exist but are not finished: their artifacts are live pins too,
+        # which closes the window between run creation and the first issued work
+        # item (review finding P3, round 2).
+        live_pins = {
+            row[0]
+            for row in db.execute(
+                "SELECT DISTINCT r.pack_hash FROM committee_run r WHERE r.candidate_id=? AND "
+                "COALESCE((SELECT t.to_state FROM committee_transition t "
+                "WHERE t.committee_run_id=r.committee_run_id ORDER BY t.rowid DESC LIMIT 1), "
+                "'PENDING_NEUTRALS') NOT IN ('SCORED','BLOCKED','ESCALATE')",
+                (candidate_id,),
+            )
+        }
+        allowed_pins = outstanding_pins | live_pins
         if pack_hash:
-            if outstanding_pins and pack_hash not in outstanding_pins:
+            if allowed_pins and pack_hash not in allowed_pins:
                 raise ValueError(
                     "pinned evidence lookup refused: pack_hash "
-                    f"{pack_hash} is not the pin of any outstanding committee work for this "
-                    "candidate; use the pack_hash from the work envelope"
+                    f"{pack_hash} is not the pin of any live or outstanding committee work for "
+                    "this candidate; use the pack_hash from the work envelope"
                 )
             row = db.execute(
                 "SELECT pack_hash,pack_spec_version,body_json FROM evidence_pack "
@@ -49,9 +63,9 @@ def resolve_evidence_artifact(
                     f"candidate {candidate_id} has no artifact pinned at pack_hash {pack_hash}"
                 )
         else:
-            if outstanding_pins:
+            if allowed_pins:
                 raise ValueError(
-                    "unpinned evidence lookup refused: this candidate has outstanding "
+                    "unpinned evidence lookup refused: this candidate has live or outstanding "
                     "committee work; pass the pack_hash from the work envelope"
                 )
             row = db.execute(

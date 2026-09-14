@@ -33,11 +33,16 @@ MAX_STRUCTURED_BYTES = 4096
 MAX_BODY_BYTES = 160_000
 MAX_VIEW_EVIDENCE_ROWS = 256
 
-#: Legacy pack v1 applied this same cap to its single artifact -- the artifact
-#: that served both scoring and the committee, which is the defect #67 fixes.
-#: It is retained as a *scoring-identity* projection constant (not a view
-#: bound): the methodology hash must keep reproducing historical identity.
-MAX_EVIDENCE_ROWS = MAX_VIEW_EVIDENCE_ROWS
+#: Scoring-identity row cap. **Independently declared on purpose** (review
+#: finding P1, round 2): this is the cap that feeds
+#: ``scoring.methodology_evidence_projection``, so it must never be an alias of
+#: the model-facing ``MAX_VIEW_EVIDENCE_ROWS``. If it aliased the view bound, an
+#: innocuous capacity change to what models see would silently move the
+#: methodology identity of *historical* runs and manufacture
+#: ``SCREEN_METHODOLOGY_CHANGE``. The two numbers happen to agree today; they are
+#: allowed to diverge, and changing this one requires a deliberate
+#: ``SEMANTIC_EVIDENCE_PROJECTION_VERSION`` decision.
+MAX_EVIDENCE_ROWS = 256
 
 #: Version of the methodology-identity projection applied to screen evidence ids
 #: before hashing. See `scoring.methodology_evidence_projection`.
