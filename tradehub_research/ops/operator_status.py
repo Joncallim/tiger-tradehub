@@ -28,8 +28,31 @@ from tradehub_research.validation.experiment_db import ExperimentDB
 RUNNER_RECEIPTS = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
 
 
+def _authority_record_count() -> int:
+    """Durable count of published authority records (export proof)."""
+    if not DEFAULT_AUTHORITY_DIR.is_dir():
+        return 0
+    try:
+        return sum(1 for path in DEFAULT_AUTHORITY_DIR.glob("*.json") if path.is_file())
+    except OSError:
+        return 0
+
+
+def _all_total(entry: dict | None) -> int | None:
+    """Lifetime total for a provenance entry, or None when the split is UNKNOWN.
+
+    Never coerces an unknown split to a fake 0, and never raises: a failed
+    provenance query must leave the operator status surface fully intact.
+    """
+    if not isinstance(entry, dict):
+        return None
+    genuine, acceptance = entry.get("genuine"), entry.get("acceptance")
+    if genuine is None or acceptance is None:
+        return None
+    return int(genuine) + int(acceptance)
+
+
 def _published_authority_ids() -> set[str]:
-    """Proposal ids that have a published authority record (durable export proof)."""
     if not DEFAULT_AUTHORITY_DIR.is_dir():
         return set()
     try:
@@ -204,12 +227,10 @@ def operator_status(
     # ``*_total`` fields below are GENUINE-production totals (acceptance rows
     # excluded). The untouched raw grand totals are exposed separately under
     # ``*_all_total`` so no consumer silently loses the ability to see them.
-    chain["portfolio_runs_all_total"] = (
-        provenance["portfolio_runs"]["genuine"] + provenance["portfolio_runs"]["acceptance"]
-    )
-    chain["observations_all_total"] = (
-        provenance["observations"]["genuine"] + provenance["observations"]["acceptance"]
-    )
+    # Both are None when the split is UNKNOWN — never a fake 0, and never a
+    # crash: a failed provenance query must not take the whole status down.
+    chain["portfolio_runs_all_total"] = _all_total(provenance["portfolio_runs"])
+    chain["observations_all_total"] = _all_total(provenance["observations"])
     # The LATEST DECISION's eligible exports are derived from durable state:
     # the proposals persisted for that run, intersected with the published
     # authority records. Deliberately NOT the lifetime authority-file count and

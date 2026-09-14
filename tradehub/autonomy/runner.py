@@ -487,11 +487,16 @@ def run_autonomy(
             # any budget charge or preview: the order size is the max_quantity
             # DELTA, never the completion (target) holding quantity.
             payload, telemetry = _order_payload(proposal, symbol, policy)
-            # Re-derive the quantity from the SERIALIZED payload (shares ->
-            # microunits) rather than re-reading the same field, so a cast or
-            # rounding defect in the payload is caught. The bound is the tighter
-            # of the proposal's and the published authority record's max
-            # quantity, so a tampered envelope cannot widen it.
+            # REGRESSION GUARD, NOT a tamper defense. Because _order_payload
+            # derives the quantity from max_quantity_microunits and already
+            # requires it to be a whole-share multiple, this round-trip is
+            # lossless and cannot fire against a well-formed proposal; and
+            # _validate_proposal_authority has ALREADY refused any envelope whose
+            # max_quantity_microunits differs from the published authority
+            # record, so both bounds below are equal by the time we get here.
+            # Its only value is catching a FUTURE _order_payload bug that starts
+            # sourcing the quantity from somewhere else. Envelope tampering is
+            # caught by _validate_proposal_authority, not by this check.
             serialized_microunits = int(payload["quantity"]) * 1_000_000
             bounds = [int(proposal.get("max_quantity_microunits") or 0)]
             if authority:
@@ -504,6 +509,7 @@ def run_autonomy(
                     f"serialized order quantity {serialized_microunits} exceeds "
                     f"proposal/authority max_quantity {min(bounds)}"
                 )
+            # This one IS independent: it recomputes mark x quantity itself.
             if telemetry["translated_notional_microusd"] > notional_microusd:
                 raise AutonomyRefusal(
                     f"translated notional {telemetry['translated_notional_microusd']} "

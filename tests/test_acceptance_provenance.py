@@ -261,6 +261,132 @@ def test_operator_status_provenance_is_not_silently_swallowed():
     assert 'genuine_clause(column="c.pipeline_run_id")' in src
 
 
+def test_all_total_is_none_safe_and_never_fakes_a_zero():
+    """The exact defect: None + None crashed the whole status surface."""
+    from tradehub_research.ops.operator_status import _all_total
+
+    assert _all_total({"genuine": None, "acceptance": None}) is None
+    assert _all_total({"genuine": 1, "acceptance": 2}) == 3
+    assert _all_total({"genuine": 0, "acceptance": 0}) == 0
+    assert _all_total({}) is None
+    assert _all_total(None) is None
+    # Must never raise for any malformed shape.
+    assert _all_total({"genuine": None, "acceptance": 5}) is None
+
+
+def test_operator_status_survives_a_failing_provenance_query(tmp_path, monkeypatch):
+    """ONE failing provenance query must RECORD the error and still return fully.
+
+    Regression for the crash: with the score_snapshot split unknown, that table's
+    counts must be None and the status payload must still be produced in full —
+    not an unhandled TypeError, and not a fake 0. Every other provenance query
+    keeps working, which is the realistic failure mode.
+    """
+    import sqlite3 as _sqlite3
+    from types import SimpleNamespace
+
+    from tradehub_research.ops import operator_status as ops
+
+    real = _sqlite3.connect(tmp_path / "s.db")
+    real.execute("CREATE TABLE pipeline_run (run_id TEXT, as_of TEXT, started_at TEXT)")
+    real.execute(
+        "CREATE TABLE portfolio_run (run_id TEXT, pipeline_run_id TEXT, "
+        "decision_as_of TEXT, created_at TEXT)"
+    )
+    real.execute("CREATE TABLE portfolio_state_observation (decision_id TEXT, run_id TEXT)")
+    real.execute("CREATE TABLE committee_run (committee_run_id TEXT, pipeline_run_id TEXT)")
+    real.execute("CREATE TABLE score_snapshot (snapshot_id TEXT, committee_run_id TEXT)")
+    real.execute(
+        "CREATE TABLE trade_proposal (proposal_id TEXT, decision_id TEXT, export_status TEXT)"
+    )
+    real.execute(
+        "INSERT INTO portfolio_run VALUES ('r1','genuine-a','2026-09-10T00:00:00Z','2026-09-10')"
+    )
+    real.commit()
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            if "score_snapshot" in sql:
+                raise _sqlite3.OperationalError("simulated: score_snapshot query failed")
+            return real.execute(sql, params)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def close(self):
+            pass
+
+    class _DB:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def connect(self, *args, **kwargs):
+            return _Conn()
+
+    class _EmptyCursor:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class _EmptyConn:
+        def execute(self, sql, params=()):
+            return _EmptyCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _ExpDB:
+        def connect(self, *args, **kwargs):
+            return _EmptyConn()
+
+    monkeypatch.setattr(ops, "ResearchDB", _DB)
+    monkeypatch.setattr(
+        ops,
+        "refresh_health",
+        lambda **kwargs: {"securities_expected": 0, "with_bars": 0, "stale_count": 0},
+    )
+    monkeypatch.setattr(
+        ops,
+        "forward_health",
+        lambda **kwargs: {
+            "production_predictions": 0,
+            "predictions_due": 0,
+            "matured": {},
+        },
+    )
+    monkeypatch.setattr(ops, "_authority_record_count", lambda: 0)
+    monkeypatch.setattr(ops, "_runner_receipts", lambda: {"count": 0})
+    monkeypatch.setattr(ops, "_published_authority_ids", lambda: set())
+
+    paths = SimpleNamespace(
+        research_db=tmp_path / "r.db",
+        experiment_db=tmp_path / "e.db",
+        research_dir=tmp_path,
+    )
+    settings = SimpleNamespace(busy_timeout_ms=5000)
+
+    out = ops.operator_status(settings=settings, experiment_db=_ExpDB(), paths=paths)
+
+    assert isinstance(out, dict) and out, "operator_status must still return a payload"
+    chain = out["decision_chain"]
+    provenance = chain["provenance"]
+    # The ONE failed query is recorded, not swallowed...
+    assert "score_snapshots" in provenance["query_errors"], provenance
+    # ...its split is honestly unknown...
+    assert provenance["score_snapshots"]["genuine"] is None
+    # ...the healthy queries still report, and nothing crashed.
+    assert provenance["portfolio_runs"]["genuine"] == 1
+    assert chain["provenance"]["query_errors"]["score_snapshots"].startswith("OperationalError")
+
+
 def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):
     """A NULL/unattributable run id is never genuine production."""
     con = sqlite3.connect(tmp_path / "nulls.db")
