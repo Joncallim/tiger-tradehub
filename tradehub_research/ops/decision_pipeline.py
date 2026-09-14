@@ -331,6 +331,13 @@ def export_eligible_proposals(
                 "policy_version": row["policy_version"],
                 "sizing_policy_version": row["sizing_policy_version"],
                 "proposal_mode": row["proposal_mode"],
+                # Existing owner-approved PAPER autonomy state machine. The
+                # runner binds these into the authority comparison and requires
+                # f"{current_state}->{proposed_state}" to be present in
+                # policy.allowed_state_transitions before any budget charge.
+                "current_state": row["current_state"],
+                "proposed_state": row["proposed_state"],
+                "state_transition": f"{row['current_state']}->{row['proposed_state']}",
                 # Recorded for operator transparency ONLY. It is deliberately
                 # NOT part of autonomy_eligible: the portfolio engine currently
                 # stamps every proposal with requires_human_approval=1

@@ -179,6 +179,8 @@ def _validate_proposal_authority(
         "portfolio_snapshot_id",
         "policy_version",
         "sizing_policy_version",
+        "current_state",
+        "proposed_state",
     ):
         if proposal.get(field) != record.get(field):
             raise AutonomyRefusal(f"envelope {field} does not match published authority")
@@ -321,9 +323,22 @@ def run_autonomy(
     day = now.date().isoformat()
     if not envelope_files:
         # Nothing to do: exit BEFORE any broker interaction. No PAPER proof,
-        # no allowlist query, no budget read, no ledger receipt. Polling the
-        # broker for a run that cannot act is meaningless load and meaningless
-        # evidence.
+        # no allowlist query, no budget charge, no order. The client is never
+        # even constructed, so the broker is provably untouched.
+        #
+        # A durable receipt IS recorded: FA-06 needs a verifiable artifact
+        # proving the empty-inbox path ran and contacted nothing.
+        _record_ledger(
+            {
+                "kind": "runner_run_receipt_v1",
+                "status": "IDLE_EMPTY_INBOX",
+                "broker_contacted": False,
+                "proposals_seen": 0,
+                "orders": 0,
+                "at": utc_now(),
+            },
+            ledger_path=ledger,
+        )
         return {
             "status": "IDLE_EMPTY_INBOX",
             "reason": "no proposal envelopes pending; broker untouched",
@@ -381,6 +396,19 @@ def run_autonomy(
                 envelope,
                 fixture=bool(envelope.get("fixture")),
             )
+            # Enforce the EXISTING owner-approved PAPER autonomy state machine.
+            # This is enforcement of policy.allowed_state_transitions (not a new
+            # investment rule) and it runs BEFORE any exposure check, budget
+            # charge, or broker call.
+            transition = str(
+                authority.get("state_transition")
+                or f"{proposal.get('current_state')}->{proposal.get('proposed_state')}"
+            )
+            if transition not in set(policy.allowed_state_transitions):
+                raise AutonomyRefusal(
+                    f"state transition {transition!r} is not allowed by "
+                    f"{policy.policy_version}.allowed_state_transitions"
+                )
             _validate_exposure(proposal, policy)
             # The published authority record — not the inbox file — is the
             # source of the order-driving symbol.

@@ -81,6 +81,8 @@ def _envelope(
     sellable: int | None = None,
     mark: int = 15_000_000,
     security_id: str = "S1",
+    current_state: str | None = None,
+    proposed_state: str | None = None,
 ) -> dict:
     proposal = {
         "proposal_id": proposal_id,
@@ -98,6 +100,11 @@ def _envelope(
         "portfolio_snapshot_id": "pf-1",
         "policy_version": "v1",
         "sizing_policy_version": "v1",
+        # Existing owner-approved PAPER autonomy state machine. Fixtures model a
+        # VALID transition (BUY=WATCH->ENTER, SELL=HOLD->TRIM) so the runner's
+        # allowed_state_transitions enforcement is exercised, not bypassed.
+        "current_state": current_state or ("WATCH" if action == "BUY" else "HOLD"),
+        "proposed_state": proposed_state or ("ENTER" if action == "BUY" else "TRIM"),
         "quantity_increment_microunits": 1,
         "limit_only": True,
         "created_at": created_at or "2026-08-31T12:00:00Z",

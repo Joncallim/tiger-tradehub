@@ -14,6 +14,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/tradehub-research /var/lib/tradehub/autonomy/proposals
+ReadWritePaths=/var/lib/tradehub-research /var/lib/tradehub/autonomy/proposals /var/lib/tradehub/autonomy/authority
 InaccessiblePaths=/var/lib/tradehub/autonomy/kill_switch
 InaccessiblePaths=/etc/tradehub/execution.env /etc/tradehub/autonomy.env -/etc/tradehub/tiger_private_key.pk8

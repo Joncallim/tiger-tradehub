@@ -24,14 +24,19 @@ from tradehub_research.validation.experiment_db import ExperimentDB
 RUNNER_RECEIPTS = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
 
 
-def _authority_record_count() -> int:
-    """Durable count of exported proposals (research-written authority records)."""
+def _published_authority_ids() -> set[str]:
+    """Proposal ids that have a published authority record (durable export proof)."""
     if not DEFAULT_AUTHORITY_DIR.is_dir():
-        return 0
+        return set()
     try:
-        return sum(1 for p in DEFAULT_AUTHORITY_DIR.glob("*.json") if p.is_file())
+        return {p.stem for p in DEFAULT_AUTHORITY_DIR.glob("*.json") if p.is_file()}
     except OSError:
-        return 0
+        return set()
+
+
+def _authority_record_count() -> int:
+    """LIFETIME global count of published authority records."""
+    return len(_published_authority_ids())
 
 
 def _runner_receipts() -> dict[str, Any]:
@@ -88,20 +93,26 @@ def operator_status(
     # Decision ledger: a no-proposal run is first-class, not an error. EVERY
     # field is derived from durable state, so asynchronous finalizer work can
     # never make the chain inconsistent with a stale cycle-log snapshot.
+    # LIFETIME/GLOBAL totals carry an explicit `_total` suffix; per-decision
+    # values live under `latest_decision`.
     proposal = None
-    chain = {
-        "portfolio_runs": 0,
-        "observations": 0,
-        "proposals": 0,
-        "authority_records": 0,
-        "eligible_exports": 0,
+    latest_run_id: str | None = None
+    latest_pipeline_run_id: str | None = None
+    latest_decision_as_of: str | None = None
+    latest_created_at: str | None = None
+    latest_proposals = 0
+    chain: dict[str, Any] = {
+        "portfolio_runs_total": 0,
+        "observations_total": 0,
+        "authority_records_total": 0,
+        "latest_decision": None,
     }
     with research_db.connect(read_only=True) as conn:
         try:
-            chain["portfolio_runs"] = conn.execute("SELECT count(*) FROM portfolio_run").fetchone()[
-                0
-            ]
-            chain["observations"] = conn.execute(
+            chain["portfolio_runs_total"] = conn.execute(
+                "SELECT count(*) FROM portfolio_run"
+            ).fetchone()[0]
+            chain["observations_total"] = conn.execute(
                 "SELECT count(*) FROM portfolio_state_observation"
             ).fetchone()[0]
             row = conn.execute(
@@ -109,24 +120,49 @@ def operator_status(
                 "FROM portfolio_run ORDER BY created_at DESC, rowid DESC LIMIT 1"
             ).fetchone()
             if row:
-                run_id = str(row["run_id"])
+                latest_run_id = str(row["run_id"])
+                latest_pipeline_run_id = str(row["pipeline_run_id"])
+                latest_decision_as_of = str(row["decision_as_of"])
+                latest_created_at = str(row["created_at"])
                 proposal = {
-                    "run_id": run_id,
-                    "pipeline_run_id": str(row["pipeline_run_id"]),
-                    "decision_as_of": str(row["decision_as_of"]),
-                    "created_at": str(row["created_at"]),
+                    "run_id": latest_run_id,
+                    "pipeline_run_id": latest_pipeline_run_id,
+                    "decision_as_of": latest_decision_as_of,
+                    "created_at": latest_created_at,
                 }
-                chain["proposals"] = conn.execute(
+                latest_proposals = conn.execute(
                     "SELECT count(*) FROM trade_proposal WHERE decision_id IN "
                     "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
-                    (run_id,),
+                    (latest_run_id,),
                 ).fetchone()[0]
         except Exception:  # noqa: BLE001 -- optional table
             proposal = None
-    # Exported authority records are the durable proof of export, written by
-    # research at export time regardless of which tick produced them.
-    chain["authority_records"] = _authority_record_count()
-    chain["eligible_exports"] = chain["authority_records"]
+    chain["authority_records_total"] = _authority_record_count()
+    # The LATEST DECISION's eligible exports are derived from durable state:
+    # the proposals persisted for that run, intersected with the published
+    # authority records. Deliberately NOT the lifetime authority-file count and
+    # deliberately NOT the cycle log, so an asynchronous finalizer run is
+    # reflected immediately even when cycle-log.jsonl has not changed.
+    exported_ids: list[str] = []
+    if latest_run_id is not None:
+        with research_db.connect(read_only=True) as conn:
+            rows = conn.execute(
+                "SELECT proposal_id FROM trade_proposal WHERE decision_id IN "
+                "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
+                (latest_run_id,),
+            ).fetchall()
+        proposal_ids = {str(r["proposal_id"]) for r in rows}
+        latest_proposals = len(proposal_ids)
+        exported_ids = sorted(_published_authority_ids() & proposal_ids)
+    chain["latest_decision"] = {
+        "run_id": latest_run_id,
+        "pipeline_run_id": latest_pipeline_run_id,
+        "decision_as_of": latest_decision_as_of,
+        "created_at": latest_created_at,
+        "proposals": latest_proposals,
+        "eligible_exports": len(exported_ids),
+        "exported_proposal_ids": exported_ids,
+    }
 
     # Validation: regime + snapshot presence.
     validation = {}
@@ -178,7 +214,8 @@ def operator_status(
             "decision_status": (last_cycle or {}).get("decision", {}).get("status"),
         },
         "proposal_status": {
-            "eligible_exports": chain["eligible_exports"],
+            # Latest decision's durable export count (NOT the lifetime total).
+            "eligible_exports": (chain["latest_decision"] or {}).get("eligible_exports", 0),
             "classification": (last_cycle or {}).get("decision", {}).get("status"),
         },
         "decision_chain": {

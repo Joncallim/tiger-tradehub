@@ -33,6 +33,9 @@ PROPOSAL_FIELDS = {
     "portfolio_snapshot_id": "snap-1",
     "policy_version": "paper-provisional-v1",
     "sizing_policy_version": "paper-sizing-v1",
+    # Existing owner-approved PAPER autonomy state machine.
+    "current_state": "WATCH",
+    "proposed_state": "ENTER",
 }
 
 
@@ -72,6 +75,9 @@ def _publish(authority_dir: Path, envelope: dict, **overrides) -> dict:
         "policy_version": proposal["policy_version"],
         "sizing_policy_version": proposal["sizing_policy_version"],
         "proposal_mode": "PAPER",
+        "current_state": proposal["current_state"],
+        "proposed_state": proposal["proposed_state"],
+        "state_transition": f"{proposal['current_state']}->{proposal['proposed_state']}",
         "requires_human_approval": 0,
         "autonomy_eligible": True,
         "data_as_of": envelope["data_as_of"],
@@ -177,6 +183,26 @@ def test_authority_published_before_envelope_records_no_evidence_or_credentials(
     forbidden = {"evidence", "claims", "thesis", "token", "api_key", "secret"}
     assert not (set(record) & forbidden)
     assert record["envelope_identity_hash"] == _identity(envelope)
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered"),
+    [("current_state", "TRIM"), ("proposed_state", "EXIT")],
+)
+def test_state_field_mismatch_is_refused(tmp_path, field, tampered):
+    """The authority record binds the proposal's state-machine fields."""
+    envelope = _envelope()
+    _publish(tmp_path, envelope, **{field: tampered})
+    with pytest.raises(AutonomyRefusal, match=field):
+        _validate_proposal_authority(tmp_path, envelope, fixture=False)
+
+
+def test_state_transition_is_recorded_in_authority(tmp_path):
+    envelope = _envelope()
+    record = _publish(tmp_path, envelope)
+    assert record["current_state"] == "WATCH"
+    assert record["proposed_state"] == "ENTER"
+    assert record["state_transition"] == "WATCH->ENTER"
 
 
 def test_marked_fixture_bypasses_authority(tmp_path):

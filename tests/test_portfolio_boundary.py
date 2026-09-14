@@ -69,6 +69,10 @@ SANCTIONED_FILES = {
     # Proposal-authority boundary test: deliberately imports the execution
     # runner to prove it reads only the research-written projection.
     "tests/test_proposal_authority.py",
+    # Autonomy state-transition / path-trigger boundary tests: deliberately
+    # import the execution runner to prove policy enforcement and the
+    # no-broker-on-empty-inbox contract.
+    "tests/test_autonomy_state_transitions.py",
     # the oracle module itself (hex-encoded terms; RA-03 repeats this pattern)
     "tests/test_portfolio_boundary.py",
 }

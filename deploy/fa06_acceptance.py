@@ -17,6 +17,7 @@ Read-only except for the deliberate restart/rollback actions it performs.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,26 @@ RESULTS: list[tuple[str, bool, str]] = []
 def check(name: str, ok: bool, detail: str = "") -> None:
     RESULTS.append((name, bool(ok), detail))
     print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}")
+
+
+def _last_runner_receipt(
+    path: str = "/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl",
+) -> dict | None:
+    """Most recent autonomy runner receipt, or None when absent/unreadable."""
+    try:
+        lines = [
+            line for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("kind") == "runner_run_receipt_v1":
+            return item
+    return None
 
 
 def _count_production_predictions(path: str) -> int | None:
@@ -121,15 +142,71 @@ def main() -> int:
     else:
         check("research MCP binary present", False, "binary missing")
 
-    # 5. Scheduled jobs: timers enabled and last result ok.
+    # 5. Scheduled jobs: timers enabled and last result ok. The #66 runtime
+    # surface (committee finalizer, reconcile, autonomy) is part of the
+    # acceptance contract, not just the legacy four timers.
     for timer in (
         "tradehub-daily-refresh",
         "tradehub-research-cycle",
         "tradehub-forward-capture",
         "tradehub-outcome-maturation",
+        "tradehub-committee-finalizer",
+        "tradehub-reconcile",
+        "tradehub-paper-autonomy",
     ):
         code, _ = sh(["systemctl", "is-enabled", f"{timer}.timer"])
         check(f"timer enabled {timer}", code == 0)
+
+    # 5a. Autonomy path unit must be ARMED and must trigger on inbox CHANGE,
+    # never on file EXISTENCE: a refused envelope stays on disk by design, and
+    # PathExistsGlob would re-arm forever (activation loop).
+    code, unit_text = sh(["systemctl", "cat", "tradehub-paper-autonomy.path"])
+    check(
+        "autonomy path unit uses change-trigger (no existence-glob loop)",
+        code == 0 and "PathChanged=" in unit_text and "PathExistsGlob=" not in unit_text,
+        "PathChanged on the inbox directory",
+    )
+    code, active = sh(["systemctl", "is-active", "tradehub-paper-autonomy.path"])
+    check("autonomy path unit active", code == 0 and active.strip() == "active", active.strip())
+
+    # 5b. Bounded invocation of the finalizer service under its real identity.
+    code, _ = sh(["systemctl", "start", "tradehub-committee-finalizer.service"], timeout=600)
+    rcode, result = sh(
+        [
+            "systemctl",
+            "show",
+            "tradehub-committee-finalizer.service",
+            "-p",
+            "Result",
+            "--value",
+        ]
+    )
+    check(
+        "finalizer service bounded invocation ok",
+        code == 0 and rcode == 0 and result.strip() == "success",
+        f"Result={result.strip()}",
+    )
+
+    # 5c. Autonomy with an EMPTY inbox must succeed WITHOUT contacting the
+    # broker, and must leave durable evidence saying so.
+    receipt_before = _last_runner_receipt()
+    code, _ = sh(["systemctl", "start", "tradehub-paper-autonomy.service"], timeout=600)
+    rcode, result = sh(
+        ["systemctl", "show", "tradehub-paper-autonomy.service", "-p", "Result", "--value"]
+    )
+    receipt_after = _last_runner_receipt()
+    check(
+        "autonomy empty-inbox invocation ok (no broker call)",
+        code == 0
+        and rcode == 0
+        and result.strip() == "success"
+        and receipt_after is not None
+        and receipt_after.get("status") == "IDLE_EMPTY_INBOX"
+        and receipt_after.get("broker_contacted") is False
+        and receipt_after.get("orders") == 0,
+        f"Result={result.strip()} receipt={receipt_after}",
+    )
+    del receipt_before
 
     # 6. Forward-capture idempotency with REAL evidence: re-running the
     # deployed capture service must insert no duplicate production

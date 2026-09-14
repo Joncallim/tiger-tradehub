@@ -2236,6 +2236,9 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         # the research-written projection and rejects a tampered/absent one.
         # It is an execution-boundary test, not research code.
         "tests/test_proposal_authority.py",
+        # Autonomy state-transition / path-trigger boundary tests (execution
+        # plane): policy enforcement + no-broker-on-empty-inbox evidence.
+        "tests/test_autonomy_state_transitions.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of
         # execution vocabulary in the research capability profile
         "tests/test_research_capability.py",
