@@ -335,6 +335,17 @@ def test_view_report_is_honest_about_aggregation_and_omission(tmp_path):
     assert body["representation"] == view_module.REPRESENTATION
     assert body["model_honesty"]["aggregated_series_present"] is True
     assert body["model_honesty"]["citation_scope"] == "evidence rows presented in this view"
+    # The honesty contract must be machine-readable, not only prose: these flags
+    # are what a reviewer (or an auditor) checks a model's claims against.
+    assert body["model_honesty"]["aggregate_fields_are_code_computed"] is True
+    assert body["model_honesty"]["omitted_observations_are_not_missing_data"] is True
+    assert body["model_honesty"]["lineage_set_hash_is_an_identity_not_market_evidence"] is True
+    assert body["evidence_omitted"]["omission_semantics"] == (
+        "representation_compaction_not_data_quality"
+    )
+    assert body["series_representation"]["omission_semantics"] == (
+        "representation_compaction_not_data_quality"
+    )
     momentum = next(
         entry for entry in body["screens"] if entry["family"] == "momentum_confirmation"
     )
@@ -389,14 +400,16 @@ def test_prior_legacy_run_and_lineage_run_resolve_to_equivalent_semantic_identit
     with database.connect(read_only=True) as db:
         assert (
             db.execute(
-                "SELECT lineage_hash FROM committee_run WHERE committee_run_id=?", (lineage_run,)
+                "SELECT lineage_hash FROM committee_run_lineage WHERE committee_run_id=?",
+                (lineage_run,),
             ).fetchone()[0]
             == lineage.lineage_hash
         )
         assert (
             db.execute(
-                "SELECT lineage_hash FROM committee_run WHERE committee_run_id=?", (legacy_run,)
-            ).fetchone()[0]
+                "SELECT lineage_hash FROM committee_run_lineage WHERE committee_run_id=?",
+                (legacy_run,),
+            ).fetchone()
             is None
         )
         current = db.execute(
@@ -441,8 +454,8 @@ def test_committee_run_pinned_to_a_view_without_lineage_refuses_to_score(tmp_pat
         db.execute(
             "INSERT INTO committee_run(committee_run_id,candidate_id,pipeline_run_id,pack_hash,"
             "role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,"
-            "prompt_versions_json,assessment_schema_version,lineage_hash,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "prompt_versions_json,assessment_schema_version,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "orphan",
                 candidate_id,
@@ -454,7 +467,6 @@ def test_committee_run_pinned_to_a_view_without_lineage_refuses_to_score(tmp_pat
                 scoring_hash,
                 canonical_json({"neutral": "v1"}),
                 1,
-                None,
                 "2024-06-05Z",
             ),
         )

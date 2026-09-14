@@ -172,7 +172,7 @@ def queue_committee_work(database: ResearchDB, pipeline_run_id: str) -> dict[str
                 committee_policy_version=1,
                 comparator_config_hash=comparator_hash,
                 scoring_config_hash=scoring_hash,
-                prompt_versions={"neutral": "v1", "red_team": "v1", "arbiter": "v1"},
+                prompt_versions={"neutral": "v2", "red_team": "v2", "arbiter": "v2"},
                 assessment_schema_version=1,
             )
             router.initialize(run_id)

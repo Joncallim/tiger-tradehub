@@ -469,15 +469,23 @@ class Scorer:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
         """Resolve the scoring input of record for one committee run (#67).
 
-        A run created by #67 carries ``lineage_hash`` and scores from the
-        complete scoring lineage.  A run created before #67 carries only a pack
-        hash; it scores from that legacy pack v1 body so historical results stay
-        reproducible.  A bounded committee view is never a scoring input, and
-        saying so loudly here is the point: this is the boundary that model-view
-        size limits must not be able to cross.
+        A run created by #67 carries a ``committee_run_lineage`` mapping row and
+        scores from the complete scoring lineage.  A run created before #67 has
+        no mapping row; it scores from its legacy pack v1 body so historical
+        results stay reproducible.  A bounded committee view is never a scoring
+        input, and saying so loudly here is the point: this is the boundary that
+        model-view size limits must not be able to cross.
         """
         keys = set(committee_run.keys()) if hasattr(committee_run, "keys") else set()
-        lineage_hash = committee_run["lineage_hash"] if "lineage_hash" in keys else None
+        run_id = committee_run["committee_run_id"] if "committee_run_id" in keys else None
+        lineage_hash = None
+        if run_id is not None:
+            mapping = db.execute(
+                "SELECT lineage_hash FROM committee_run_lineage WHERE committee_run_id=?",
+                (run_id,),
+            ).fetchone()
+            if mapping is not None:
+                lineage_hash = mapping[0]
         if lineage_hash:
             row = db.execute(
                 "SELECT body_json FROM scoring_lineage WHERE lineage_hash=?", (lineage_hash,)

@@ -1,7 +1,8 @@
 # PR #67 — Decouple deterministic scoring lineage from bounded committee context
 
-Status: **design accepted, NOT implemented**. Deliberately excluded from PR #66
-so a representation change cannot ride inside an already-large
+Status: **implemented** on `feat/pack-representation-decoupling` (base: merged
+main `6a4154d`, i.e. post-#66). Design was accepted and deliberately excluded
+from #66 so a representation change could not ride inside an already-large
 security/runtime PR.
 
 ## Accepted diagnosis (production, run `bcb7359…f5ef8`)
@@ -17,15 +18,21 @@ blocked:                        32
 momentum-lineage hypothesis:  CONFIRMED
 ```
 
-Two measured classes, one root cause:
+Re-measured with an instrumented rebuild of the v1 body assembly (reproduces the
+tally exactly: 8 / 24 / 2 buildable):
 
-- **8 × `PASSING_EVIDENCE_GT_256`** — the momentum screen *passed* and its
-  evidence set contains a median of **4,200** ids (max 4,257) against a bound
-  of 256. Every other family contributes 5–6 ids.
-- **24 × `FINAL_BODY_GT_160000`** — momentum did *not* pass, so passing evidence
-  is small (5–6), yet the pack body still exceeds 160 KB because the momentum
-  screen's `raw_features_json` is ≈ **2.34 MB** (measured on ALNT:
-  2,343,451 bytes) and rides into the serialized body.
+| class | n | mechanism |
+|---|---|---|
+| `PASSING_EVIDENCE_GT_256` | 8 | momentum *passed*; its evidence set is a median of 4,200 ids (max 4,257) against the 256-row bound. |
+| `FINAL_BODY_GT_160000` | 24 | momentum did *not* pass, so passing evidence stays small — but the frozen bar set is 1,100–4,300 ids, and the 256-row interpretive slice alone serializes to **205–222 KB**, over the 160 KB body cap. |
+
+Precision correction to the original note: the momentum screen's `raw_features_json`
+is ≈2.34 MB raw, but `MAX_FEATURE_SOURCES` already bounds the serialized feature
+projection to ≈28 KB; the term that actually overflows the body budget is the
+**bar-level evidence rows** the series references. So the defect is not "one big
+field" — it is that the single artifact must simultaneously carry complete
+deterministic scoring identity and bounded interpretive context, under one byte
+cap and one row cap.
 
 Momentum time-series lineage is being forced into the same physical object used
 both for deterministic scoring and for LLM context.
@@ -40,53 +47,138 @@ both for deterministic scoring and for LLM context.
 
 Verified reason truncation is dangerous: `semantic_screen_payload` includes
 `raw_features` and feeds `semantic_screen_hash`
-(`tradehub_research/committee/scoring.py:67-90`), and screen `evidence_ids`
-drive `scored_evidence`/`scored_evidence_hash` (`:111-139`, `:178-203`). A naive
-capacity fix would silently change score identity.
+(`tradehub_research/committee/scoring.py`), and screen `evidence_ids` drive
+`scored_evidence`/`scored_evidence_hash`. A naive capacity fix would silently
+change score identity.
 
-## Target architecture
+## Implemented architecture
 
 ```text
-FULL DETERMINISTIC LINEAGE  ->  scorer      (complete evidence identity)
-BOUNDED COMMITTEE VIEW      ->  LLM         (truthful aggregate + bounded evidence)
+FULL DETERMINISTIC LINEAGE  ->  scorer   (complete evidence identity, no model cap)
+BOUNDED COMMITTEE VIEW      ->  LLM      (code-computed aggregates + bounded evidence)
 ```
 
-Both bind to the same frozen candidate/pipeline run.
+Both bind to the same frozen candidate / pipeline run / `as_of` / screen results
+and are built from **one shared PIT loader**
+(`tradehub_research/committee/frozen_inputs.py`), so provenance, PIT, security,
+screen-match, cluster and underlying-group gates cannot drift between the
+artifact a scorer reads and the artifact a model sees.
+
+### Artifacts
+
+| artifact | storage | contents |
+|---|---|---|
+| `ScoringLineage` | `scoring_lineage` (append-only) | every frozen screen with its **complete** evidence identity, the versioned scoring-identity projection of `raw_features` (`SCORING_PROJECTION_VERSION = 1`, byte-identical to the v1 projection), and complete evidence identity for every frozen observation. |
+| `CommitteeView` | `evidence_pack.pack_spec_version = 2` | bounded model-facing artifact: series features replaced by deterministic aggregates, bounded interpretive evidence, explicit omission metadata, `lineage_hash` reference. |
+| pack v1 | `evidence_pack.pack_spec_version = 1` | unchanged, still the scoring input for pre-#67 runs and acceptance fixtures. |
+
+`committee_run.pack_hash` pins the view; the run→lineage association lives in the
+append-only `committee_run_lineage` mapping table (see migration/rollback below).
 
 ### Model evidence honesty (binding)
 
-Where the bounded view omits individual time-series observations, the model must
-be told it is receiving a **deterministic aggregate**, must not claim to have
-inspected omitted individual bars, and may cite only artifacts actually present
-in the committee schema. The full deterministic lineage stays auditable outside
-the LLM context. Synthetic citations for convenience are forbidden. If the
-current assessment schema cannot represent this honestly, propose the smallest
-schema extension and hostile-review it before implementation.
+The view is self-describing and machine-checkable: `representation`,
+`model_honesty.{citation_scope, reasoning_scope, aggregate_fields_are_code_computed,
+omitted_observations_are_not_missing_data,
+lineage_set_hash_is_an_identity_not_market_evidence}`,
+`evidence_omitted.{interpretive_omitted, series_observations_omitted,
+omission_semantics}`, per-screen `series_aggregates[]` with counts, session-date
+range and `lineage_set_hash`.
 
-## Equivalence gate (non-negotiable)
+The model may cite only evidence rows present in the view (the assessment
+firewall builds `in_pack` from `body["evidence"]`, so an omitted observation id is
+refused). Observations folded into an aggregate are **not** re-serialized, so they
+cannot crowd out interpretive evidence. Prompt contract: `prompt_version: "v2"`
+(skill `tradehub-committee-worker-v2`); v1 remains the historical prompt.
 
-For every candidate whose v1 pack currently builds, the new representation must
-produce identical:
+### Committee work is pinned to one artifact
 
-- family contributions
-- base evidence
-- confluence bonus
-- penalties
-- raw score
-- conviction
-- data quality
-- scored evidence identity / `scored_evidence_hash`
-- trajectory-relevant semantic identity
+`committee_work.pack_hash` (existing column) is the pin. The MCP research tool
+`get_evidence_pack(candidate_id, pack_hash=…)` returns exactly that artifact and
+fails closed on a mismatch; **unpinned** lookups are refused while the candidate
+has outstanding committee work, so a worker can never silently be shown a newer
+artifact than the one its work was issued against. Newest-artifact races cannot
+change what issued work sees.
 
-Distinguish **numerical/scoring equivalence** from **artifact identity**: a
-versioned/rebase of pack or assessment artifact ids is acceptable, a changed
-score is not. Trajectory semantics must be preserved explicitly. If any value
-changes, the design is rejected and redesigned — do not create a new scoring
-version to make a pack fit.
+### Migration / rollback
+
+Migration 12 is **purely additive**: `CREATE TABLE scoring_lineage`,
+`CREATE INDEX`, `CREATE TABLE committee_run_lineage`, append-only triggers. No
+`ALTER`, no `DROP`, no `DELETE`, no `UPDATE`; `committee_run` keeps its historical
+11-column shape. Regression: `tests/test_committee_identity_migration.py`.
+
+Verified against a production copy migrated by the new code, then exercised with
+the **pre-#67 (#66) code**:
+
+```text
+migrate()                         -> 12, no error
+committee_run columns             -> unchanged (11)
+legacy positional INSERT          -> ok
+legacy committee run resume       -> same run id
+router initialize + status        -> SCORED
+legacy score snapshot reuse       -> conviction 5, scored_evidence_hash 400f9774…
+check().integrity                 -> ok
+check().ok                        -> false  (schema_version 12 vs the old code's
+                                    compiled expectation of 11 — a reporting
+                                    field only; no operation fails)
+```
+
+Code rollback therefore does **not** require restoring the 4.6 GB database. The
+only residual difference is the old build's schema-version comparison in its own
+health payload.
+
+Known residual: the pre-#67 build has no guard against scoring a *view* (that
+guard is new code). If it were rolled back onto a database where #67 had already
+created view-pinned runs, it would need those runs re-issued; restoring is not
+required for correctness of existing (v1-pinned) history.
+
+## Equivalence gate
+
+Identical for every candidate whose v1 pack builds; measured on the two genuine
+production candidates (frozen inputs unchanged):
+
+| | CMBMF | DLR-PK |
+|---|---|---|
+| v1 pack hash (rebuilt == stored) | `91d8326d…6021` | `a80c2db4…f847` |
+| family contributions, groups, penalties, base evidence, confluence | identical | identical |
+| raw score | 6.04 | 0.0 |
+| conviction | 5 | 0 |
+| data quality | 0.156 | 0.034667 |
+| `scored_evidence_hash` | `400f9774…` | `c47e4ec4…` |
+| semantic screen hashes | identical | identical |
+| persisted production snapshot | matches | matches |
+
+Artifact identity (lineage 67,209 B vs pack 147,047 B for CMBMF) differs
+legitimately; scoring identity does not. Legacy pack reproducibility is asserted
+by rebuilding v1 through the refactored shared loader and comparing to the stored
+row: identical `pack_hash` and byte-identical canonical body (also proven
+cross-tree against main@`6a4154d` for a synthetic fixture, hash `ea586446…`).
+
+Trajectory semantics: the prior run is resolved through the same artifact
+resolver, so a representation change cannot manufacture
+`SCREEN_METHODOLOGY_CHANGE`; unchanged scored evidence with a changed committee
+representation remains `MODEL_REASSESSMENT`.
+
+## Capacity (production copy, genuine run)
+
+```text
+decision candidates        34
+materialized               34
+PACK_TOO_LARGE              0
+controls refused            5
+view bytes   median 39,871 · p95 52,501 · max 52,530   (cap 160,000)
+lineage bytes median 1.47 MB · max 2.36 MB            (~50 MB total)
+interpretive evidence omitted 0 for every candidate
+series observations omitted are counted + hashed + range-reported per feature
+```
+
+The 160 KB view cap is unchanged (no bound was relaxed to make this fit).
 
 ## Acceptance for PR #67
 
-- all 34 decision candidates reach committee materialization
-- golden equivalence suite green against currently-buildable candidates
-- the 2 already-SCORED production candidates keep byte-identical scoring output
-- explicit statement of what the bounded view omits and how the model is told
+- [x] all 34 decision candidates reach committee materialization
+- [x] golden equivalence suite green against currently-buildable candidates
+- [x] the 2 already-SCORED production candidates keep identical scoring output
+- [x] explicit statement of what the bounded view omits and how the model is told
+- [x] migration is rollback-safe; v1 artifact identity reproduced
+- [x] committee work pinned to an exact artifact, fail-closed

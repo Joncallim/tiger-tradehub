@@ -308,6 +308,7 @@ class CommitteeViewBuilder:
             "evidence_omitted": {
                 "count": 0,
                 "reasons": {},
+                "omission_semantics": "representation_compaction_not_data_quality",
                 "deterministic_order": (
                     "interpretive_passing_first_then_evidence_id, then series representatives"
                 ),
@@ -317,6 +318,7 @@ class CommitteeViewBuilder:
                 "observation_references": series_references,
                 "represented_by": "deterministic per-feature aggregates",
                 "individual_observations_in_lineage": True,
+                "omission_semantics": "representation_compaction_not_data_quality",
             },
             "model_honesty": {
                 "representation": REPRESENTATION,
@@ -328,6 +330,9 @@ class CommitteeViewBuilder:
                     "deterministic aggregates and presented evidence rows; the model must not "
                     "imply it inspected observations that were not presented"
                 ),
+                "aggregate_fields_are_code_computed": True,
+                "omitted_observations_are_not_missing_data": True,
+                "lineage_set_hash_is_an_identity_not_market_evidence": True,
                 "scoring_lineage": "referenced by lineage.hash (not visible to models)",
             },
             "bounds": {
@@ -403,6 +408,7 @@ class CommitteeViewBuilder:
             "series_observations_omitted": omitted_series,
             "series_representatives_presented": representative_presented,
             "reasons": dict(sorted(reasons.items())),
+            "omission_semantics": skeleton["evidence_omitted"]["omission_semantics"],
             "deterministic_order": (
                 "interpretive_passing_first_then_evidence_id, then series representatives"
             ),

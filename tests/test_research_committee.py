@@ -1602,7 +1602,7 @@ def test_candidate_trends_follow_as_of_not_snapshot_hash(tmp_path):
                 ),
             )
             raw.execute(
-                "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     f"committee-{run_id}",
                     candidate_id,
@@ -1615,7 +1615,6 @@ def test_candidate_trends_follow_as_of_not_snapshot_hash(tmp_path):
                     "{}",
                     1,
                     as_of,
-                    None,
                 ),
             )
         for snapshot_id, run_id, conviction in (
@@ -1691,7 +1690,7 @@ def test_prior_snapshot_selection_excludes_future_as_of(tmp_path):
             ),
         )
         raw.execute(
-            "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "future-committee",
                 "candidate",
@@ -1704,7 +1703,6 @@ def test_prior_snapshot_selection_excludes_future_as_of(tmp_path):
                 "{}",
                 1,
                 "2026-01-01Z",
-                None,
             ),
         )
         raw.execute(

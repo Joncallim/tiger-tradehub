@@ -1032,7 +1032,13 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         CREATE INDEX scoring_lineage_run_idx ON scoring_lineage(pipeline_run_id);
         CREATE TRIGGER scoring_lineage_no_update BEFORE UPDATE ON scoring_lineage BEGIN SELECT RAISE(ABORT, 'scoring_lineage is append-only'); END;
         CREATE TRIGGER scoring_lineage_no_delete BEFORE DELETE ON scoring_lineage BEGIN SELECT RAISE(ABORT, 'scoring_lineage is append-only'); END;
-        ALTER TABLE committee_run ADD COLUMN lineage_hash TEXT REFERENCES scoring_lineage(lineage_hash);
+        CREATE TABLE committee_run_lineage (
+            committee_run_id TEXT PRIMARY KEY REFERENCES committee_run(committee_run_id),
+            lineage_hash TEXT NOT NULL REFERENCES scoring_lineage(lineage_hash),
+            recorded_at TEXT NOT NULL
+        );
+        CREATE TRIGGER committee_run_lineage_no_update BEFORE UPDATE ON committee_run_lineage BEGIN SELECT RAISE(ABORT, 'committee_run_lineage is append-only'); END;
+        CREATE TRIGGER committee_run_lineage_no_delete BEFORE DELETE ON committee_run_lineage BEGIN SELECT RAISE(ABORT, 'committee_run_lineage is append-only'); END;
         """,
     ),
 )

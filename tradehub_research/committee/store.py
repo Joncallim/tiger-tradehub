@@ -276,11 +276,13 @@ class CommitteeStore:
     ) -> str:
         del provider_routes
         roles = list(NEUTRAL_ROLES)
-        # ``lineage_hash`` is deliberately NOT part of the logical identity: the
-        # committee run is pinned by ``pack_hash`` (the bounded view), and the
-        # view body embeds its lineage hash, so pack_hash -> lineage_hash is
-        # functional.  Adding it here would mint new run ids for existing runs
-        # and break idempotent resume.
+        # ``lineage_hash`` is recorded in the append-only ``committee_run_lineage``
+        # mapping table, never as a column on ``committee_run``: that keeps the
+        # historical table shape (and therefore pre-#67 code on a migrated
+        # database) intact, and keeps the association deterministic and
+        # append-only.  It is deliberately NOT part of the logical identity --
+        # the run is pinned by ``pack_hash`` (the bounded view), and the view body
+        # embeds its lineage hash, so pack_hash -> lineage_hash is functional.
         logical = {
             "candidate_id": candidate_id,
             "pack_hash": pack_hash,
@@ -302,7 +304,6 @@ class CommitteeStore:
             scoring_config_hash,
             canonical_json(dict(prompt_versions)),
             assessment_schema_version,
-            lineage_hash,
         )
         with self.database.connect() as db:
             candidate = db.execute(
@@ -320,18 +321,48 @@ class CommitteeStore:
             ):
                 raise ValueError("committee run candidate/pack mismatch")
             stored = db.execute(
-                "SELECT committee_run_id,candidate_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version,lineage_hash FROM committee_run WHERE committee_run_id=?",
+                "SELECT committee_run_id,candidate_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version FROM committee_run WHERE committee_run_id=?",
                 (run_id,),
             ).fetchone()
             if stored is not None:
                 if tuple(stored) != values:
                     raise DeterminismError("committee run identity collision")
+                self._record_lineage(db, run_id, lineage_hash)
                 return run_id
             db.execute(
-                "INSERT INTO committee_run(committee_run_id,candidate_id,pipeline_run_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version,lineage_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO committee_run(committee_run_id,candidate_id,pipeline_run_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (run_id, candidate_id, candidate[0], *values[2:], utc_now()),
             )
+            self._record_lineage(db, run_id, lineage_hash)
         return run_id
+
+    @staticmethod
+    def _record_lineage(db: Any, run_id: str, lineage_hash: str | None) -> None:
+        """Record (or verify) the append-only run -> lineage association.
+
+        Legacy runs created before #67 simply have no mapping row.
+        """
+        if lineage_hash is None:
+            return
+        existing = db.execute(
+            "SELECT lineage_hash FROM committee_run_lineage WHERE committee_run_id=?", (run_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != lineage_hash:
+                raise DeterminismError("committee run lineage collision")
+            return
+        if (
+            db.execute(
+                "SELECT lineage_hash FROM scoring_lineage WHERE lineage_hash=?", (lineage_hash,)
+            ).fetchone()
+            is None
+        ):
+            raise ValueError(f"unknown scoring lineage: {lineage_hash}")
+        db.execute(
+            "INSERT INTO committee_run_lineage(committee_run_id,lineage_hash,recorded_at) "
+            "VALUES (?,?,?)",
+            (run_id, lineage_hash, utc_now()),
+        )
 
     def record_transition(
         self,

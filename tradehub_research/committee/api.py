@@ -71,7 +71,7 @@ def create_run(
             comparator_config_hash=body.get("comparator_config_hash", comparator),
             scoring_config_hash=body.get("scoring_config_hash", scoring),
             prompt_versions=body.get(
-                "prompt_versions", {"neutral": "v1", "red_team": "v1", "arbiter": "v1"}
+                "prompt_versions", {"neutral": "v2", "red_team": "v2", "arbiter": "v2"}
             ),
             assessment_schema_version=int(body.get("assessment_schema_version", 1)),
         )
