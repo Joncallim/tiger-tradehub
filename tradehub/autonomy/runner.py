@@ -486,6 +486,11 @@ def run_autonomy(
             # and notional against the proposal's own bounds. This runs BEFORE
             # any budget charge or preview: the order size is the max_quantity
             # DELTA, never the completion (target) holding quantity.
+            #
+            # NOTE: with the current _order_payload the quantity assertion is a
+            # regression GUARD (order quantity is derived from the same field),
+            # not a second independent derivation. The notional assertion IS
+            # independent (it recomputes mark x quantity).
             payload, telemetry = _order_payload(proposal, symbol, policy)
             declared_max_quantity = int(proposal.get("max_quantity_microunits") or 0)
             if telemetry["order_quantity_microunits"] > declared_max_quantity:

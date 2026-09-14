@@ -2245,6 +2245,9 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         # Disposable-DB E2E: exporter + production runner boundary against a
         # throwaway migrated database (execution plane).
         "tests/test_disposable_e2e_p66.py",
+        # Real producer->consumer quantity proof (execution plane): real sizing
+        # output consumed by the production runner.
+        "tests/test_disposable_e2e_held.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of
         # execution vocabulary in the research capability profile
         "tests/test_research_capability.py",

@@ -183,6 +183,15 @@ def operator_status(
     except Exception:  # noqa: BLE001 -- optional tables
         pass
     chain["provenance"] = provenance
+    # ``*_total`` fields below are GENUINE-production totals (acceptance rows
+    # excluded). The untouched raw grand totals are exposed separately under
+    # ``*_all_total`` so no consumer silently loses the ability to see them.
+    chain["portfolio_runs_all_total"] = (
+        provenance["portfolio_runs"]["genuine"] + provenance["portfolio_runs"]["acceptance"]
+    )
+    chain["observations_all_total"] = (
+        provenance["observations"]["genuine"] + provenance["observations"]["acceptance"]
+    )
     # The LATEST DECISION's eligible exports are derived from durable state:
     # the proposals persisted for that run, intersected with the published
     # authority records. Deliberately NOT the lifetime authority-file count and

@@ -61,13 +61,77 @@ def test_sql_clauses_are_complementary(tmp_path):
     assert genuine & acceptance == set()
 
 
-def test_operator_status_excludes_acceptance_rows_and_reports_the_split():
+def _mini_db(tmp_path):
+    """Minimal DB with the shapes operator_status queries."""
+    con = sqlite3.connect(tmp_path / "mini.db")
+    con.execute(
+        "CREATE TABLE portfolio_run (run_id TEXT, pipeline_run_id TEXT, "
+        "decision_as_of TEXT, created_at TEXT)"
+    )
+    con.execute("CREATE TABLE portfolio_state_observation (run_id TEXT, pipeline_run_id TEXT)")
+    con.executemany(
+        "INSERT INTO portfolio_run VALUES (?,?,?,?)",
+        [
+            ("gen-1", "bcb73591996077de45a9c5e6ea8d72be2dd3781d870e999dbd9809bde83f5ef8", "t", "2"),
+            ("gen-2", "another-genuine-run", "t", "1"),
+            ("acc-1", "pr66-acceptance-0", "t", "4"),
+            ("acc-2", "pr66-acceptance-v2-3", "t", "3"),
+        ],
+    )
+    con.executemany(
+        "INSERT INTO portfolio_state_observation VALUES (?,?)",
+        [
+            ("gen-1", "bcb73591996077de45a9c5e6ea8d72be2dd3781d870e999dbd9809bde83f5ef8"),
+            ("gen-2", "another-genuine-run"),
+            ("acc-1", "pr66-acceptance-0"),
+            ("acc-2", "pr66-acceptance-v2-3"),
+        ],
+    )
+    con.commit()
+    return con
+
+
+def test_operator_status_queries_separate_genuine_from_acceptance(tmp_path):
+    """Behavioural: run the SAME query shapes operator_status composes."""
+    con = _mini_db(tmp_path)
+    gsql, gparams = genuine_clause()
+
+    genuine_runs = con.execute(
+        f"SELECT count(*) FROM portfolio_run WHERE {gsql}", gparams
+    ).fetchone()[0]
+    all_runs = con.execute("SELECT count(*) FROM portfolio_run").fetchone()[0]
+    genuine_obs = con.execute(
+        "SELECT count(*) FROM portfolio_state_observation o JOIN portfolio_run r "
+        f"ON r.run_id = o.run_id WHERE r.{gsql}",
+        gparams,
+    ).fetchone()[0]
+
+    assert genuine_runs == 2
+    assert all_runs == 4
+    assert all_runs - genuine_runs == 2  # acceptance rows excluded
+    assert genuine_obs == 2
+
+    # The latest GENUINE decision must never be an acceptance run.
+    latest = con.execute(
+        f"SELECT pipeline_run_id FROM portfolio_run WHERE {gsql} ORDER BY created_at DESC LIMIT 1",
+        gparams,
+    ).fetchone()[0]
+    assert not is_acceptance_run(latest)
+    assert latest == "bcb73591996077de45a9c5e6ea8d72be2dd3781d870e999dbd9809bde83f5ef8"
+
+
+def test_operator_status_source_wires_the_shared_clause_and_reports_the_split():
     src = (ROOT / "tradehub_research" / "ops" / "operator_status.py").read_text(encoding="utf-8")
-    # Genuine counts must be filtered by the shared clause...
     assert "genuine_clause()" in src
-    assert 'WHERE " + gsql' in src or '" WHERE " + gsql' in src
-    # ...and the split must be reported explicitly.
     assert '"provenance"' in src
     assert "acceptance_run_prefixes" in src
-    # The latest decision must not be an acceptance run.
-    assert "FROM portfolio_run WHERE " in src
+    # Raw grand totals stay visible rather than being silently rewritten.
+    assert "portfolio_runs_all_total" in src
+    assert "observations_all_total" in src
+
+
+def test_forward_capture_never_captures_an_acceptance_run():
+    src = (ROOT / "tradehub_research" / "ops" / "forward_capture.py").read_text(encoding="utf-8")
+    assert "is_acceptance_run" in src
+    assert "SKIPPED_ACCEPTANCE_RUN" in src
+    assert "genuine_clause()" in src

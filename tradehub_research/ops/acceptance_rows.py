@@ -14,6 +14,20 @@ Consumers that MUST exclude acceptance rows:
   - investment-evidence conclusions
   - adaptive training/evaluation inputs
   - operator genuine-production counts
+
+WIRING STATUS (kept honest — do not overclaim):
+  WIRED:
+    - tradehub_research/ops/operator_status.py  (genuine counts + provenance split,
+      and the latest decision never resolves to an acceptance run)
+    - tradehub_research/ops/forward_capture.py   (acceptance runs are never
+      captured into the production forward ledger, and the implicit
+      "latest run" selection skips them)
+  NOT YET WIRED (tracked as follow-up; do NOT assume protection):
+    - portfolio performance reporting
+    - investment-evidence conclusion surfaces
+    - adaptive training/evaluation inputs
+  Callers in those surfaces should adopt genuine_clause()/is_acceptance_run()
+  before they are treated as protected.
 """
 
 from __future__ import annotations
@@ -43,7 +57,14 @@ def genuine_clause(column: str = "pipeline_run_id") -> tuple[str, tuple[str, ...
 
 
 def acceptance_clause(column: str = "pipeline_run_id") -> tuple[str, tuple[str, ...]]:
+    """SQL predicate for acceptance rows.
+
+    NULL-safe to match ``is_acceptance_run``: an unattributable row (NULL) is
+    never genuine production, so it counts as acceptance rather than falling
+    through SQL three-valued logic.
+    """
+    likes = " OR ".join(f"{column} LIKE ?" for _ in ACCEPTANCE_RUN_PREFIXES)
     return (
-        " OR ".join(f"{column} LIKE ?" for _ in ACCEPTANCE_RUN_PREFIXES),
+        f"({likes} OR {column} IS NULL OR {column} = '')",
         tuple(f"{prefix}%" for prefix in ACCEPTANCE_RUN_PREFIXES),
     )

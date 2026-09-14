@@ -17,6 +17,7 @@ import sys
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
+from tradehub_research.ops.acceptance_rows import genuine_clause, is_acceptance_run
 from tradehub_research.ops.common import ResearchPaths, research_paths
 from tradehub_research.screen_store import ScreenStore
 from tradehub_research.validation.experiment_db import ExperimentDB
@@ -43,14 +44,22 @@ def capture_production_predictions(
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
     store = ScreenStore(research_db)
 
+    gsql, gparams = genuine_clause()
     if run_id is None:
         with research_db.connect(read_only=True) as conn:
             row = conn.execute(
-                "SELECT run_id FROM pipeline_run ORDER BY started_at DESC LIMIT 1"
+                "SELECT run_id FROM pipeline_run WHERE " + gsql + " "
+                "ORDER BY started_at DESC LIMIT 1",
+                gparams,
             ).fetchone()
         if row is None:
             return {"status": "NO_RUN", "predictions": 0}
         run_id = str(row[0])
+    elif is_acceptance_run(run_id):
+        # ACCEPTANCE runs are deployment-verification artifacts. They must
+        # never enter the production forward ledger, or they would contaminate
+        # forward-learning results, evidence conclusions and adaptive training.
+        return {"status": "SKIPPED_ACCEPTANCE_RUN", "predictions": 0, "run_id": run_id}
 
     # The PRODUCTION observation date is the pipeline_run.as_of (the actual
     # screening date) -- NEVER screen_result.computed_at (wall clock).
