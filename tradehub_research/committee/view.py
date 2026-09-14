@@ -108,18 +108,19 @@ def _observation_sort_key(item: dict[str, Any]) -> tuple[str, str]:
     return (str(item.get("session_date") or ""), str(item.get("evidence_id") or ""))
 
 
-def resolve_aggregate(features: Any, path: str) -> dict[str, Any]:
-    """Resolve the *shipped* aggregate object for an aggregate path.
+def resolve_aggregate(features: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+    """Resolve the *shipped* aggregate object for an aggregate key path.
 
     ``truncate_strings`` rebuilds the feature tree, so the object that ends up in
     ``screens[].raw_features`` is a copy of the one the builder collected. Trim
     must be applied to the copy that actually ships (review finding P1, round 4),
-    which is what this locator provides.
+    which is what this locator provides. The path is a captured key tuple rather
+    than a split string, so a feature key containing "/" cannot break it (review
+    finding P3, round 6).
     """
-    relative = path.split("/raw_features/", 1)[1].split("/")
     cursor: Any = features
-    for part in relative:
-        cursor = cursor[int(part)] if isinstance(cursor, list) else cursor[part]
+    for key in keys:
+        cursor = cursor[int(key)] if isinstance(cursor, list) else cursor[key]
     return cursor
 
 
@@ -153,7 +154,19 @@ def _series_aggregate(
     else:
         head = MAX_SERIES_REPRESENTATIVES // 2
         presented = ordered[:head] + ordered[-(MAX_SERIES_REPRESENTATIVES - head) :]
-    compacted = len(ordered) - len(presented)
+    # A series list may repeat an evidence id; the shipped aggregate must never
+    # advertise the same id twice (review finding P3, round 6), because a model
+    # copying the list would be rejected as "contains duplicates".
+    unique_presented: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in presented:
+        key = str(item.get("evidence_id") or "")
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        unique_presented.append(item)
+    presented = unique_presented
+    compacted = max(0, total - len(presented) - (total - len(ordered)))
     return {
         "value": value.get("value"),
         "unit": value.get("unit"),
@@ -190,6 +203,7 @@ def aggregate_series(
     aggregates: list[dict[str, Any]],
     aggregated_ids: set[str],
     admissible_ids: set[str],
+    keys: tuple[str, ...] = (),
 ) -> Any:
     """Replace every observation series with a deterministic aggregate.
 
@@ -216,6 +230,7 @@ def aggregate_series(
             aggregates.append(
                 {
                     "path": path,
+                    "keys": keys,
                     "aggregate": aggregate,
                     "referenced_ids": sorted(series_observation_ids(value)),
                 }
@@ -223,13 +238,25 @@ def aggregate_series(
             return aggregate
         return {
             key: aggregate_series(
-                value[key], f"{path}/{key}", aggregates, aggregated_ids, admissible_ids
+                value[key],
+                f"{path}/{key}",
+                aggregates,
+                aggregated_ids,
+                admissible_ids,
+                (*keys, key),
             )
             for key in sorted(value)
         }
     if isinstance(value, list):
         return [
-            aggregate_series(item, f"{path}/{index}", aggregates, aggregated_ids, admissible_ids)
+            aggregate_series(
+                item,
+                f"{path}/{index}",
+                aggregates,
+                aggregated_ids,
+                admissible_ids,
+                (*keys, str(index)),
+            )
             for index, item in enumerate(value)
         ]
     return value
@@ -309,6 +336,7 @@ class CommitteeViewBuilder:
         truncations: list[dict[str, Any]] = []
         screens: list[dict[str, Any]] = []
         screen_aggregates: dict[str, list[dict[str, Any]]] = {}
+        screen_declared: dict[str, set[str]] = {}
         aggregated_ids: set[str] = set()
         series_referenced_ids: set[str] = set()
         representative_ids: list[str] = []
@@ -336,6 +364,7 @@ class CommitteeViewBuilder:
                     if evidence_id not in representative_ids:
                         representative_ids.append(evidence_id)
             screen_aggregates[row["screen_result_id"]] = pairs
+            screen_declared[row["screen_result_id"]] = set(evidence_ids)
             if pairs:
                 # Series screens advertise their representative observations. The
                 # list is restricted to ids this screen actually declares and is
@@ -462,7 +491,13 @@ class CommitteeViewBuilder:
             if len(presented_ids) >= MAX_VIEW_EVIDENCE_ROWS:
                 reasons["row_cap"] = reasons.get("row_cap", 0) + 1
                 return False
-            probe = self._evidence_row(inputs, evidence_id, {}, probe_truncations)
+            # Probe with the *worst-case* shipped row shape: the shipped row adds
+            # superseded_within_pack_by (review finding P3, round 6), so probing
+            # without it could admit a row that the final fail-closed byte check
+            # then rejects.
+            probe = self._evidence_row(
+                inputs, evidence_id, {evidence_id: "0" * 64}, probe_truncations
+            )
             if probe is None:
                 reasons["structured_row_oversize"] = reasons.get("structured_row_oversize", 0) + 1
                 return False
@@ -487,13 +522,14 @@ class CommitteeViewBuilder:
         for evidence_id in interpretive:
             _admit(evidence_id)
         # Supersession is view-local: it may only point at an observation that is
-        # actually visible here (v1 semantics), so it is resolved after the
-        # visible set is fixed.
+        # actually visible here (v1 semantics). BOTH endpoints must be visible
+        # (review finding P2, round 6): pack v1 iterated only its selected rows, so
+        # naming an invisible successor would advertise an uncitable id.
         visible = set(presented_ids)
         successors = {
             row["supersedes_evidence_id"]: evidence_id
             for evidence_id, row in inputs.evidence_rows.items()
-            if row["supersedes_evidence_id"] in visible
+            if evidence_id in visible and row["supersedes_evidence_id"] in visible
         }
         presented = [
             self._evidence_row(inputs, evidence_id, successors, truncations)
@@ -511,7 +547,7 @@ class CommitteeViewBuilder:
             meta: list[dict[str, Any]] = []
             shipped = screen["raw_features"]
             for pair in screen_aggregates[screen["screen_result_id"]]:
-                aggregate = resolve_aggregate(shipped, pair["path"])
+                aggregate = resolve_aggregate(shipped, pair["keys"])
                 admitted = [
                     evidence_id
                     for evidence_id in aggregate["representative_evidence_ids"]
@@ -551,8 +587,12 @@ class CommitteeViewBuilder:
             screen["evidence_ids"] = [
                 evidence_id for evidence_id in screen["evidence_ids"] if evidence_id in visible_ids
             ]
-            screen["evidence_ids_omitted"] = screen["evidence_id_count"] - len(
-                screen["evidence_ids"]
+            # Declared-minus-presented, not declared-minus-advertised (review
+            # finding P3, round 6): a declared id that is visible without being
+            # advertised as a representative is presented, not omitted.
+            declared = screen_declared[screen["screen_result_id"]]
+            screen["evidence_ids_omitted"] = len(declared) - sum(
+                1 for evidence_id in declared if evidence_id in visible_ids
             )
         representative_presented = sum(
             1 for evidence_id in representative_ids if evidence_id in visible_ids

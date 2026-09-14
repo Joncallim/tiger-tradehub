@@ -18,6 +18,7 @@ reached the copy that ships, plus four more defects. This module pins:
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import pytest
 from test_committee_identity_migration import (  # noqa: E402 - sibling test fixture
@@ -36,12 +37,39 @@ from tradehub_research.committee.scoring import (
     score_screens,
 )
 from tradehub_research.committee.store import ScoringSpec
-from tradehub_research.committee.view import CommitteeViewBuilder, resolve_aggregate
+from tradehub_research.committee.view import CommitteeViewBuilder
 from tradehub_research.db import ResearchDB
 from tradehub_research.screen_store import DeterminismError, ScreenResult, ScreenSpec
 from tradehub_research.screens import canonical_json
 
 AS_OF = "2025-06-30T00:00:00Z"
+
+
+def find_shipped(features: Any, lineage_set_hash: str) -> dict:
+    """Locate the shipped aggregate object by its lineage identity.
+
+    Resolving by path string is brittle (a feature key may contain "/"), and the
+    identity is the field the model is told to trust, so the tests locate the
+    object the same way a reader would.
+    """
+    found: list[dict] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if (
+                node.get("lineage_set_hash") == lineage_set_hash
+                and "representative_evidence_ids" in node
+            ):
+                found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(features)
+    assert len(found) == 1, f"expected exactly one shipped aggregate for {lineage_set_hash}"
+    return found[0]
 
 
 def _assert_shipped_copies_agree(view: dict) -> None:
@@ -54,7 +82,7 @@ def _assert_shipped_copies_agree(view: dict) -> None:
             screen["evidence_ids"]
         )
         for entry in screen["series_aggregates"]:
-            shipped = resolve_aggregate(screen["raw_features"], entry["path"])
+            shipped = find_shipped(screen["raw_features"], entry["lineage_set_hash"])
             advertised = set(shipped["representative_evidence_ids"])
             assert advertised <= presented, "shipped aggregate advertises an unadmitted id"
             assert shipped["observations_presented"] == len(advertised)
