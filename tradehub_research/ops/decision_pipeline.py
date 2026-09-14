@@ -343,6 +343,56 @@ def run_portfolio_decision(
     *,
     pipeline_run_id: str,
     decision_as_of: str,
+    evidence_as_of: str | None = None,
+    inbox: Path | None = None,
+    snapshot=None,
+) -> dict[str, Any]:
+    """Two-clock decision entry point.
+
+    ``evidence_as_of`` is the frozen pipeline market/evidence cutoff. It bounds
+    every model fact and every packed evidence row (PIT firewall) and never
+    moves forward because committee models finished later.
+
+    ``decision_as_of`` is the actual operational decision time and must be
+    >= every persisted score's ``computed_at`` for this run so an
+    asynchronously completed committee score stays visible to Phase 3.
+
+    Score ``computed_at`` is never backdated to satisfy this contract.
+    """
+    if evidence_as_of is not None and normalize_ts(decision_as_of) < normalize_ts(evidence_as_of):
+        raise ValueError("decision_as_of must not precede evidence_as_of")
+    with database.connect(read_only=True) as conn:
+        future = conn.execute(
+            "SELECT count(*) FROM score_snapshot s JOIN committee_run c "
+            "ON c.committee_run_id=s.committee_run_id "
+            "WHERE c.pipeline_run_id=? AND s.computed_at>?",
+            (pipeline_run_id, normalize_ts(decision_as_of)),
+        ).fetchone()[0]
+    if future:
+        # Loud by design: refusing here is the assertion that protects the
+        # two-clock contract. Fix by using an operational decision time, never
+        # by backdating score computed_at.
+        raise ValueError(
+            f"{future} persisted score(s) are newer than decision_as_of; "
+            "decision_as_of must be the actual operational decision time"
+        )
+    result = _run_portfolio_decision_inner(
+        database,
+        pipeline_run_id=pipeline_run_id,
+        decision_as_of=decision_as_of,
+        inbox=inbox,
+        snapshot=snapshot,
+    )
+    result.setdefault("evidence_as_of", normalize_ts(evidence_as_of) if evidence_as_of else None)
+    result.setdefault("decision_as_of", normalize_ts(decision_as_of))
+    return result
+
+
+def _run_portfolio_decision_inner(
+    database: ResearchDB,
+    *,
+    pipeline_run_id: str,
+    decision_as_of: str,
     inbox: Path | None = None,
     snapshot=None,
 ) -> dict[str, Any]:

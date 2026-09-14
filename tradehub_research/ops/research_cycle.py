@@ -128,9 +128,25 @@ def run_research_cycle(
     # validation helper masquerading as an operational score and left the
     # decision ledger empty.  Queue actual committee work, score only READY
     # committee runs, then call the existing Phase-3 engine.
+    #
+    # TWO-CLOCK CONTRACT (do not merge these):
+    #   evidence_as_of = as_of_ts: the frozen pipeline market/evidence cutoff.
+    #     It bounds every packed evidence row and every model fact (PIT) and is
+    #     never moved forward because committee models finished later.
+    #   decision_as_of = the actual operational decision time (now). It is
+    #     always >= a persisted score's computed_at, so an asynchronously
+    #     completed committee score stays visible to Phase 3. The score's own
+    #     computed_at is never backdated.
+    evidence_as_of = as_of_ts
     committee = queue_committee_work(research_db, run_id)
     scores = persist_ready_scores(research_db, run_id)
-    decision = run_portfolio_decision(research_db, pipeline_run_id=run_id, decision_as_of=as_of_ts)
+    decision_as_of = utc_now()
+    decision = run_portfolio_decision(
+        research_db,
+        pipeline_run_id=run_id,
+        decision_as_of=decision_as_of,
+        evidence_as_of=evidence_as_of,
+    )
 
     summary = {
         "status": "OK",
@@ -146,6 +162,8 @@ def run_research_cycle(
         "score_snapshot_ids": scores["score_snapshots"],
         "committee_pending": scores["committee_pending"],
         "decision": decision,
+        "evidence_as_of": evidence_as_of,
+        "decision_as_of": decision_as_of,
         "committee_needed": bool(committee["committee_runs"]),
         "created_at": utc_now(),
     }
