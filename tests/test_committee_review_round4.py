@@ -104,12 +104,21 @@ def test_series_omission_counts_separate_not_frozen(tmp_path):
     view = CommitteeViewBuilder(database).build(candidate_id).body
     aggregates = [entry for screen in view["screens"] for entry in screen["series_aggregates"]]
     compacted = sum(entry["observations_compacted"] for entry in aggregates)
-    not_frozen = sum(entry["observations_not_frozen"] for entry in aggregates)
-    assert not_frozen > 0, "fixture must reference observations that are not frozen evidence"
-    assert view["evidence_omitted"]["series_references_not_frozen"] == not_frozen
+    per_feature_not_frozen = sum(entry["observations_not_frozen"] for entry in aggregates)
+    assert per_feature_not_frozen > 0
+    # Top-level counters are distinct-unit counts and must reconcile (review
+    # finding P3, round 5): presented + compacted + not-frozen == referenced.
+    presented = view["evidence_omitted"]["series_representatives_presented"]
+    omitted = view["evidence_omitted"]["series_observations_omitted"]
+    not_frozen = view["evidence_omitted"]["series_references_not_frozen"]
+    distinct_referenced = view["evidence_omitted"]["series_observations_referenced_distinct"]
+    assert presented + omitted + not_frozen == distinct_referenced
+    assert not_frozen <= per_feature_not_frozen
     total_references = sum(entry["observation_count"] for entry in aggregates)
     assert (
-        compacted + not_frozen + sum(entry["observations_presented"] for entry in aggregates)
+        compacted
+        + per_feature_not_frozen
+        + sum(entry["observations_presented"] for entry in aggregates)
         == total_references
     )
     semantics = view["evidence_omitted"]["semantics"]
@@ -242,10 +251,13 @@ def _cluster_fixture(path):
                     "2024-06-03Z",
                 ),
             )
-        # c1: the first half of the passing bars plus the bridging outside bar.
-        # c2: the second half of the passing bars plus the bridging outside bar.
-        # c3: the remaining outside bars.
-        bridging = outside_bars[0]
+        # c1: the first half of the passing bars plus the bridging bar.
+        # c2: the second half of the passing bars plus the bridging bar.
+        # c3: the remaining outside bars. The bridge is deliberately the LAST bar,
+        # i.e. beyond the 256-id historical selection (review finding P3, round 5):
+        # with the bridge inside the selection the whole-set derivation merges the
+        # same components and the regression would not discriminate.
+        bridging = outside_bars[-1]
         for cluster_id, members in (
             ("c1", passing_bars[:118] + [bridging]),
             ("c2", passing_bars[118:] + [bridging]),
@@ -361,10 +373,20 @@ def test_group_labels_are_anchored_to_the_historical_selection(tmp_path):
         assert lineage_labels[evidence_id] == pack_labels[evidence_id], (
             f"label drift for {evidence_id} inside the historical selection"
         )
-    # The scenario is real: rows outside the selection exist and carry labels.
+    # The scenario is real and discriminating: the merge caused by the outside
+    # bridge WOULD relabel inside-selection rows, so an unanchored derivation
+    # would fail the equality above.
     outside = sorted(set(lineage_labels) - selected)
     assert outside, "fixture must contain rows outside the historical selection"
     assert all(lineage_labels[evidence_id] for evidence_id in outside)
+    from tradehub_research.committee.frozen_inputs import compute_groups, load_frozen_inputs
+
+    with database.connect(read_only=True) as db:
+        inputs = load_frozen_inputs(db, candidate_id)
+    unanchored = compute_groups(inputs.evidence_rows, inputs.clusters, set(inputs.passing_ids))
+    assert any(
+        unanchored[evidence_id] != lineage_labels[evidence_id] for evidence_id in sorted(selected)
+    ), "the regression must discriminate: an unanchored derivation must differ inside the selection"
     # Scored-evidence identity is therefore identical to what v1 scored.
     spec = ScoringSpec().as_dict()
     scored_pack = score_screens(pack.body["screens"], pack.body["evidence"], spec)

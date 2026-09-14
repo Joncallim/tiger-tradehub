@@ -77,8 +77,13 @@ def _omission_semantics() -> dict[str, str]:
     return {
         "series_observations": _SERIES_OMISSION_SEMANTICS,
         "series_references_outside_frozen_set": (
-            "referenced by a feature's series but not part of this candidate's frozen "
-            "evidence; these are in no lineage and in no aggregate"
+            "distinct observations referenced by a feature's series but not part of this "
+            "candidate's frozen evidence; these are in no lineage and in no aggregate, and "
+            "carry no retention claim"
+        ),
+        "counts_reconcile": (
+            "presented representatives + series_observations_omitted + "
+            "series_references_not_frozen == series_observations_referenced_distinct"
         ),
         "interpretive_rows": _INTERPRETIVE_OMISSION_SEMANTICS,
         "data_quality_signal": (
@@ -206,7 +211,15 @@ def aggregate_series(
         if isinstance(sources, list):
             aggregate = _series_aggregate(value, sources, admissible_ids)
             aggregated_ids.update(series_observation_ids(value))
-            aggregates.append({"path": path, "aggregate": aggregate})
+            # ``referenced_ids`` stays internal (never serialized): it lets the
+            # builder count distinct referenced-but-not-frozen observations.
+            aggregates.append(
+                {
+                    "path": path,
+                    "aggregate": aggregate,
+                    "referenced_ids": sorted(series_observation_ids(value)),
+                }
+            )
             return aggregate
         return {
             key: aggregate_series(
@@ -297,9 +310,9 @@ class CommitteeViewBuilder:
         screens: list[dict[str, Any]] = []
         screen_aggregates: dict[str, list[dict[str, Any]]] = {}
         aggregated_ids: set[str] = set()
+        series_referenced_ids: set[str] = set()
         representative_ids: list[str] = []
         series_references = 0
-        series_not_frozen = 0
         admissible_ids = set(inputs.evidence_rows)
         for item in inputs.results:
             row = item.row
@@ -318,20 +331,27 @@ class CommitteeViewBuilder:
             evidence_ids = list(item.evidence_ids)
             series_references += sum(pair["aggregate"]["observation_count"] for pair in pairs)
             for pair in pairs:
+                series_referenced_ids.update(pair["referenced_ids"])
                 for evidence_id in pair["aggregate"]["representative_evidence_ids"]:
                     if evidence_id not in representative_ids:
                         representative_ids.append(evidence_id)
             screen_aggregates[row["screen_result_id"]] = pairs
             if pairs:
-                # Series screens present their representative observations; the
-                # complete id set is committed by digest instead of being
-                # re-serialized (thousands of ids would consume the budget that
-                # belongs to interpretive evidence).
-                presented_ids = [
-                    evidence_id
-                    for pair in pairs
-                    for evidence_id in pair["aggregate"]["representative_evidence_ids"]
-                ][:MAX_VIEW_EVIDENCE_ROWS]
+                # Series screens advertise their representative observations. The
+                # list is restricted to ids this screen actually declares and is
+                # deduplicated in first-seen order (review finding P2, round 5):
+                # two features over the same series otherwise yield duplicate
+                # advertised ids, which the assessment validator rejects as
+                # malformed, and a repeated id would corrupt the omitted count.
+                declared = set(evidence_ids)
+                presented_ids = list(
+                    dict.fromkeys(
+                        evidence_id
+                        for pair in pairs
+                        for evidence_id in pair["aggregate"]["representative_evidence_ids"]
+                        if evidence_id in declared
+                    )
+                )[:MAX_VIEW_EVIDENCE_ROWS]
             else:
                 presented_ids = evidence_ids[:MAX_VIEW_EVIDENCE_ROWS]
             screens.append(
@@ -505,7 +525,12 @@ class CommitteeViewBuilder:
                 ]
                 aggregate["observations_presented"] = len(admitted)
                 aggregate["observations_omitted"] = aggregate["observation_count"] - len(admitted)
-                series_not_frozen += aggregate["observations_not_frozen"]
+                # Recomputed after admission so the shipped counters always add
+                # up (review finding P3, round 5): the pre-trim value counted
+                # representatives that admission later declined.
+                aggregate["observations_compacted"] = (
+                    aggregate["observations_omitted"] - aggregate["observations_not_frozen"]
+                )
                 meta.append(
                     {
                         "path": pair["path"],
@@ -533,14 +558,20 @@ class CommitteeViewBuilder:
             1 for evidence_id in representative_ids if evidence_id in visible_ids
         )
         omitted_interpretive = sum(1 for item in interpretive if item not in visible_ids)
-        omitted_series = max(0, len(aggregated_ids) - representative_presented)
+        # Distinct-unit counters (review finding P3, round 5): every referenced
+        # observation is exactly one of presented / frozen-but-compacted /
+        # referenced-but-not-frozen, so the three published numbers reconcile.
+        frozen_ids = set(inputs.frozen_ids)
+        not_frozen_ids = series_referenced_ids - frozen_ids
+        omitted_series = max(0, len(aggregated_ids & frozen_ids) - representative_presented)
         body = dict(skeleton)
         body["evidence"] = presented
         body["evidence_omitted"] = {
             "count": omitted_interpretive + omitted_series,
             "interpretive_omitted": omitted_interpretive,
             "series_observations_omitted": omitted_series,
-            "series_references_not_frozen": series_not_frozen,
+            "series_references_not_frozen": len(not_frozen_ids),
+            "series_observations_referenced_distinct": len(series_referenced_ids),
             "series_representatives_presented": representative_presented,
             "reasons": dict(sorted(reasons.items())),
             "semantics": skeleton["evidence_omitted"]["semantics"],
