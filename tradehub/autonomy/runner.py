@@ -486,17 +486,23 @@ def run_autonomy(
             # and notional against the proposal's own bounds. This runs BEFORE
             # any budget charge or preview: the order size is the max_quantity
             # DELTA, never the completion (target) holding quantity.
-            #
-            # NOTE: with the current _order_payload the quantity assertion is a
-            # regression GUARD (order quantity is derived from the same field),
-            # not a second independent derivation. The notional assertion IS
-            # independent (it recomputes mark x quantity).
             payload, telemetry = _order_payload(proposal, symbol, policy)
-            declared_max_quantity = int(proposal.get("max_quantity_microunits") or 0)
-            if telemetry["order_quantity_microunits"] > declared_max_quantity:
+            # Re-derive the quantity from the SERIALIZED payload (shares ->
+            # microunits) rather than re-reading the same field, so a cast or
+            # rounding defect in the payload is caught. The bound is the tighter
+            # of the proposal's and the published authority record's max
+            # quantity, so a tampered envelope cannot widen it.
+            serialized_microunits = int(payload["quantity"]) * 1_000_000
+            bounds = [int(proposal.get("max_quantity_microunits") or 0)]
+            if authority:
+                bounds.append(int(authority.get("max_quantity_microunits") or 0))
+            bounds = [bound for bound in bounds if bound > 0]
+            if serialized_microunits <= 0:
+                raise AutonomyRefusal("serialized order quantity is not positive")
+            if bounds and serialized_microunits > min(bounds):
                 raise AutonomyRefusal(
-                    f"translated order quantity {telemetry['order_quantity_microunits']} "
-                    f"exceeds proposal max_quantity {declared_max_quantity}"
+                    f"serialized order quantity {serialized_microunits} exceeds "
+                    f"proposal/authority max_quantity {min(bounds)}"
                 )
             if telemetry["translated_notional_microusd"] > notional_microusd:
                 raise AutonomyRefusal(

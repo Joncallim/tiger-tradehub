@@ -172,6 +172,95 @@ def test_forward_capture_uses_the_run_id_column_for_pipeline_run():
     assert "SKIPPED_ACCEPTANCE_RUN" in src
 
 
+def test_provenance_queries_use_the_right_column_per_table(tmp_path):
+    """Regression for the malformed-SQL finding.
+
+    A schema-accurate DB: score_snapshot has NEITHER pipeline_run_id NOR run_id
+    (it links via committee_run), and portfolio_state_observation has no
+    pipeline_run_id (it links via portfolio_run.run_id). Every provenance query
+    must therefore use an explicitly qualified column, and must NOT silently
+    degrade to zeros.
+    """
+    con = sqlite3.connect(tmp_path / "prov.db")
+    con.execute("CREATE TABLE portfolio_run (run_id TEXT, pipeline_run_id TEXT, created_at TEXT)")
+    con.execute("CREATE TABLE portfolio_state_observation (decision_id TEXT, run_id TEXT)")
+    con.execute("CREATE TABLE committee_run (committee_run_id TEXT, pipeline_run_id TEXT)")
+    con.execute("CREATE TABLE score_snapshot (snapshot_id TEXT, committee_run_id TEXT)")
+
+    con.executemany(
+        "INSERT INTO portfolio_run VALUES (?,?,?)",
+        [("r1", "genuine-a", "2"), ("r2", "pr66-acceptance-0", "1")],
+    )
+    con.executemany(
+        "INSERT INTO portfolio_state_observation VALUES (?,?)",
+        [("d1", "r1"), ("d2", "r2")],
+    )
+    con.executemany(
+        "INSERT INTO committee_run VALUES (?,?)",
+        [("c1", "genuine-a"), ("c2", "pr66-acceptance-0"), ("c3", "genuine-b")],
+    )
+    con.executemany(
+        "INSERT INTO score_snapshot VALUES (?,?)",
+        [("s1", "c1"), ("s2", "c2"), ("s3", "c3")],
+    )
+    con.commit()
+
+    gsql, gparams = genuine_clause()
+    obs_sql, obs_params = genuine_clause(column="r.pipeline_run_id")
+    committee_sql, committee_params = genuine_clause(column="c.pipeline_run_id")
+
+    specs = (
+        ("portfolio_runs", "portfolio_run", "SELECT count(*) FROM portfolio_run", gsql, gparams),
+        (
+            "observations",
+            "portfolio_state_observation o JOIN portfolio_run r ON r.run_id = o.run_id",
+            "SELECT count(*) FROM portfolio_state_observation",
+            obs_sql,
+            obs_params,
+        ),
+        (
+            "score_snapshots",
+            "score_snapshot s JOIN committee_run c ON c.committee_run_id = s.committee_run_id",
+            "SELECT count(*) FROM score_snapshot",
+            committee_sql,
+            committee_params,
+        ),
+        ("committee_runs", "committee_run", "SELECT count(*) FROM committee_run", gsql, gparams),
+    )
+    results = {}
+    for key, source, total_sql, where_sql, where_params in specs:
+        try:
+            total = con.execute(total_sql).fetchone()[0]
+            genuine = con.execute(
+                f"SELECT count(*) FROM {source} WHERE {where_sql}", where_params
+            ).fetchone()[0]
+            results[key] = {"genuine": genuine, "acceptance": total - genuine}
+        except sqlite3.Error as exc:  # pragma: no cover - would be the defect
+            results[key] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    assert results == {
+        "portfolio_runs": {"genuine": 1, "acceptance": 1},
+        "observations": {"genuine": 1, "acceptance": 1},
+        "score_snapshots": {"genuine": 2, "acceptance": 1},
+        "committee_runs": {"genuine": 2, "acceptance": 1},
+    }, results
+
+    # The naive form (unqualified / wrong column) genuinely fails — which is
+    # exactly the silent-zero defect this test guards against.
+    with pytest.raises(sqlite3.OperationalError):
+        con.execute("SELECT count(*) FROM score_snapshot WHERE not_a_real_column").fetchone()
+
+
+def test_operator_status_provenance_is_not_silently_swallowed():
+    src = (ROOT / "tradehub_research" / "ops" / "operator_status.py").read_text(encoding="utf-8")
+    # Failures must be RECORDED, not swallowed by a bare pass.
+    assert "query_errors" in src
+    assert 'provenance[key] = {"genuine": None, "acceptance": None}' in src
+    # Every provenance query must be explicitly column-qualified.
+    assert 'genuine_clause(column="r.pipeline_run_id")' in src
+    assert 'genuine_clause(column="c.pipeline_run_id")' in src
+
+
 def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):
     """A NULL/unattributable run id is never genuine production."""
     con = sqlite3.connect(tmp_path / "nulls.db")

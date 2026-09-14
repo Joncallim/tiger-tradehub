@@ -111,6 +111,7 @@ def operator_status(
     # conclusions, or adaptive training/evaluation inputs.
     gsql, gparams = genuine_clause()
     obs_sql, obs_params = genuine_clause(column="r.pipeline_run_id")
+    committee_sql, committee_params = genuine_clause(column="c.pipeline_run_id")
     provenance: dict[str, Any] = {
         "acceptance_run_prefixes": list(ACCEPTANCE_RUN_PREFIXES),
         "portfolio_runs": {"genuine": 0, "acceptance": 0},
@@ -155,34 +156,50 @@ def operator_status(
         except Exception:  # noqa: BLE001 -- optional table
             proposal = None
     chain["authority_records_total"] = _authority_record_count()
-    # Genuine vs acceptance split for the decision chain. Deterministic and
-    # derived from durable run-id labelling only.
-    try:
-        with research_db.connect(read_only=True) as conn:
-            for key, table in (
-                ("portfolio_runs", "portfolio_run"),
-                ("observations", "portfolio_state_observation"),
-                ("score_snapshots", "score_snapshot"),
-                ("committee_runs", "committee_run"),
-            ):
-                if table == "portfolio_state_observation":
-                    total = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                    genuine = conn.execute(
-                        f"SELECT count(*) FROM {table} o JOIN portfolio_run r "
-                        f"ON r.run_id = o.run_id WHERE r." + gsql,
-                        gparams,
-                    ).fetchone()[0]
-                else:
-                    total = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                    genuine = conn.execute(
-                        f"SELECT count(*) FROM {table} WHERE " + gsql, gparams
-                    ).fetchone()[0]
+    # Genuine vs acceptance split for the decision chain. Every table is filtered
+    # through an EXPLICITLY QUALIFIED column on the table that actually owns the
+    # pipeline run id:
+    #   portfolio_run                 -> pipeline_run_id (own column)
+    #   portfolio_state_observation   -> via portfolio_run.run_id
+    #   score_snapshot                -> via committee_run (has NEITHER
+    #                                    pipeline_run_id NOR run_id)
+    #   committee_run                 -> pipeline_run_id (own column)
+    # A wrong column here raises OperationalError, so failures are RECORDED
+    # rather than swallowed: a silent zero would be a misleading report.
+    provenance_errors: dict[str, str] = {}
+    provenance_specs = (
+        ("portfolio_runs", "portfolio_run", "SELECT count(*) FROM portfolio_run", gsql, gparams),
+        (
+            "observations",
+            "portfolio_state_observation o JOIN portfolio_run r ON r.run_id = o.run_id",
+            "SELECT count(*) FROM portfolio_state_observation",
+            obs_sql,
+            obs_params,
+        ),
+        (
+            "score_snapshots",
+            "score_snapshot s JOIN committee_run c ON c.committee_run_id = s.committee_run_id",
+            "SELECT count(*) FROM score_snapshot",
+            committee_sql,
+            committee_params,
+        ),
+        ("committee_runs", "committee_run", "SELECT count(*) FROM committee_run", gsql, gparams),
+    )
+    for key, source, total_sql, where_sql, where_params in provenance_specs:
+        try:
+            with research_db.connect(read_only=True) as conn:
+                total = conn.execute(total_sql).fetchone()[0]
+                genuine = conn.execute(
+                    f"SELECT count(*) FROM {source} WHERE {where_sql}", where_params
+                ).fetchone()[0]
                 provenance[key] = {
                     "genuine": int(genuine),
                     "acceptance": int(total) - int(genuine),
                 }
-    except Exception:  # noqa: BLE001 -- optional tables
-        pass
+        except Exception as exc:  # noqa: BLE001 -- reported, never silent
+            provenance[key] = {"genuine": None, "acceptance": None}
+            provenance_errors[key] = f"{type(exc).__name__}: {exc}"
+    provenance["query_errors"] = provenance_errors
     chain["provenance"] = provenance
     # ``*_total`` fields below are GENUINE-production totals (acceptance rows
     # excluded). The untouched raw grand totals are exposed separately under

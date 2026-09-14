@@ -305,6 +305,12 @@ def test_disposable_e2e_tampered_authority_refuses(disposable):  # noqa: F811
     summary = _run(disposable)
     assert summary["orders"] == 0
     assert summary["refusals"]
+    # The refusal must be ATTRIBUTABLE to the tamper, not any incidental cause.
+    assert any(
+        "does not match published authority" in str(entry.get("reason", ""))
+        for entry in summary["refusals"]
+    ), summary["refusals"]
+    assert [p for p, _ in disposable["client"].calls if p.startswith("/orders/")] == []
 
 
 def test_disposable_e2e_duplicate_rerun_does_not_duplicate_the_order(disposable):  # noqa: F811
