@@ -1,8 +1,15 @@
 [Unit]
-Description=TradeHub autonomous PAPER runner timer (Mon/Wed/Fri)
+Description=TradeHub autonomous PAPER runner timer (bounded recovery poll)
 
 [Timer]
-OnCalendar=Mon,Wed,Fri *-*-* 23:20:00
+# Event-driven first: tradehub-paper-autonomy.path starts a pass immediately
+# when a proposal envelope is exported. This timer is only a bounded RECOVERY
+# poll for a missed path event (or a restart mid-export). It must never be a
+# tight poll: the runner exits before any broker call when the inbox is empty,
+# but a 5-minute cadence still produced hundreds of meaningless broker
+# PAPER-proof receipts.
+OnBootSec=15min
+OnUnitActiveSec=30min
 Persistent=true
 
 [Install]

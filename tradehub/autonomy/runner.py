@@ -5,8 +5,11 @@ THE PRIVILEGED ACTOR IS THIS PROGRAM, NOT A MODEL. It:
   surface, never decides whether a stock is attractive, never changes
   investment weights or risk policy;
 - receives ONLY typed eligible trade_proposal envelopes (research-side,
-  portfolio-engine-produced; a proposal may carry `fixture: true` ONLY for
-  the separately-marked deterministic acceptance fixture);
+  portfolio-engine-produced). The production envelope grammar carries NO
+  fixture metadata at all: the mere PRESENCE of a `fixture`/`fixture_tag` key
+  (whatever its value) is refused. Only the separately-marked deterministic
+  acceptance harness, which enables fixture behaviour OUT OF BAND via
+  `run_autonomy(..., fixture_mode=True)`, may use marked fixtures;
 - revalidates: versioned PAPER policy, kill switch, positive PAPER account
   proof (via the execution API's live broker query), proposal freshness,
   data freshness, symbol allowlist, holdings/long-only, daily count/notional
@@ -23,7 +26,9 @@ Zero eligible proposals -> zero orders (a successful run).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -32,13 +37,20 @@ from tradehub.autonomy import kill_switch
 from tradehub.autonomy.budgets import BUDGET_DB, charge, daily_usage
 from tradehub.autonomy.policy import POLICY_FILE, PaperAutonomyPolicy, load_policy
 from tradehub_research.config import ResearchSettings
-from tradehub_research.db import ResearchDB, utc_now
+from tradehub_research.db import utc_now
+from tradehub_research.screens import canonical_json
 
 INBOX_DIR = Path("/var/lib/tradehub/autonomy/proposals")
 PROCESSED_DIR = INBOX_DIR / "processed"
 LEDGER_FILE = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
+# The ONLY research-written artifact this identity may read. The autonomy
+# identity never opens research.db.
+AUTHORITY_DIR = Path(
+    os.getenv("TRADEHUB_PROPOSAL_AUTHORITY_DIR", "/var/lib/tradehub/autonomy/authority")
+)
+AUTHORITY_SCHEMA_VERSION = "paper-proposal-authority-v1"
 
-EXECUTION_API = __import__("os").getenv("TRADEHUB_EXECUTION_API", "http://127.0.0.1:8787")
+EXECUTION_API = os.getenv("TRADEHUB_EXECUTION_API", "http://127.0.0.1:8787")
 AUTONOMOUS_TAG = "autonomous-paper-v1"
 
 
@@ -111,23 +123,77 @@ def prove_paper_account(client, settings: ResearchSettings) -> dict:
     return proof
 
 
-def _resolve_ticker(research_db: ResearchDB | None):
-    def resolve(security_id: str, as_of: str) -> str | None:
-        # Best-effort identity cross-check: absent/unavailable research DB
-        # degrades to None (the envelope symbol is authoritative); a DB error
-        # must never block the runner's own validation in isolated runs.
-        if research_db is None:
-            return None
-        try:
-            with research_db.connect(read_only=True) as conn:
-                row = conn.execute(
-                    "SELECT canonical_ticker FROM security WHERE security_id=?", (security_id,)
-                ).fetchone()
-            return str(row["canonical_ticker"]).upper() if row and row["canonical_ticker"] else None
-        except Exception:  # noqa: BLE001 -- best-effort cross-check
-            return None
+def _validate_proposal_authority(
+    authority_dir: Path | None, envelope: dict, *, fixture_mode: bool
+) -> dict:
+    """Bind a runnable envelope to the research-published authority projection.
 
-    return resolve
+    The autonomy identity has NO research-database access. Authority is the
+    narrow research-written projection published BEFORE the envelope; an
+    envelope whose authority record is absent, ineligible, or inconsistent
+    fails closed. Only marked acceptance fixtures bypass this check.
+    """
+    if fixture_mode:
+        return {}
+    if authority_dir is None:
+        raise AutonomyRefusal("proposal authority directory unavailable; refusing")
+    proposal = envelope.get("proposal")
+    if not isinstance(proposal, dict):
+        raise AutonomyRefusal("envelope has no typed proposal")
+    proposal_id = proposal.get("proposal_id")
+    if not isinstance(proposal_id, str) or not proposal_id:
+        raise AutonomyRefusal("proposal missing proposal_id")
+    path = authority_dir / f"{proposal_id}.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise AutonomyRefusal("no persisted proposal authority; refusing") from exc
+    except (OSError, ValueError) as exc:
+        raise AutonomyRefusal(f"proposal authority unreadable: {type(exc).__name__}") from exc
+    if not isinstance(record, dict):
+        raise AutonomyRefusal("proposal authority is not an object")
+    if record.get("schema_version") != AUTHORITY_SCHEMA_VERSION:
+        raise AutonomyRefusal("unexpected proposal authority schema")
+    if record.get("proposal_id") != proposal_id:
+        raise AutonomyRefusal("proposal authority id mismatch")
+    if not record.get("autonomy_eligible"):
+        raise AutonomyRefusal("persisted proposal is not eligible PAPER/non-FIXTURE")
+    # Recompute the stable envelope identity (wall-clock metadata excluded) and
+    # require exact equality with the published authority.
+    stable = dict(envelope)
+    stable.pop("exported_at", None)
+    identity = hashlib.sha256(canonical_json(stable).encode()).hexdigest()
+    if record.get("envelope_identity_hash") != identity:
+        raise AutonomyRefusal("envelope identity does not match published authority")
+    symbol = str(envelope.get("symbol") or "").upper()
+    if not symbol or symbol != str(record.get("canonical_symbol") or "").upper():
+        raise AutonomyRefusal("envelope symbol does not match published authority")
+    # The record's own convenience string must agree with its own bound fields.
+    # A producer that wrote a mismatched state_transition is refused outright,
+    # so the policy gate below never has to trust it.
+    derived = f"{record.get('current_state')}->{record.get('proposed_state')}"
+    if record.get("state_transition") not in (None, derived):
+        raise AutonomyRefusal("proposal authority state_transition is internally inconsistent")
+    if str(envelope.get("data_as_of", ""))[:10] != str(record.get("data_as_of"))[:10]:
+        raise AutonomyRefusal("envelope data_as_of does not match published authority")
+    for field in (
+        "security_id",
+        "action",
+        "max_quantity_microunits",
+        "completion_quantity_microunits",
+        "max_notional_microusd",
+        "target_weight_ppm",
+        "current_weight_ppm",
+        "score_snapshot_id",
+        "portfolio_snapshot_id",
+        "policy_version",
+        "sizing_policy_version",
+        "current_state",
+        "proposed_state",
+    ):
+        if proposal.get(field) != record.get(field):
+            raise AutonomyRefusal(f"envelope {field} does not match published authority")
+    return record
 
 
 def _proposal_age_ok(proposal: dict, policy: PaperAutonomyPolicy, now: datetime) -> bool:
@@ -152,16 +218,35 @@ def _data_age_ok(envelope: dict, policy: PaperAutonomyPolicy, now: datetime) -> 
     return age <= policy.data_max_age_seconds
 
 
-def _validate_envelope(envelope: dict, policy: PaperAutonomyPolicy, now: datetime) -> None:
+def _validate_envelope(
+    envelope: dict, policy: PaperAutonomyPolicy, now: datetime, *, fixture_mode: bool
+) -> None:
     proposal = envelope.get("proposal")
     if not isinstance(proposal, dict):
         raise AutonomyRefusal("envelope has no typed proposal")
     if "proposal_id" not in proposal:
         raise AutonomyRefusal("proposal missing proposal_id (typed trade-proposal required)")
-    if envelope.get("fixture") and not str(envelope.get("fixture_tag", "")).startswith(
-        "paper-acceptance-fixture"
-    ):
-        raise AutonomyRefusal("fixture proposals require a marked acceptance-fixture tag")
+    # Fixture authority is NEVER payable from envelope contents. In production
+    # the presence of ANY fixture-metadata KEY is a forgery attempt and is
+    # refused REGARDLESS OF ITS VALUE: `fixture: false` and `fixture_tag: ""`
+    # are exactly as invalid as `fixture: true`, so the production envelope
+    # grammar cannot contain fixture metadata at all. (Truthiness was the bug:
+    # a falsy marker slipped through a check written for key presence.)
+    if not fixture_mode:
+        forged = sorted(
+            {
+                f"{where}.{key}"
+                for where, source in (("envelope", envelope), ("proposal", proposal))
+                for key in ("fixture", "fixture_tag")
+                if key in source
+            }
+        )
+        if forged:
+            raise AutonomyRefusal(
+                f"envelope carries fixture metadata key(s) {forged}; fixture "
+                "authority cannot be claimed from envelope contents and is refused "
+                "outside an explicitly isolated acceptance harness"
+            )
     if not _proposal_age_ok(proposal, policy, now):
         raise AutonomyRefusal("proposal is stale (older than proposal_max_age)")
     if not _data_age_ok(envelope, policy, now):
@@ -185,45 +270,78 @@ def _validate_exposure(proposal: dict, policy: PaperAutonomyPolicy) -> None:
         )
 
 
-def _order_payload(proposal: dict, symbol: str, policy: PaperAutonomyPolicy) -> dict:
-    """Map the typed proposal to the EXISTING OrderIntent contract (no new
-    order route; long-only BUY for ENTER/ADD, SELL bounded by holdings)."""
+def _order_payload(proposal: dict, symbol: str, policy: PaperAutonomyPolicy) -> tuple[dict, dict]:
+    """Map the typed proposal to the EXISTING OrderIntent contract.
+
+    QUANTITY SEMANTICS (load-bearing):
+      max_quantity_microunits        = the ORDER quantity, i.e. the DELTA traded
+      completion_quantity_microunits = the TARGET post-trade holding quantity
+
+    The order size is ALWAYS the delta. Using completion would over-order:
+    holding 10 and buying 5 completes at 15, and sending 15 buys 15.
+
+    Returns (payload, telemetry) so the caller can independently assert the
+    order quantity and the translated notional against the proposal bounds
+    BEFORE any budget charge or preview.
+    """
     action = str(proposal["action"]).upper()
     if action not in ("BUY", "SELL"):
         raise AutonomyRefusal(f"unsupported action {action!r} (long-only US equities only)")
-    quantity_microunits = int(
-        proposal.get("completion_quantity_microunits")
-        or proposal.get("max_quantity_microunits")
-        or 0
-    )
-    if quantity_microunits <= 0:
-        raise AutonomyRefusal("proposal has zero executable quantity")
-    if quantity_microunits % 1_000_000 != 0:
+
+    order_microunits = int(proposal.get("max_quantity_microunits") or 0)
+    if order_microunits <= 0:
+        raise AutonomyRefusal("proposal has zero executable quantity (max_quantity_microunits)")
+    if order_microunits % 1_000_000 != 0:
         raise AutonomyRefusal(
             "fractional share quantities are not supported (US stocks, whole shares only)"
         )
-    if quantity_microunits < 1_000_000:
+    if order_microunits < 1_000_000:
         raise AutonomyRefusal("quantity below one whole share")
+
+    # The completion (target) quantity must be a consistent delta on the current
+    # holding when the holding is known. Integer microunit arithmetic only.
+    completion = proposal.get("completion_quantity_microunits")
+    current = proposal.get("current_quantity_microunits")
+    if completion is not None and current is not None:
+        expected = (
+            int(current) + order_microunits if action == "BUY" else int(current) - order_microunits
+        )
+        if int(completion) != expected:
+            raise AutonomyRefusal(
+                f"proposal completion_quantity_microunits {completion} is not a consistent "
+                f"delta on holding {current} for a {action} of {order_microunits} microunits"
+            )
+
     if action == "SELL":
-        current = proposal.get("current_quantity_microunits")
         sellable = proposal.get("sellable_quantity_microunits")
-        if sellable is not None and quantity_microunits > int(sellable):
+        if sellable is not None and order_microunits > int(sellable):
             raise AutonomyRefusal("SELL quantity exceeds sellable holdings (long-only)")
-        if current is not None and quantity_microunits > int(current):
+        if current is not None and order_microunits > int(current):
             raise AutonomyRefusal("SELL quantity exceeds current holdings (long-only)")
+
     mark = proposal.get("mark_price_microusd")
     if not mark:
         raise AutonomyRefusal("proposal missing mark_price_microusd (LIMIT price required)")
-    return {
+
+    # Deterministic integer notional translation: microunits x microusd / 1e6.
+    translated_notional_microusd = order_microunits * int(mark) // 1_000_000
+    payload = {
         "symbol": symbol,
         "side": action,
-        "quantity": quantity_microunits / 1_000_000,
+        "quantity": order_microunits // 1_000_000,
         "order_type": "LIMIT",
         "limit_price": int(mark) / 1_000_000,
         "currency": "USD",
         "reason": f"autonomous-paper-v1:{proposal.get('proposal_id', '')[:24]}",
         "client_request_id": f"ap-{proposal.get('proposal_id', '')[:40]}",
     }
+    telemetry = {
+        "order_quantity_microunits": order_microunits,
+        "completion_quantity_microunits": completion,
+        "translated_notional_microusd": translated_notional_microusd,
+        "declared_max_notional_microusd": int(proposal.get("max_notional_microusd") or 0),
+    }
+    return payload, telemetry
 
 
 def _record_ledger(entry: dict, ledger_path: Path = LEDGER_FILE) -> None:
@@ -244,10 +362,20 @@ def run_autonomy(
     now: datetime | None = None,
     paper_proof: dict | None = None,
     kill_switch_path: Path | None = None,
+    authority_dir: Path | None = AUTHORITY_DIR,
+    fixture_mode: bool = False,
 ) -> dict:
     """One deterministic autonomous-PAPER run. Returns the run summary.
 
     Deterministic + injectable for tests (now/api_client/paper_proof/allowlist).
+
+    ``fixture_mode`` is an OUT-OF-BAND, harness-only switch that permits
+    envelopes without a persisted authority record. It defaults to False, can
+    NEVER be enabled from envelope contents (the PRESENCE of a fixture/
+    fixture_tag key in the inbox envelope or its proposal is refused, whatever
+    its value -- not honoured), and is NOT enabled by the deployed systemd
+    unit. Production runs therefore require persisted authority for every
+    envelope.
     """
     now = now or _now()
     policy = load_policy(policy_path)
@@ -257,6 +385,41 @@ def run_autonomy(
     if policy.kill_switch or kill_switch.is_blocked(kill_path):
         return {"status": "BLOCKED", "reason": "kill switch engaged", "orders": 0}
     kill_switch.assert_allowed(kill_path)
+
+    inbox.mkdir(parents=True, exist_ok=True)
+    processed_dir = inbox / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    envelope_files = sorted(inbox.glob("*.json"))
+    day = now.date().isoformat()
+    if not envelope_files:
+        # Nothing to do: exit BEFORE any broker interaction. No PAPER proof,
+        # no allowlist query, no budget charge, no order. The client is never
+        # even constructed, so the broker is provably untouched.
+        #
+        # A durable receipt IS recorded: FA-06 needs a verifiable artifact
+        # proving the empty-inbox path ran and contacted nothing.
+        _record_ledger(
+            {
+                "kind": "runner_run_receipt_v1",
+                "status": "IDLE_EMPTY_INBOX",
+                "broker_contacted": False,
+                "proposals_seen": 0,
+                "orders": 0,
+                "at": utc_now(),
+            },
+            ledger_path=ledger,
+        )
+        return {
+            "status": "IDLE_EMPTY_INBOX",
+            "reason": "no proposal envelopes pending; broker untouched",
+            "policy_version": policy.policy_version,
+            "orders": 0,
+            "proposals_seen": 0,
+            "refusals": [],
+            "executions": [],
+            "paper_proof": None,
+            "at": utc_now(),
+        }
 
     client = api_client or _client(settings)
     try:
@@ -272,12 +435,6 @@ def run_autonomy(
         }
     allowlist = allowlist or set(client.get("/config/allowlist").get("symbols", []))
 
-    inbox.mkdir(parents=True, exist_ok=True)
-    processed_dir = inbox / "processed"
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    envelope_files = sorted(inbox.glob("*.json"))
-    day = now.date().isoformat()
-
     summary = {
         "status": "OK",
         "policy_version": policy.policy_version,
@@ -291,12 +448,6 @@ def run_autonomy(
         },
     }
 
-    try:
-        research_db = ResearchDB(settings.db_path, settings.busy_timeout_ms)
-    except Exception:  # noqa: BLE001 -- absent DB degrades the cross-check
-        research_db = None
-    resolve = _resolve_ticker(research_db)
-
     for path in envelope_files:
         try:
             envelope = json.loads(path.read_text())
@@ -309,26 +460,76 @@ def run_autonomy(
         proposal = envelope.get("proposal", {})
         proposal_id = proposal.get("proposal_id", path.stem)
         try:
-            _validate_envelope(envelope, policy, now)
+            _validate_envelope(envelope, policy, now, fixture_mode=fixture_mode)
+            authority = _validate_proposal_authority(
+                authority_dir,
+                envelope,
+                fixture_mode=fixture_mode,
+            )
+            # Enforce the EXISTING owner-approved PAPER autonomy state machine.
+            # This is enforcement of policy.allowed_state_transitions (not a new
+            # investment rule) and it runs BEFORE any exposure check, budget
+            # charge, or broker call.
+            #
+            # The transition is RECOMPUTED from the authority record's own bound
+            # fields, never read from a stored convenience string, so this gate
+            # stays independent of any producer-side formatting bug.
+            if authority:
+                transition = f"{authority.get('current_state')}->{authority.get('proposed_state')}"
+            else:
+                # fixture bypass: no authority record exists by design
+                transition = f"{proposal.get('current_state')}->{proposal.get('proposed_state')}"
+            if transition not in set(policy.allowed_state_transitions):
+                raise AutonomyRefusal(
+                    f"state transition {transition!r} is not allowed by "
+                    f"{policy.policy_version}.allowed_state_transitions"
+                )
             _validate_exposure(proposal, policy)
-            symbol = str(envelope.get("symbol") or "").upper()
+            # The published authority record — not the inbox file — is the
+            # source of the order-driving symbol.
+            symbol = str(authority.get("canonical_symbol") or envelope.get("symbol") or "").upper()
             if not symbol:
                 raise AutonomyRefusal("envelope missing authoritative symbol")
-            # Cross-check against the research identity when resolvable: a
-            # mismatch between the exported symbol and the PIT identity is a
-            # refusal (the DB may be absent in isolated acceptance runs).
-            db_symbol = resolve(
-                str(proposal.get("security_id", "")), str(envelope.get("data_as_of", ""))
-            )
-            if db_symbol and db_symbol != symbol:
-                raise AutonomyRefusal(
-                    f"symbol mismatch: envelope {symbol!r} vs identity {db_symbol!r}"
-                )
             if symbol not in {s.upper() for s in allowlist}:
                 raise AutonomyRefusal(f"symbol {symbol!r} not in the execution allowlist")
             notional_microusd = int(proposal.get("max_notional_microusd") or 0)
             if notional_microusd <= 0:
                 raise AutonomyRefusal("proposal missing positive max_notional_microusd")
+
+            # Build the order and INDEPENDENTLY assert the translated quantity
+            # and notional against the proposal's own bounds. This runs BEFORE
+            # any budget charge or preview: the order size is the max_quantity
+            # DELTA, never the completion (target) holding quantity.
+            payload, telemetry = _order_payload(proposal, symbol, policy)
+            # REGRESSION GUARD, NOT a tamper defense. Because _order_payload
+            # derives the quantity from max_quantity_microunits and already
+            # requires it to be a whole-share multiple, this round-trip is
+            # lossless and cannot fire against a well-formed proposal; and
+            # _validate_proposal_authority has ALREADY refused any envelope whose
+            # max_quantity_microunits differs from the published authority
+            # record, so both bounds below are equal by the time we get here.
+            # Its only value is catching a FUTURE _order_payload bug that starts
+            # sourcing the quantity from somewhere else. Envelope tampering is
+            # caught by _validate_proposal_authority, not by this check.
+            serialized_microunits = int(payload["quantity"]) * 1_000_000
+            bounds = [int(proposal.get("max_quantity_microunits") or 0)]
+            if authority:
+                bounds.append(int(authority.get("max_quantity_microunits") or 0))
+            bounds = [bound for bound in bounds if bound > 0]
+            if serialized_microunits <= 0:
+                raise AutonomyRefusal("serialized order quantity is not positive")
+            if bounds and serialized_microunits > min(bounds):
+                raise AutonomyRefusal(
+                    f"serialized order quantity {serialized_microunits} exceeds "
+                    f"proposal/authority max_quantity {min(bounds)}"
+                )
+            # This one IS independent: it recomputes mark x quantity itself.
+            if telemetry["translated_notional_microusd"] > notional_microusd:
+                raise AutonomyRefusal(
+                    f"translated notional {telemetry['translated_notional_microusd']} "
+                    f"exceeds proposal max_notional {notional_microusd}"
+                )
+
             usage = daily_usage(day, path=budget_db)
             if usage["count"] >= policy.max_order_count_per_day:
                 raise AutonomyRefusal("daily order-count budget exhausted")
@@ -346,7 +547,6 @@ def run_autonomy(
                 )
                 continue
 
-            payload = _order_payload(proposal, symbol, policy)
             preview = client.post("/orders/preview", payload)
             token = preview.get("confirmation_token")
             if not token:
@@ -405,6 +605,17 @@ def run_autonomy(
                 {"proposal_id": proposal_id, "reason": f"unexpected: {type(exc).__name__}: {exc}"}
             )
 
+    _record_ledger(
+        {
+            "kind": "runner_run_receipt_v1",
+            "status": summary["status"],
+            "orders": summary["orders"],
+            "proposals_seen": summary["proposals_seen"],
+            "refusal_count": len(summary["refusals"]),
+            "at": summary["at"],
+        },
+        ledger_path=ledger,
+    )
     return summary
 
 

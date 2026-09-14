@@ -13,6 +13,7 @@ from tradehub_research.ops.forward_capture import capture_production_predictions
 from tradehub_research.ops.health import forward_health
 from tradehub_research.ops.outcome_maturation import mature_due_outcomes
 from tradehub_research.ops.report_cli import build_daily_report
+from tradehub_research.ops.research_cycle import run_research_cycle
 from tradehub_research.screening import ScreeningConfig, run_screening
 from tradehub_research.validation.experiment_db import ExperimentDB
 
@@ -168,10 +169,39 @@ def test_maturation_honest_when_bars_missing(tmp_path):
     assert health["matured"] == {}  # nothing matured yet (horizons not due)
 
 
-def test_daily_report_honest_when_broker_unavailable(tmp_path):
+def test_daily_report_honest_when_broker_unavailable(tmp_path, monkeypatch):
+    """No broker data + nothing ran today => honest, and never a fake $0.
+
+    The runner ledger is pinned to an isolated path: the assertion is about a
+    day with NO actions, so it must not depend on the host's live ledger.
+    """
+    from tradehub_research.ops import report_cli
+
+    monkeypatch.setattr(report_cli, "LEDGER", tmp_path / "ledger.jsonl")
     paths, research_db, exp = _seed(tmp_path)
     settings = ResearchSettings(db_path=research_db.path, busy_timeout_ms=5000)
     report = build_daily_report(settings=settings, experiment_db=exp, paths=paths, analytics={})
     assert "Today: unavailable (unavailable)" in report
     assert "$0" not in report
     assert "No action" in report
+
+
+def test_research_cycle_queues_real_committee_work_and_never_fakes_score(tmp_path):
+    """Regression for Hermes: replay-only cycle output used to claim OK with no ledger."""
+    paths, research_db, exp = _seed(tmp_path)
+    settings = ResearchSettings(db_path=research_db.path, busy_timeout_ms=5000)
+    summary = run_research_cycle(
+        settings=settings,
+        experiment_db=exp,
+        paths=paths,
+        as_of=date(2026, 8, 28),
+    )
+    assert summary["status"] == "OK"
+    assert summary["decision"]["status"] == "BLOCKED_NO_VALID_SCORE"
+    # A Phase-2 score cannot be constructed from the screen replay helper.
+    with research_db.connect(read_only=True) as conn:
+        assert conn.execute("SELECT count(*) FROM score_snapshot").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM portfolio_policy").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM portfolio_run").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM trade_proposal").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM committee_run").fetchone()[0] >= 0

@@ -30,6 +30,43 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}")
 
 
+def _last_runner_receipt(
+    path: str = "/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl",
+) -> dict | None:
+    """Most recent autonomy runner receipt, or None when absent/unreadable."""
+    try:
+        lines = [
+            line for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("kind") == "runner_run_receipt_v1":
+            return item
+    return None
+
+
+def _count_production_predictions(path: str) -> int | None:
+    """Read-only count of genuine production forward predictions (None if unreadable)."""
+    code, out = sh(
+        [
+            "sqlite3",
+            path,
+            "SELECT count(*) FROM forward_prediction WHERE provenance='production'",
+        ]
+    )
+    if code != 0:
+        return None
+    try:
+        return int(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
 def sh(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -105,33 +142,97 @@ def main() -> int:
     else:
         check("research MCP binary present", False, "binary missing")
 
-    # 5. Scheduled jobs: timers enabled and last result ok.
+    # 5. Scheduled jobs: timers enabled and last result ok. The #66 runtime
+    # surface (committee finalizer, reconcile, autonomy) is part of the
+    # acceptance contract, not just the legacy four timers.
     for timer in (
         "tradehub-daily-refresh",
         "tradehub-research-cycle",
         "tradehub-forward-capture",
         "tradehub-outcome-maturation",
+        "tradehub-committee-finalizer",
+        "tradehub-reconcile",
+        "tradehub-paper-autonomy",
     ):
         code, _ = sh(["systemctl", "is-enabled", f"{timer}.timer"])
         check(f"timer enabled {timer}", code == 0)
 
-    # 6. No duplicate forward prediction (capture dedupe).
-    code, out = sh(
-        [
-            "/home/jon/tiger-tradehub-main/.venv/bin/python",
-            "-m",
-            "tradehub_research.ops.forward_capture",
-        ],
-        timeout=600,
+    # 5a. Autonomy path unit must be ARMED and must trigger on inbox CHANGE,
+    # never on file EXISTENCE: a refused envelope stays on disk by design, and
+    # PathExistsGlob would re-arm forever (activation loop).
+    code, unit_text = sh(["systemctl", "cat", "tradehub-paper-autonomy.path"])
+    check(
+        "autonomy path unit uses change-trigger (no existence-glob loop)",
+        code == 0 and "PathChanged=" in unit_text and "PathExistsGlob=" not in unit_text,
+        "PathChanged on the inbox directory",
     )
-    try:
-        summary = json.loads(out.strip().splitlines()[-1])
-        check(
-            "forward capture idempotent (no dupes)",
-            summary.get("counts", {}).get("rejected") == 0,
-        )
-    except Exception:  # noqa: BLE001
-        check("forward capture idempotent (no dupes)", False, out[-200:])
+    code, active = sh(["systemctl", "is-active", "tradehub-paper-autonomy.path"])
+    check("autonomy path unit active", code == 0 and active.strip() == "active", active.strip())
+
+    # 5b. Bounded invocation of the finalizer service under its real identity.
+    code, _ = sh(["systemctl", "start", "tradehub-committee-finalizer.service"], timeout=600)
+    rcode, result = sh(
+        [
+            "systemctl",
+            "show",
+            "tradehub-committee-finalizer.service",
+            "-p",
+            "Result",
+            "--value",
+        ]
+    )
+    check(
+        "finalizer service bounded invocation ok",
+        code == 0 and rcode == 0 and result.strip() == "success",
+        f"Result={result.strip()}",
+    )
+
+    # 5c. Autonomy with an EMPTY inbox must succeed WITHOUT contacting the
+    # broker, and must leave FRESH durable evidence of that specific run. The
+    # 30-minute recovery timer also emits IDLE_EMPTY_INBOX receipts, so the
+    # receipt timestamp must CHANGE for this invocation — otherwise a
+    # "ran but did nothing" regression would pass on a stale ledger tail.
+    receipt_before = _last_runner_receipt()
+    code, _ = sh(["systemctl", "start", "tradehub-paper-autonomy.service"], timeout=600)
+    rcode, result = sh(
+        ["systemctl", "show", "tradehub-paper-autonomy.service", "-p", "Result", "--value"]
+    )
+    receipt_after = _last_runner_receipt()
+    before_at = (receipt_before or {}).get("at")
+    after_at = (receipt_after or {}).get("at")
+    check(
+        "autonomy empty-inbox invocation ok (no broker call, fresh receipt)",
+        code == 0
+        and rcode == 0
+        and result.strip() == "success"
+        and receipt_after is not None
+        and after_at is not None
+        and after_at != before_at
+        and receipt_after.get("status") == "IDLE_EMPTY_INBOX"
+        and receipt_after.get("broker_contacted") is False
+        and receipt_after.get("orders") == 0,
+        f"Result={result.strip()} receipt at {before_at} -> {after_at}",
+    )
+
+    # 6. Forward-capture idempotency with REAL evidence: re-running the
+    # deployed capture service must insert no duplicate production
+    # prediction. A systemd `Result=success` status alone is NOT evidence.
+    experiment_db = "/var/lib/tradehub-research/experiment.db"
+    before = _count_production_predictions(experiment_db)
+    code, _ = sh(["systemctl", "start", "tradehub-forward-capture.service"], timeout=600)
+    result_code, result = sh(
+        ["systemctl", "show", "tradehub-forward-capture.service", "-p", "Result", "--value"]
+    )
+    after = _count_production_predictions(experiment_db)
+    check(
+        "forward capture idempotent (no dupes)",
+        code == 0
+        and result_code == 0
+        and result.strip() == "success"
+        and before is not None
+        and before == after,
+        f"service={result.strip()} production_predictions {before} -> {after}",
+    )
 
     # 7. No duplicate broker action: execution dry-run invariant.
     code, out = sh(["systemctl", "show", "tradehub-execution.service", "-p", "ActiveState"])

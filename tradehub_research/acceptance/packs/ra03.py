@@ -2219,6 +2219,12 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_read_only_api.py",
         "tests/test_telegram_bot.py",
         "tests/test_tiger_gateway.py",
+        "tests/test_ops_reconcile.py",
+        # Credential-free execution→research handoff and the end-to-end
+        # envelope→deterministic-runner contract deliberately cross the plane
+        # boundary.  They are execution integration tests, not research code.
+        "tests/test_portfolio_handoff.py",
+        "tests/test_decision_pipeline_autonomy_e2e.py",
         "tests/test_phase4_execution.py",
         "tests/test_phase4_runtime.py",
         "tests/test_phase4_runtime_production_seam.py",
@@ -2226,6 +2232,22 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_research_adapters.py",
         # #51 autonomous-PAPER runner tests (execution-plane capability)
         "tests/test_autonomy_paper.py",
+        # Proposal-authority boundary: asserts the autonomy runner reads ONLY
+        # the research-written projection and rejects a tampered/absent one.
+        # It is an execution-boundary test, not research code.
+        "tests/test_proposal_authority.py",
+        # Autonomy state-transition / path-trigger boundary tests (execution
+        # plane): policy enforcement + no-broker-on-empty-inbox evidence.
+        "tests/test_autonomy_state_transitions.py",
+        # P1 runner-boundary regressions (execution plane): fixture authority
+        # can never be self-granted from the inbox; order quantity is the delta.
+        "tests/test_autonomy_runner_p1.py",
+        # Disposable-DB E2E: exporter + production runner boundary against a
+        # throwaway migrated database (execution plane).
+        "tests/test_disposable_e2e_p66.py",
+        # Real producer->consumer quantity proof (execution plane): real sizing
+        # output consumed by the production runner.
+        "tests/test_disposable_e2e_held.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of
         # execution vocabulary in the research capability profile
         "tests/test_research_capability.py",

@@ -1293,6 +1293,70 @@ def test_ready_to_score_status_recovers_after_injected_score_failure(tmp_path):
         )
 
 
+def test_async_finalizer_resumes_already_scored_original_pipeline_once(tmp_path, monkeypatch):
+    """A post-score timer retry must neither strand nor re-score the pipeline.
+
+    The operational epoch is the DURABLE score set, never the pipeline
+    evidence cutoff, and the durable handoff that anchors it is supplied
+    explicitly so this stays environment-independent.
+    """
+    from tradehub_research.ops import decision_pipeline
+
+    store, run, pack_hash = _committee(tmp_path / "finalizer-retry.db")
+    router = CommitteeRouter(store.database)
+    router.initialize(run)
+    claims = [_claim("valuation_vs_history", "bullish")]
+    router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_a", "provider-a", claims))
+    assert (
+        router.submit(run, _valid_assessment(pack_hash, "neutral_analyst_b", "provider-b", claims))[
+            "state"
+        ]
+        == "SCORED"
+    )
+
+    score_set = decision_pipeline.current_score_set(store.database, "run")
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "schema_version": "paper-portfolio-handoff-v2",
+                "account_type": "PAPER",
+                "environment": "PAPER_SANDBOX",
+                "account_status": "Funded",
+                "as_of": score_set["score_ready_at"],
+                "positions": [],
+                "cash": "1000000.00",
+                "nav": "1000000.00",
+            }
+        )
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    def resume(database, *, pipeline_run_id, decision_as_of, **_kwargs):
+        assert database is store.database
+        calls.append((pipeline_run_id, decision_as_of))
+        return {"status": "HEALTHY_ZERO_ACTION", "eligible_exports": []}
+
+    monkeypatch.setattr(decision_pipeline, "run_portfolio_decision", resume)
+    first = decision_pipeline.finalize_async_committee_decisions(store.database, handoff=handoff)
+    second = decision_pipeline.finalize_async_committee_decisions(store.database, handoff=handoff)
+
+    assert [item["pipeline_run_id"] for item in first["finalized"]] == ["run"]
+    assert [item["pipeline_run_id"] for item in second["finalized"]] == ["run"]
+    assert [call[0] for call in calls] == ["run", "run"]
+    # Two-clock contract: the epoch is the score set, NOT the evidence cutoff.
+    assert all(call[1] == score_set["score_ready_at"] for call in calls)
+    assert all(call[1] != "2025-02-01T00:00:00Z" for call in calls)
+    with store.database.connect(read_only=True) as db:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM score_snapshot WHERE committee_run_id=?", (run,)
+            ).fetchone()[0]
+            == 1
+        )
+
+
 @pytest.mark.parametrize("surface", ["status", "get_work", "retry"])
 def test_second_neutral_commit_boundary_recovers_once(tmp_path, surface):
     store, run, pack_hash = _committee(tmp_path / f"neutral-recover-{surface}.db")

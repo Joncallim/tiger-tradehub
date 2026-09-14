@@ -1,0 +1,22 @@
+[Unit]
+Description=TradeHub autonomy trigger on newly exported PAPER envelopes
+Documentation=file:/opt/tiger-tradehub/deploy/systemd/README.md
+
+[Path]
+# EVENT TRIGGER ON INBOX CHANGE, NOT ON FILE EXISTENCE.
+#
+# The previous configuration used an existence-glob on *.json in the inbox.
+# That re-armed on every runner pass, because a REFUSED envelope stays on disk
+# by design (refusals are never silently deleted). Any permanently invalid
+# envelope therefore produced an immediate activation loop.
+#
+# PathChanged watches the inbox DIRECTORY for change events (create/
+# close-write/rename/delete). A refusal leaves the directory unchanged, so no
+# further activation happens until something genuinely new is exported. This is
+# a structural fix, deliberately NOT a reliance on systemd trigger/start rate
+# limiting to paper over the loop.
+PathChanged=/var/lib/tradehub/autonomy/proposals
+Unit=tradehub-paper-autonomy.service
+
+[Install]
+WantedBy=paths.target

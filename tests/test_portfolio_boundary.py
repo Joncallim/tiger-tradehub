@@ -58,11 +58,31 @@ SANCTIONED_FILES = {
     "tests/test_read_only_api.py",
     "tests/test_telegram_bot.py",
     "tests/test_tiger_gateway.py",
+    "tests/test_ops_reconcile.py",  # execution-owned broker handoff contract
+    "tests/test_portfolio_handoff.py",  # cross-plane handoff contract test
+    "tests/test_decision_pipeline_autonomy_e2e.py",  # execution-envelope integration test
     "tests/test_phase4_execution.py",
     "tests/test_phase4_runtime.py",
     "tests/test_phase4_runtime_production_seam.py",
     # #51 autonomous-PAPER runner tests (execution-plane capability)
     "tests/test_autonomy_paper.py",
+    # Proposal-authority boundary test: deliberately imports the execution
+    # runner to prove it reads only the research-written projection.
+    "tests/test_proposal_authority.py",
+    # Autonomy state-transition / path-trigger boundary tests: deliberately
+    # import the execution runner to prove policy enforcement and the
+    # no-broker-on-empty-inbox contract.
+    "tests/test_autonomy_state_transitions.py",
+    # P1 runner-boundary regressions: prove a production envelope cannot
+    # self-grant fixture authority, and that the order size is the quantity
+    # DELTA. Execution-plane tests by construction.
+    "tests/test_autonomy_runner_p1.py",
+    # Disposable-DB E2E: drives the real exporter + production runner boundary
+    # (execution plane) against a throwaway migrated database.
+    "tests/test_disposable_e2e_p66.py",
+    # Real producer->consumer quantity proof: imports the real sizing code and
+    # the production runner (execution plane).
+    "tests/test_disposable_e2e_held.py",
     # the oracle module itself (hex-encoded terms; RA-03 repeats this pattern)
     "tests/test_portfolio_boundary.py",
 }
