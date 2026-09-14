@@ -22,7 +22,23 @@ def resolve_evidence_artifact(
     candidate has outstanding committee work.
     """
     with database.connect(read_only=True) as db:
+        outstanding_pins = {
+            row[0]
+            for row in db.execute(
+                "SELECT DISTINCT w.pack_hash FROM committee_run c "
+                "JOIN committee_work w ON w.committee_run_id=c.committee_run_id "
+                "LEFT JOIN model_call_attempt a ON a.work_id=w.work_id "
+                "WHERE c.candidate_id=? AND a.attempt_id IS NULL",
+                (candidate_id,),
+            )
+        }
         if pack_hash:
+            if outstanding_pins and pack_hash not in outstanding_pins:
+                raise ValueError(
+                    "pinned evidence lookup refused: pack_hash "
+                    f"{pack_hash} is not the pin of any outstanding committee work for this "
+                    "candidate; use the pack_hash from the work envelope"
+                )
             row = db.execute(
                 "SELECT pack_hash,pack_spec_version,body_json FROM evidence_pack "
                 "WHERE candidate_id=? AND pack_hash=?",
@@ -33,14 +49,7 @@ def resolve_evidence_artifact(
                     f"candidate {candidate_id} has no artifact pinned at pack_hash {pack_hash}"
                 )
         else:
-            outstanding = db.execute(
-                "SELECT count(*) FROM committee_run c "
-                "JOIN committee_work w ON w.committee_run_id=c.committee_run_id "
-                "LEFT JOIN model_call_attempt a ON a.work_id=w.work_id "
-                "WHERE c.candidate_id=? AND a.attempt_id IS NULL",
-                (candidate_id,),
-            ).fetchone()[0]
-            if outstanding:
+            if outstanding_pins:
                 raise ValueError(
                     "unpinned evidence lookup refused: this candidate has outstanding "
                     "committee work; pass the pack_hash from the work envelope"

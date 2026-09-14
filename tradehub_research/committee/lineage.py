@@ -27,6 +27,7 @@ from typing import Any
 
 from tradehub_research.committee.bounds import (
     SCORING_PROJECTION_VERSION,
+    SEMANTIC_EVIDENCE_PROJECTION_VERSION,
     bound_feature,
     count_series_observations,
     hash_prefixed,
@@ -151,6 +152,7 @@ class ScoringLineageBuilder:
         body: dict[str, Any] = {
             "lineage_spec_version": LINEAGE_SPEC_VERSION,
             "scoring_projection_version": SCORING_PROJECTION_VERSION,
+            "semantic_evidence_projection_version": SEMANTIC_EVIDENCE_PROJECTION_VERSION,
             "candidate": {"candidate_id": inputs.candidate_id, "security_id": inputs.security_id},
             "run": inputs.run_body(),
             "identity": identity_body(inputs, db),

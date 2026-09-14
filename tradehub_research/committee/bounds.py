@@ -35,8 +35,13 @@ MAX_VIEW_EVIDENCE_ROWS = 256
 
 #: Legacy pack v1 applied this same cap to its single artifact -- the artifact
 #: that served both scoring and the committee, which is the defect #67 fixes.
-#: Retained so pack v1 stays byte-reproducible.
+#: It is retained as a *scoring-identity* projection constant (not a view
+#: bound): the methodology hash must keep reproducing historical identity.
 MAX_EVIDENCE_ROWS = MAX_VIEW_EVIDENCE_ROWS
+
+#: Version of the methodology-identity projection applied to screen evidence ids
+#: before hashing. See `scoring.methodology_evidence_projection`.
+SEMANTIC_EVIDENCE_PROJECTION_VERSION = 1
 
 # Number of representative observations retained per aggregated series feature.
 MAX_SERIES_REPRESENTATIVES = 4

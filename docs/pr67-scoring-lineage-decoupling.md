@@ -118,14 +118,19 @@ legacy committee run resume       -> same run id
 router initialize + status        -> SCORED
 legacy score snapshot reuse       -> conviction 5, scored_evidence_hash 400f9774…
 check().integrity                 -> ok
-check().ok                        -> false  (schema_version 12 vs the old code's
-                                    compiled expectation of 11 — a reporting
-                                    field only; no operation fails)
+check().ok                        -> false  (see caveat below)
 ```
 
-Code rollback therefore does **not** require restoring the 4.6 GB database. The
-only residual difference is the old build's schema-version comparison in its own
-health payload.
+Code rollback therefore does **not** require restoring the 4.6 GB database.
+
+**Caveat (must be in the rollback runbook).** `check().ok` goes false purely
+because the pre-#67 build compares `schema_version()` (12) against its own
+compiled expectation (11). No committee operation fails, but this is not merely
+cosmetic: `tradehub_research/cli.py` maps it to a non-zero **process exit code**,
+so any deploy-verification or health tooling that gates on `research check` will
+see a false failure after a rollback onto a migrated database. Do not use
+`research check` as the rollback-success signal; use the operation-level checks
+above instead.
 
 Known residual: the pre-#67 build has no guard against scoring a *view* (that
 guard is new code). If it were rolled back onto a database where #67 had already
@@ -182,3 +187,16 @@ The 160 KB view cap is unchanged (no bound was relaxed to make this fit).
 - [x] explicit statement of what the bounded view omits and how the model is told
 - [x] migration is rollback-safe; v1 artifact identity reproduced
 - [x] committee work pinned to an exact artifact, fail-closed
+
+## First integrated review — REJECT, and disposition
+
+The first integrated adversarial review (frontier gate, complete-architecture
+prompt, read-only) returned **REJECT** with 1×P1, 2×P2, 1×P3. Every finding was
+reproduced and is genuine; all four are remediated here:
+
+| finding | disposition |
+|---|---|
+| **P1** `semantic_screen_hash` inherited the 256-row pack cap through screen `evidence_ids`, while the lineage keeps the complete set — so a legacy SCORED candidate with >256 frozen ids and ≤256 passing ids could be re-classified `SCREEN_METHODOLOGY_CHANGE` from a pure representation change. | Fixed: `scoring.methodology_evidence_projection` applies the *historical* passing-first/id-capped projection before hashing, from either artifact, and is idempotent on a legacy pack. Versioned as `SEMANTIC_EVIDENCE_PROJECTION_VERSION`, documented as scoring identity — never a view bound. New regression `tests/test_committee_methodology_projection.py` builds exactly the 300-frozen/20-passing boundary and asserts identity equality plus `MODEL_REASSESSMENT` end-to-end. |
+| **P2** the pinned `get_evidence_pack` lookup accepted any existing artifact for the candidate, not the candidate's outstanding work pin. | Fixed: while outstanding committee work exists, a pin must equal one of those work pins or the lookup fails closed before any model spend. Regression extended (different existing artifact refused; own pin resolves once that run's work is issued). |
+| **P2** the rollback claim understated that `research check` exits non-zero. | Fixed: caveat added above; rollback runbook must not gate on `research check`. |
+| **P3** one `omission_semantics` label covered both aggregate-represented series omissions and capacity-dropped interpretive rows. | Fixed: `evidence_omitted.semantics` now separates `series_observations` (aggregate-represented, lineage-retained) from `interpretive_rows` (capacity-bound, not presented and not aggregated), with an explicit statement that neither is a data-quality signal. Regression asserts the labels differ. |

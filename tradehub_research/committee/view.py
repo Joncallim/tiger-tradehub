@@ -61,6 +61,28 @@ VIEW_SPEC_VERSION = 1
 VIEW_PACK_SPEC_VERSION = 2
 REPRESENTATION = "BOUNDED_COMMITTEE_VIEW"
 _AGGREGATE = "DETERMINISTIC_AGGREGATE"
+_SERIES_OMISSION_SEMANTICS = "representation_compaction_full_lineage_retained"
+_INTERPRETIVE_OMISSION_SEMANTICS = "capacity_bound_not_presented_and_not_aggregated"
+
+
+def _omission_semantics() -> dict[str, str]:
+    """Distinct semantics for the two kinds of omission (review finding P3).
+
+    Series observations omitted by aggregation are *represented* by a
+    deterministic aggregate and retained complete in the scoring lineage.
+    Interpretive rows omitted by the view's capacity bounds are neither
+    presented nor aggregated: the model simply has not seen them. Both are
+    representation facts, not data-quality signals -- but they must not share a
+    label that could imply nothing was lost when something was.
+    """
+    return {
+        "series_observations": _SERIES_OMISSION_SEMANTICS,
+        "interpretive_rows": _INTERPRETIVE_OMISSION_SEMANTICS,
+        "data_quality_signal": (
+            "neither omission kind is a data-quality signal; coverage is reported by each "
+            "screen's data_quality and sufficient_data"
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -308,7 +330,7 @@ class CommitteeViewBuilder:
             "evidence_omitted": {
                 "count": 0,
                 "reasons": {},
-                "omission_semantics": "representation_compaction_not_data_quality",
+                "semantics": _omission_semantics(),
                 "deterministic_order": (
                     "interpretive_passing_first_then_evidence_id, then series representatives"
                 ),
@@ -318,7 +340,7 @@ class CommitteeViewBuilder:
                 "observation_references": series_references,
                 "represented_by": "deterministic per-feature aggregates",
                 "individual_observations_in_lineage": True,
-                "omission_semantics": "representation_compaction_not_data_quality",
+                "omission_semantics": _SERIES_OMISSION_SEMANTICS,
             },
             "model_honesty": {
                 "representation": REPRESENTATION,
@@ -331,7 +353,9 @@ class CommitteeViewBuilder:
                     "imply it inspected observations that were not presented"
                 ),
                 "aggregate_fields_are_code_computed": True,
-                "omitted_observations_are_not_missing_data": True,
+                "series_omissions_are_aggregate_represented": True,
+                "interpretive_omissions_are_not_aggregated": True,
+                "omission_counts_are_not_data_quality": True,
                 "lineage_set_hash_is_an_identity_not_market_evidence": True,
                 "scoring_lineage": "referenced by lineage.hash (not visible to models)",
             },
@@ -408,7 +432,7 @@ class CommitteeViewBuilder:
             "series_observations_omitted": omitted_series,
             "series_representatives_presented": representative_presented,
             "reasons": dict(sorted(reasons.items())),
-            "omission_semantics": skeleton["evidence_omitted"]["omission_semantics"],
+            "semantics": skeleton["evidence_omitted"]["semantics"],
             "deterministic_order": (
                 "interpretive_passing_first_then_evidence_id, then series representatives"
             ),

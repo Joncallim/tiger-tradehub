@@ -9,6 +9,7 @@ import json
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
+from tradehub_research.committee.bounds import MAX_EVIDENCE_ROWS
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.screen_store import DeterminismError
 from tradehub_research.screens import canonical_json
@@ -86,8 +87,46 @@ def semantic_screen_hash(screen: dict[str, Any]) -> str:
     return _hash("semantic-screen-v1", semantic_screen_payload(screen))
 
 
+def methodology_evidence_projection(
+    screens: list[dict[str, Any]],
+) -> dict[int, list[str]]:
+    """Project each screen's evidence ids onto the frozen methodology identity.
+
+    Why this exists (review finding P1 on #67): the v1 pack stored
+    ``evidence_ids`` as the screen's ids *intersected with the 256-row selection
+    that the single artifact applied*, and that value feeds
+    ``semantic_screen_hash`` -- i.e. a **model-facing row cap had leaked into
+    trajectory/methodology identity**. The scoring lineage deliberately keeps the
+    *complete* id set (scoring needs it), so hashing the lineage verbatim would
+    make a representation change look like ``SCREEN_METHODOLOGY_CHANGE``.
+
+    This projection reproduces the historical identity exactly, from either
+    artifact: passing-first, then evidence id, capped at ``MAX_EVIDENCE_ROWS``.
+    It is idempotent (applying it to a legacy pack returns that pack's stored
+    values) and versioned as part of scoring semantics
+    (``SEMANTIC_EVIDENCE_PROJECTION_VERSION``) -- never as a view bound.
+    """
+    frozen = {item for screen in screens for item in screen.get("evidence_ids", [])}
+    passing = {
+        item
+        for screen in screens
+        if screen.get("passed")
+        for item in screen.get("evidence_ids", [])
+    }
+    ordered = sorted(frozen, key=lambda item: (item not in passing, item))
+    selected = set(ordered[:MAX_EVIDENCE_ROWS])
+    return {
+        index: [item for item in screen.get("evidence_ids", []) if item in selected]
+        for index, screen in enumerate(screens)
+    }
+
+
 def _semantic_screen_hashes(screens: list[dict[str, Any]]) -> list[str]:
-    return sorted(semantic_screen_hash(screen) for screen in screens)
+    projection = methodology_evidence_projection(screens)
+    return sorted(
+        semantic_screen_hash({**screen, "evidence_ids": projection[index]})
+        for index, screen in enumerate(screens)
+    )
 
 
 def score_screens(

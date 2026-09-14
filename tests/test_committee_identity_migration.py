@@ -459,14 +459,24 @@ def test_work_is_pinned_to_one_artifact_and_races_fail_closed(tmp_path):
     assert old_work["body"]["pack_spec_version"] == 1
     assert old_work["pack_hash"] == pinned_v1
     assert old_work["representation"] == "LEGACY_SCORING_PACK"
+    # A different existing artifact for the same candidate is refused while the
+    # outstanding work is pinned elsewhere: fail closed before any model spend.
+    with pytest.raises(ValueError, match="not the pin of any outstanding committee work"):
+        resolve_evidence_artifact(database, candidate_id, view.pack_hash)
+    # Once the newer run's own work is issued, its own pin resolves.
+    router.initialize(new_run)
+    new_envelope = router.get_work(new_run)
+    assert new_envelope is not None
+    assert new_envelope["pack_hash"] == view.pack_hash
     new_work = resolve_evidence_artifact(database, candidate_id, view.pack_hash)
     assert new_work["body"]["view_spec_version"] == 1
     assert new_work["pinned"] is True
     assert new_work["lineage_hash"] == lineage.lineage_hash
 
-    # Wrong or unknown pins fail closed, and unpinned lookups are refused while
-    # the candidate has outstanding committee work.
-    with pytest.raises(ValueError, match="no artifact pinned"):
+    # Wrong or unknown pins fail closed (here with outstanding work, the refusal
+    # is the stronger "not the pin of any outstanding committee work" check), and
+    # unpinned lookups are refused while work is outstanding.
+    with pytest.raises(ValueError, match="not the pin of any outstanding committee work"):
         resolve_evidence_artifact(database, candidate_id, "0" * 64)
     with pytest.raises(ValueError, match="unpinned evidence lookup refused"):
         resolve_evidence_artifact(database, candidate_id)

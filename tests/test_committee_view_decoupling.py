@@ -338,13 +338,17 @@ def test_view_report_is_honest_about_aggregation_and_omission(tmp_path):
     # The honesty contract must be machine-readable, not only prose: these flags
     # are what a reviewer (or an auditor) checks a model's claims against.
     assert body["model_honesty"]["aggregate_fields_are_code_computed"] is True
-    assert body["model_honesty"]["omitted_observations_are_not_missing_data"] is True
+    assert body["model_honesty"]["series_omissions_are_aggregate_represented"] is True
+    assert body["model_honesty"]["interpretive_omissions_are_not_aggregated"] is True
+    assert body["model_honesty"]["omission_counts_are_not_data_quality"] is True
     assert body["model_honesty"]["lineage_set_hash_is_an_identity_not_market_evidence"] is True
-    assert body["evidence_omitted"]["omission_semantics"] == (
-        "representation_compaction_not_data_quality"
-    )
+    # The two omission kinds must not share a label (review finding P3).
+    semantics = body["evidence_omitted"]["semantics"]
+    assert semantics["series_observations"] == ("representation_compaction_full_lineage_retained")
+    assert semantics["interpretive_rows"] == ("capacity_bound_not_presented_and_not_aggregated")
+    assert semantics["series_observations"] != semantics["interpretive_rows"]
     assert body["series_representation"]["omission_semantics"] == (
-        "representation_compaction_not_data_quality"
+        "representation_compaction_full_lineage_retained"
     )
     momentum = next(
         entry for entry in body["screens"] if entry["family"] == "momentum_confirmation"
