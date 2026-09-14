@@ -288,6 +288,7 @@ def test_operator_status_survives_a_failing_provenance_query(tmp_path, monkeypat
     from tradehub_research.ops import operator_status as ops
 
     real = _sqlite3.connect(tmp_path / "s.db")
+    real.row_factory = _sqlite3.Row  # operator_status reads rows by column name
     real.execute("CREATE TABLE pipeline_run (run_id TEXT, as_of TEXT, started_at TEXT)")
     real.execute(
         "CREATE TABLE portfolio_run (run_id TEXT, pipeline_run_id TEXT, "
@@ -385,6 +386,92 @@ def test_operator_status_survives_a_failing_provenance_query(tmp_path, monkeypat
     # ...the healthy queries still report, and nothing crashed.
     assert provenance["portfolio_runs"]["genuine"] == 1
     assert chain["provenance"]["query_errors"]["score_snapshots"].startswith("OperationalError")
+
+
+def test_decision_ledger_totals_are_none_not_a_silent_zero_on_failure(tmp_path, monkeypatch):
+    """The sibling-field defect: a broken ledger query must not read as 'empty system'.
+
+    `portfolio_runs_total`/`observations_total` must be None (not the 0 default)
+    and the failure recorded, so an operator can tell 'no production yet' apart
+    from 'the status query is broken'.
+    """
+    import sqlite3 as _sqlite3
+    from types import SimpleNamespace
+
+    from tradehub_research.ops import operator_status as ops
+
+    class _BoomConn:
+        def execute(self, sql, params=()):
+            raise _sqlite3.OperationalError("simulated: ledger query failed")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _BoomDB:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def connect(self, *args, **kwargs):
+            return _BoomConn()
+
+    class _EmptyCursor:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class _EmptyConn:
+        def execute(self, sql, params=()):
+            return _EmptyCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _ExpDB:
+        def connect(self, *args, **kwargs):
+            return _EmptyConn()
+
+    monkeypatch.setattr(ops, "ResearchDB", _BoomDB)
+    monkeypatch.setattr(
+        ops,
+        "refresh_health",
+        lambda **kwargs: {"securities_expected": 0, "with_bars": 0, "stale_count": 0},
+    )
+    monkeypatch.setattr(
+        ops,
+        "forward_health",
+        lambda **kwargs: {"production_predictions": 0, "predictions_due": 0, "matured": {}},
+    )
+    monkeypatch.setattr(ops, "_authority_record_count", lambda: 0)
+    monkeypatch.setattr(ops, "_runner_receipts", lambda: {"count": 0})
+    monkeypatch.setattr(ops, "_published_authority_ids", lambda: set())
+
+    paths = SimpleNamespace(
+        research_db=tmp_path / "r.db",
+        experiment_db=tmp_path / "e.db",
+        research_dir=tmp_path,
+    )
+    out = ops.operator_status(
+        settings=SimpleNamespace(busy_timeout_ms=5000), experiment_db=_ExpDB(), paths=paths
+    )
+
+    chain = out["decision_chain"]
+    # NOT a silent 0 that looks like an empty system.
+    assert chain["portfolio_runs_total"] is None, chain
+    assert chain["observations_total"] is None, chain
+    # And the failure is recorded, not swallowed.
+    errors = chain["query_errors"]
+    assert "portfolio_runs_total" in errors and "observations_total" in errors, errors
+    assert errors["portfolio_runs_total"].startswith("OperationalError")
+    # The payload is still complete.
+    assert out.get("report_status") is not None
 
 
 def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):

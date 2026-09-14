@@ -28,16 +28,6 @@ from tradehub_research.validation.experiment_db import ExperimentDB
 RUNNER_RECEIPTS = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
 
 
-def _authority_record_count() -> int:
-    """Durable count of published authority records (export proof)."""
-    if not DEFAULT_AUTHORITY_DIR.is_dir():
-        return 0
-    try:
-        return sum(1 for path in DEFAULT_AUTHORITY_DIR.glob("*.json") if path.is_file())
-    except OSError:
-        return 0
-
-
 def _all_total(entry: dict | None) -> int | None:
     """Lifetime total for a provenance entry, or None when the split is UNKNOWN.
 
@@ -148,36 +138,52 @@ def operator_status(
         "authority_records_total": 0,
         "latest_decision": None,
     }
-    with research_db.connect(read_only=True) as conn:
+    # A failed DECISION-LEDGER query must be OBSERVABLE, never a silent 0 that is
+    # indistinguishable from a genuinely empty system. Each field is guarded
+    # independently and falls back to None with a recorded error.
+    chain_errors: dict[str, str] = {}
+
+    def _ledger_scalar(label: str, sql: str, params: tuple = ()):
         try:
-            chain["portfolio_runs_total"] = conn.execute(
-                "SELECT count(*) FROM portfolio_run WHERE " + gsql, gparams
-            ).fetchone()[0]
-            chain["observations_total"] = conn.execute(
-                "SELECT count(*) FROM portfolio_state_observation o JOIN portfolio_run r "
-                "ON r.run_id = o.run_id WHERE " + obs_sql,
-                obs_params,
-            ).fetchone()[0]
+            with research_db.connect(read_only=True) as conn:
+                return conn.execute(sql, params).fetchone()[0]
+        except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+            chain_errors[label] = f"{type(exc).__name__}: {exc}"
+            return None
+
+    chain["portfolio_runs_total"] = _ledger_scalar(
+        "portfolio_runs_total", "SELECT count(*) FROM portfolio_run WHERE " + gsql, gparams
+    )
+    chain["observations_total"] = _ledger_scalar(
+        "observations_total",
+        "SELECT count(*) FROM portfolio_state_observation o JOIN portfolio_run r "
+        "ON r.run_id = o.run_id WHERE " + obs_sql,
+        obs_params,
+    )
+    try:
+        with research_db.connect(read_only=True) as conn:
             row = conn.execute(
                 "SELECT run_id, pipeline_run_id, decision_as_of, created_at "
                 "FROM portfolio_run WHERE " + gsql + " "
                 "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 gparams,
             ).fetchone()
-            if row:
-                latest_run_id = str(row["run_id"])
-                latest_pipeline_run_id = str(row["pipeline_run_id"])
-                latest_decision_as_of = str(row["decision_as_of"])
-                latest_created_at = str(row["created_at"])
-                proposal = {
-                    "run_id": latest_run_id,
-                    "pipeline_run_id": latest_pipeline_run_id,
-                    "decision_as_of": latest_decision_as_of,
-                    "created_at": latest_created_at,
-                }
-                latest_proposals = 0
-        except Exception:  # noqa: BLE001 -- optional table
-            proposal = None
+    except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+        chain_errors["latest_decision"] = f"{type(exc).__name__}: {exc}"
+        row = None
+    chain["query_errors"] = chain_errors
+    if row:
+        latest_run_id = str(row["run_id"])
+        latest_pipeline_run_id = str(row["pipeline_run_id"])
+        latest_decision_as_of = str(row["decision_as_of"])
+        latest_created_at = str(row["created_at"])
+        proposal = {
+            "run_id": latest_run_id,
+            "pipeline_run_id": latest_pipeline_run_id,
+            "decision_as_of": latest_decision_as_of,
+            "created_at": latest_created_at,
+        }
+        latest_proposals = 0
     chain["authority_records_total"] = _authority_record_count()
     # Genuine vs acceptance split for the decision chain. Every table is filtered
     # through an EXPLICITLY QUALIFIED column on the table that actually owns the
