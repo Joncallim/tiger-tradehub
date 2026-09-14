@@ -571,10 +571,93 @@ def test_eligible_exports_is_none_when_only_the_export_lookup_fails(tmp_path, mo
     # ...and the failed export lookup is honest and recorded, not a 0 or a crash.
     assert chain["latest_decision"]["eligible_exports"] is None, chain["latest_decision"]
     assert chain["latest_decision"]["exported_proposal_ids"] is None
+    # The sibling count on the same failure path must ALSO be None, not a
+    # silent-zero 0 that would read as "this decision produced no proposals".
+    assert chain["latest_decision"]["proposals"] is None, chain["latest_decision"]
     errors = chain["query_errors"]
     assert "eligible_exports" in errors, errors
     assert errors["eligible_exports"].startswith("OperationalError")
     assert out.get("report_status") is not None
+
+
+def test_corrupt_cycle_log_is_recorded_not_read_as_no_data(tmp_path, monkeypatch):
+    """A corrupt/absent log must be distinguishable from 'no cycle has run'."""
+    from types import SimpleNamespace
+
+    from tradehub_research.ops import operator_status as ops
+
+    class _EmptyCursor:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class _EmptyConn:
+        def execute(self, sql, params=()):
+            return _EmptyCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        ops, "ResearchDB", lambda *a, **k: SimpleNamespace(connect=lambda **kw: _EmptyConn())
+    )
+    monkeypatch.setattr(
+        ops,
+        "refresh_health",
+        lambda **kw: {"securities_expected": 1, "with_bars": 1, "stale_count": 0},
+    )
+    monkeypatch.setattr(
+        ops,
+        "forward_health",
+        lambda **kw: {"production_predictions": 1, "predictions_due": 0, "matured": {}},
+    )
+    monkeypatch.setattr(ops, "_authority_record_count", lambda: 0)
+    monkeypatch.setattr(ops, "_runner_receipts", lambda: {"count": 0})
+    monkeypatch.setattr(ops, "_published_authority_ids", lambda: set())
+
+    # A CORRUPT last line.
+    (tmp_path / "cycle-log.jsonl").write_text('{"ok": true}\n{not json at all\n')
+    paths = SimpleNamespace(
+        research_db=tmp_path / "r.db", experiment_db=tmp_path / "e.db", research_dir=tmp_path
+    )
+    out = ops.operator_status(
+        settings=SimpleNamespace(busy_timeout_ms=5000),
+        experiment_db=SimpleNamespace(connect=lambda **kw: _EmptyConn()),
+        paths=paths,
+    )
+    assert "cycle_log" in out["decision_chain"]["query_errors"], out["decision_chain"]
+
+    # An UNREADABLE log must also be recorded rather than crashing.
+    monkeypatch.setattr(
+        ops.Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(OSError("EACCES"))
+    )
+    out2 = ops.operator_status(
+        settings=SimpleNamespace(busy_timeout_ms=5000),
+        experiment_db=SimpleNamespace(connect=lambda **kw: _EmptyConn()),
+        paths=paths,
+    )
+    assert "cycle_log" in out2["decision_chain"]["query_errors"]
+
+
+def test_published_authority_ids_never_raises_on_a_bad_directory(monkeypatch):
+    """Path.is_dir() re-raises on EACCES, so the whole body must be guarded."""
+    from pathlib import Path
+
+    from tradehub_research.ops import operator_status as ops
+
+    class _BadDir:
+        def is_dir(self):
+            raise PermissionError("EACCES")
+
+    monkeypatch.setattr(ops, "DEFAULT_AUTHORITY_DIR", _BadDir())
+    assert ops._published_authority_ids() == set()
+    assert ops._authority_record_count() == 0
+    assert Path  # keep the import meaningful
 
 
 def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):

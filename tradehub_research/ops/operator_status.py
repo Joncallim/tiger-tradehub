@@ -43,9 +43,12 @@ def _all_total(entry: dict | None) -> int | None:
 
 
 def _published_authority_ids() -> set[str]:
-    if not DEFAULT_AUTHORITY_DIR.is_dir():
-        return set()
+    # Path.is_dir() only swallows ENOENT/ENOTDIR/EBADF/ELOOP -- it RE-RAISES on
+    # EACCES and other OS errors, so the whole body must be guarded, not just
+    # the glob.
     try:
+        if not DEFAULT_AUTHORITY_DIR.is_dir():
+            return set()
         return {p.stem for p in DEFAULT_AUTHORITY_DIR.glob("*.json") if p.is_file()}
     except OSError:
         return set()
@@ -57,12 +60,20 @@ def _authority_record_count() -> int:
 
 
 def _runner_receipts() -> dict[str, Any]:
-    """Sanitized receipt count/latest entry; malformed lines never imply success."""
-    if not RUNNER_RECEIPTS.exists():
-        return {"count": 0, "latest": None, "status": "unavailable"}
+    """Sanitized receipt count/latest entry; malformed lines never imply success.
+
+    An UNREADABLE receipt file is reported distinctly from an ABSENT one, and
+    never raises out of operator_status().
+    """
+    try:
+        if not RUNNER_RECEIPTS.exists():
+            return {"count": 0, "latest": None, "status": "unavailable"}
+        text = RUNNER_RECEIPTS.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"count": 0, "latest": None, "status": f"unreadable:{type(exc).__name__}"}
     latest = None
     count = 0
-    for line in RUNNER_RECEIPTS.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
@@ -93,19 +104,36 @@ def operator_status(
 ) -> dict:
     paths = paths or research_paths()
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
-    fwd = forward_health(experiment_db=experiment_db, paths=paths)
-    refr = refresh_health(settings=settings, paths=paths)
+    # Any failure anywhere below must be RECORDED here rather than escaping
+    # operator_status() or masquerading as "the system is empty". Declared early
+    # so every section can contribute; chain["query_errors"] aliases this object.
+    chain_errors: dict[str, str] = {}
 
-    # Pipeline: last research-cycle run from the cycle log.
+    try:
+        fwd = forward_health(experiment_db=experiment_db, paths=paths)
+    except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+        chain_errors["forward_health"] = f"{type(exc).__name__}: {exc}"
+        fwd = {"production_predictions": None, "predictions_due": None, "matured": {}}
+    try:
+        refr = refresh_health(settings=settings, paths=paths)
+    except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+        chain_errors["refresh_health"] = f"{type(exc).__name__}: {exc}"
+        refr = {"securities_expected": None, "with_bars": None, "stale_count": None}
+
+    # Pipeline: last research-cycle run from the cycle log. A CORRUPT or
+    # UNREADABLE log must be distinguishable from "no cycle has ever run".
     cycle_log = paths.research_dir / "cycle-log.jsonl"
     last_cycle = None
-    if cycle_log.exists():
-        lines = [ln for ln in cycle_log.read_text().splitlines() if ln.strip()]
-        if lines:
-            try:
-                last_cycle = json.loads(lines[-1])
-            except ValueError:
-                last_cycle = None
+    try:
+        if cycle_log.exists():
+            lines = [ln for ln in cycle_log.read_text().splitlines() if ln.strip()]
+            if lines:
+                try:
+                    last_cycle = json.loads(lines[-1])
+                except ValueError as exc:
+                    chain_errors["cycle_log"] = f"malformed last line: {exc}"
+    except OSError as exc:
+        chain_errors["cycle_log"] = f"{type(exc).__name__}: {exc}"
 
     # Decision ledger: a no-proposal run is first-class, not an error. EVERY
     # field is derived from durable state, so asynchronous finalizer work can
@@ -138,11 +166,10 @@ def operator_status(
         "authority_records_total": 0,
         "latest_decision": None,
     }
+
     # A failed DECISION-LEDGER query must be OBSERVABLE, never a silent 0 that is
     # indistinguishable from a genuinely empty system. Each field is guarded
     # independently and falls back to None with a recorded error.
-    chain_errors: dict[str, str] = {}
-
     def _ledger_scalar(label: str, sql: str, params: tuple = ()):
         try:
             with research_db.connect(read_only=True) as conn:
@@ -184,7 +211,11 @@ def operator_status(
             "created_at": latest_created_at,
         }
         latest_proposals = 0
-    chain["authority_records_total"] = _authority_record_count()
+    try:
+        chain["authority_records_total"] = _authority_record_count()
+    except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+        chain["authority_records_total"] = None
+        chain_errors["authority_records_total"] = f"{type(exc).__name__}: {exc}"
     # Genuine vs acceptance split for the decision chain. Every table is filtered
     # through an EXPLICITLY QUALIFIED column on the table that actually owns the
     # pipeline run id:
