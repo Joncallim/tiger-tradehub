@@ -98,11 +98,23 @@ def _flow_adjusted(rows: list[dict]) -> float | None:
     return end - start - deposits + withdrawals
 
 
-def _ledger_actions(ledger_path: Path, today: str) -> tuple[int, int]:
-    """(executions, refusals) recorded today by the autonomous runner."""
-    executions = refusals = 0
+def _ledger_actions(ledger_path: Path, today: str) -> tuple[int, int, int]:
+    """(executions, refusals, unknown) recorded today by the autonomous runner.
+
+    ONLY per-proposal outcomes are ACTIONS. A run receipt
+    (``kind=runner_run_receipt_v1``: IDLE_EMPTY_INBOX / OK / BLOCKED summaries)
+    is the durable record of one INVOCATION, not an action; counting receipts
+    as refusals made an enabled-but-idle runner render as "N refused/blocked"
+    in the daily report. Per-proposal refusals are durable inside the receipt
+    as ``refusal_count``, which is where they are counted from.
+
+    An INDETERMINATE submit (broker outcome UNKNOWN) is reported as UNKNOWN --
+    neither an execution nor a refusal, because claiming either would be a
+    false statement about what happened.
+    """
+    executions = refusals = unknown = 0
     if not ledger_path.exists():
-        return 0, 0
+        return 0, 0, 0
     for line in ledger_path.read_text().splitlines():
         if not line.strip():
             continue
@@ -110,13 +122,20 @@ def _ledger_actions(ledger_path: Path, today: str) -> tuple[int, int]:
             entry = json.loads(line)
         except ValueError:
             continue
-        if str(entry.get("at", ""))[:10] != today:
+        if not isinstance(entry, dict) or str(entry.get("at", ""))[:10] != today:
+            continue
+        if entry.get("kind") == "runner_run_receipt_v1":
+            try:
+                refusals += int(entry.get("refusal_count") or 0)
+            except (TypeError, ValueError):
+                unknown += 1
             continue
         if entry.get("decision") == "EXECUTED":
             executions += 1
         else:
-            refusals += 1
-    return executions, refusals
+            # Unclassifiable / indeterminate: never silently swallowed.
+            unknown += 1
+    return executions, refusals, unknown
 
 
 def _system_health(fwd: dict, refr: dict, refr_count: int) -> str:
@@ -144,13 +163,15 @@ def build_daily_report(
     broker = analytics if analytics is not None else _broker_today(LATEST)
     fwd = forward_health(experiment_db=experiment_db)
     refr = refresh_health(settings=settings, paths=paths)
-    executions, refusals = _ledger_actions(LEDGER, date.today().isoformat())
+    executions, refusals, unknown = _ledger_actions(LEDGER, date.today().isoformat())
 
     actions = []
     if executions:
         actions.append(f"{executions} PAPER execution(s)")
     if refusals:
         actions.append(f"{refusals} refused/blocked")
+    if unknown:
+        actions.append(f"{unknown} outcome(s) unknown")
     actions_text = "; ".join(actions) if actions else "No action"
 
     matured = fwd.get("matured_by_horizon", {})
@@ -195,7 +216,7 @@ def build_weekly_report(
     )
 
     matured = fwd.get("matured_by_horizon", {})
-    executions, refusals = _ledger_actions(LEDGER, date.today().isoformat())
+    executions, refusals, unknown = _ledger_actions(LEDGER, date.today().isoformat())
     system = []
     if refr.get("stale_count"):
         system.append(f"{refr['stale_count']} stale data names")
@@ -203,6 +224,8 @@ def build_weekly_report(
         system.append("data healthy")
     if executions:
         system.append(f"{executions} PAPER execution(s) today")
+    if unknown:
+        system.append(f"{unknown} outcome(s) unknown")
 
     data = {
         "asset_value": asset_value,

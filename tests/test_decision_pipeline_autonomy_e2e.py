@@ -168,6 +168,9 @@ def test_persisted_nonfixture_proposal_exports_once_and_receives_dry_run_receipt
         budget_db=tmp_path / "paper-budget.sqlite",
         api_client=client,
         authority_dir=authority_dir,
+        # Isolated kill switch: never the LIVE production path, so the test
+        # result cannot depend on host containment state.
+        kill_switch_path=tmp_path / "kill_switch",
         now=proposal_time.replace(tzinfo=timezone.utc),
     )
 

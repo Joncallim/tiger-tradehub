@@ -171,7 +171,15 @@ def _run(ctx, fixture_mode: bool = True, **kwargs):
     ``fixture_mode`` out of band. Production (and the deployed systemd unit)
     never sets it, so every production envelope requires persisted authority.
     Tests that must exercise the PRODUCTION contract pass fixture_mode=False.
+
+    The kill switch is ALWAYS the isolated per-test file: without this the
+    runner would fall back to the LIVE production kill-switch path
+    (``/var/lib/tradehub/autonomy/kill_switch``) and these unit tests would
+    silently depend on host state -- passing on a host with no switch file and
+    failing on a host where containment is engaged. Unit-test outcomes must
+    never be a function of live production state.
     """
+    kwargs.setdefault("kill_switch_path", ctx["kill_file"])
     return run_autonomy(
         settings=ctx["settings"],
         policy_path=ctx["policy_path"],

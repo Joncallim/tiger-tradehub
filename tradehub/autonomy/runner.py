@@ -5,8 +5,11 @@ THE PRIVILEGED ACTOR IS THIS PROGRAM, NOT A MODEL. It:
   surface, never decides whether a stock is attractive, never changes
   investment weights or risk policy;
 - receives ONLY typed eligible trade_proposal envelopes (research-side,
-  portfolio-engine-produced; a proposal may carry `fixture: true` ONLY for
-  the separately-marked deterministic acceptance fixture);
+  portfolio-engine-produced). The production envelope grammar carries NO
+  fixture metadata at all: the mere PRESENCE of a `fixture`/`fixture_tag` key
+  (whatever its value) is refused. Only the separately-marked deterministic
+  acceptance harness, which enables fixture behaviour OUT OF BAND via
+  `run_autonomy(..., fixture_mode=True)`, may use marked fixtures;
 - revalidates: versioned PAPER policy, kill switch, positive PAPER account
   proof (via the execution API's live broker query), proposal freshness,
   data freshness, symbol allowlist, holdings/long-only, daily count/notional
@@ -224,17 +227,26 @@ def _validate_envelope(
     if "proposal_id" not in proposal:
         raise AutonomyRefusal("proposal missing proposal_id (typed trade-proposal required)")
     # Fixture authority is NEVER payable from envelope contents. In production
-    # any fixture field/tag in the inbox is a forgery attempt and refuses.
-    if not fixture_mode and (
-        envelope.get("fixture")
-        or envelope.get("fixture_tag")
-        or proposal.get("fixture")
-        or proposal.get("fixture_tag")
-    ):
-        raise AutonomyRefusal(
-            "envelope declares fixture authority; fixture proposals are refused "
-            "outside an explicitly isolated acceptance harness"
+    # the presence of ANY fixture-metadata KEY is a forgery attempt and is
+    # refused REGARDLESS OF ITS VALUE: `fixture: false` and `fixture_tag: ""`
+    # are exactly as invalid as `fixture: true`, so the production envelope
+    # grammar cannot contain fixture metadata at all. (Truthiness was the bug:
+    # a falsy marker slipped through a check written for key presence.)
+    if not fixture_mode:
+        forged = sorted(
+            {
+                f"{where}.{key}"
+                for where, source in (("envelope", envelope), ("proposal", proposal))
+                for key in ("fixture", "fixture_tag")
+                if key in source
+            }
         )
+        if forged:
+            raise AutonomyRefusal(
+                f"envelope carries fixture metadata key(s) {forged}; fixture "
+                "authority cannot be claimed from envelope contents and is refused "
+                "outside an explicitly isolated acceptance harness"
+            )
     if not _proposal_age_ok(proposal, policy, now):
         raise AutonomyRefusal("proposal is stale (older than proposal_max_age)")
     if not _data_age_ok(envelope, policy, now):
@@ -359,9 +371,11 @@ def run_autonomy(
 
     ``fixture_mode`` is an OUT-OF-BAND, harness-only switch that permits
     envelopes without a persisted authority record. It defaults to False, can
-    NEVER be enabled from envelope contents (a fixture field/tag in the inbox
-    is refused, not honoured), and is NOT enabled by the deployed systemd unit.
-    Production runs therefore require persisted authority for every envelope.
+    NEVER be enabled from envelope contents (the PRESENCE of a fixture/
+    fixture_tag key in the inbox envelope or its proposal is refused, whatever
+    its value -- not honoured), and is NOT enabled by the deployed systemd
+    unit. Production runs therefore require persisted authority for every
+    envelope.
     """
     now = now or _now()
     policy = load_policy(policy_path)

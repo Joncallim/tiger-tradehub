@@ -200,6 +200,10 @@ def _run(d: dict, **kwargs) -> dict:
                 kwargs["now"] = moment + timedelta(seconds=60)
                 if kwargs["now"].tzinfo is None:
                     kwargs["now"] = kwargs["now"].replace(tzinfo=timezone.utc)
+    kwargs.setdefault(
+        "kill_switch_path",
+        d.get("kill_file") or Path(d["ledger"]).parent / "kill_switch",
+    )
     return run_autonomy(
         settings=d["settings"],
         policy_path=d["policy_path"],

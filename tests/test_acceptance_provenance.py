@@ -650,31 +650,39 @@ def test_corrupt_cycle_log_is_recorded_not_read_as_no_data(tmp_path, monkeypatch
     assert "cycle_log" in out2["decision_chain"]["query_errors"]
 
 
-def test_published_authority_ids_never_raises_on_a_bad_directory(monkeypatch):
-    """Path.is_dir() re-raises on EACCES, so the whole body must be guarded."""
-    from pathlib import Path
+def test_published_authority_ids_propagates_a_bad_directory_to_the_guarded_caller(monkeypatch):
+    """An unreadable authority store must stay VISIBLE, never read as zero.
 
+    ``Path.exists()``/``is_dir()`` swallow EACCES and return False, so an
+    unreadable store used to look like an absent one; the helper now stat()s
+    explicitly and propagates, and operator_status records None + the error (see
+    tests/test_operator_status_faults.py for the full fault-injection matrix).
+    """
     from tradehub_research.ops import operator_status as ops
 
     class _BadDir:
-        def is_dir(self):
+        def stat(self):
             raise PermissionError("EACCES")
 
     monkeypatch.setattr(ops, "DEFAULT_AUTHORITY_DIR", _BadDir())
-    assert ops._published_authority_ids() == set()
-    assert ops._authority_record_count() == 0
-    assert Path  # keep the import meaningful
+    with pytest.raises(PermissionError):
+        ops._published_authority_ids()
+    with pytest.raises(PermissionError):
+        ops._authority_record_count()
 
 
 def test_runner_receipts_unreadable_is_distinguishable_from_absent(tmp_path, monkeypatch):
     """An UNREADABLE receipt file must not read as 'no receipts' and must not raise."""
     from tradehub_research.ops import operator_status as ops
 
-    # ABSENT file -> 'unavailable'
+    # ABSENT file -> documented absence: 'unavailable' with a known zero.
     monkeypatch.setattr(ops, "RUNNER_RECEIPTS", tmp_path / "nope.jsonl")
-    assert ops._runner_receipts()["status"] == "unavailable"
+    absent = ops._runner_receipts()
+    assert absent["status"] == "unavailable"
+    assert absent["count"] == 0
 
-    # UNREADABLE file (exists, but reading raises) -> distinguishable, no raise.
+    # UNREADABLE file (exists, but reading raises) -> distinguishable, no raise,
+    # and the count is UNKNOWN rather than a fake 0.
     target = tmp_path / "ledger.jsonl"
     target.write_text("{}\n")
 
@@ -688,12 +696,27 @@ def test_runner_receipts_unreadable_is_distinguishable_from_absent(tmp_path, mon
     monkeypatch.setattr(ops, "RUNNER_RECEIPTS", _Unreadable())
     out = ops._runner_receipts()
     assert out["status"].startswith("unreadable:"), out
-    assert out["count"] == 0
+    assert out["count"] is None, "an unreadable ledger must not report 0 receipts"
 
-    # A MALFORMED line is likewise distinguishable.
+    # A MALFORMED line is likewise distinguishable, with an unknown count.
     monkeypatch.setattr(ops, "RUNNER_RECEIPTS", target)
     target.write_text("not json\n")
-    assert ops._runner_receipts()["status"] == "malformed"
+    malformed = ops._runner_receipts()
+    assert malformed["status"] == "malformed"
+    assert malformed["count"] is None
+
+    # A line that is valid JSON but NOT an object used to raise AttributeError
+    # out of operator_status entirely.
+    target.write_text('{"kind": "runner_run_receipt_v1", "at": "2026-09-14T00:00:00Z"}\n[1, 2]\n')
+    not_an_object = ops._runner_receipts()
+    assert not_an_object["status"] == "malformed", not_an_object
+    assert not_an_object["count"] is None
+
+    # A healthy ledger still reports a real count.
+    target.write_text('{"kind": "runner_run_receipt_v1", "at": "2026-09-14T00:00:00Z"}\n')
+    healthy = ops._runner_receipts()
+    assert healthy["status"] == "ok"
+    assert healthy["count"] == 1
 
 
 def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):

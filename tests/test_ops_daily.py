@@ -169,7 +169,15 @@ def test_maturation_honest_when_bars_missing(tmp_path):
     assert health["matured"] == {}  # nothing matured yet (horizons not due)
 
 
-def test_daily_report_honest_when_broker_unavailable(tmp_path):
+def test_daily_report_honest_when_broker_unavailable(tmp_path, monkeypatch):
+    """No broker data + nothing ran today => honest, and never a fake $0.
+
+    The runner ledger is pinned to an isolated path: the assertion is about a
+    day with NO actions, so it must not depend on the host's live ledger.
+    """
+    from tradehub_research.ops import report_cli
+
+    monkeypatch.setattr(report_cli, "LEDGER", tmp_path / "ledger.jsonl")
     paths, research_db, exp = _seed(tmp_path)
     settings = ResearchSettings(db_path=research_db.path, busy_timeout_ms=5000)
     report = build_daily_report(settings=settings, experiment_db=exp, paths=paths, analytics={})

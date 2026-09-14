@@ -159,6 +159,86 @@ def test_fixture_mode_defaults_to_false():
 
 
 # --------------------------------------------------------------------------
+# P1-1b  the production fixture grammar is KEY PRESENCE, not truthiness
+# --------------------------------------------------------------------------
+# Final-review finding C: the guard used truthiness, so `fixture: false` and
+# `fixture_tag: ""` slipped through while the documented contract said ANY
+# fixture / fixture_tag key is refused. These regressions pin the documented
+# and enforced grammars together: in production, fixture metadata keys cannot
+# exist in the envelope AT ALL.
+FALSY_FIXTURE_MARKERS = (
+    {"fixture": False},
+    {"fixture": None},
+    {"fixture": 0},
+    {"fixture": ""},
+    {"fixture_tag": ""},
+    {"fixture_tag": None},
+    {"fixture": False, "fixture_tag": ""},
+)
+
+
+@pytest.mark.parametrize("marker", FALSY_FIXTURE_MARKERS)
+def test_falsy_fixture_keys_are_refused_by_key_presence(ctx, marker):  # noqa: F811
+    envelope = _envelope(fixture=False)  # clean: carries NO fixture keys
+    envelope.update(marker)
+    _write_inbox(ctx, envelope)
+    summary = _run(ctx, fixture_mode=False)
+
+    assert summary["orders"] == 0
+    assert summary["executions"] == []
+    assert any(
+        "fixture metadata key" in str(entry.get("reason", "")) for entry in summary["refusals"]
+    ), summary["refusals"]
+    assert _charged(ctx) == 0, "must not charge budget"
+    assert _preview_payloads(ctx) == [], "must not preview"
+    assert _submit_calls(ctx) == [], "must not submit"
+
+
+@pytest.mark.parametrize("key", ["fixture", "fixture_tag"])
+@pytest.mark.parametrize("value", [False, None, ""])
+def test_falsy_fixture_keys_nested_in_the_proposal_are_refused(ctx, key, value):  # noqa: F811
+    envelope = _envelope(fixture=False)
+    envelope["proposal"][key] = value
+    _write_inbox(ctx, envelope)
+    summary = _run(ctx, fixture_mode=False)
+    assert summary["orders"] == 0
+    assert any(
+        "fixture metadata key" in str(entry.get("reason", "")) for entry in summary["refusals"]
+    ), summary["refusals"]
+    assert _preview_payloads(ctx) == []
+
+
+def test_falsy_fixture_key_is_refused_even_with_a_real_authority_record(ctx):  # noqa: F811
+    """A published authority record never licenses fixture metadata."""
+    envelope = _envelope(fixture=False)
+    envelope["fixture"] = False
+    _publish(ctx, envelope)
+    _write_inbox(ctx, envelope)
+    summary = _run(ctx, fixture_mode=False)
+    assert summary["orders"] == 0
+    assert any(
+        "fixture metadata key" in str(entry.get("reason", "")) for entry in summary["refusals"]
+    ), summary["refusals"]
+    assert _preview_payloads(ctx) == []
+
+
+def test_clean_envelope_is_not_refused_for_fixture_reasons(ctx):  # noqa: F811
+    """The stricter grammar must not start refusing legitimate envelopes."""
+    _write_inbox(ctx, _envelope(fixture=False))
+    summary = _run(ctx, fixture_mode=False)
+    reasons = [str(entry.get("reason", "")) for entry in summary["refusals"]]
+    assert any("no persisted proposal authority" in reason for reason in reasons), reasons
+    assert not any("fixture metadata key" in reason for reason in reasons), reasons
+
+
+def test_harness_fixture_mode_is_unaffected_by_the_stricter_grammar(ctx):  # noqa: F811
+    """The OUT-OF-BAND acceptance harness path still executes its fixture."""
+    _write_inbox(ctx, _envelope(fixture=True, fixture_tag="paper-acceptance-fixture-v1"))
+    summary = _run(ctx, fixture_mode=True)
+    assert summary["orders"] == 1, summary["refusals"]
+
+
+# --------------------------------------------------------------------------
 # P1-2  order quantity is the DELTA, not the completion target
 # --------------------------------------------------------------------------
 def test_add_uses_delta_quantity_not_completion(ctx):  # noqa: F811
