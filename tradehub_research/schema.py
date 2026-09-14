@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- migration SQL remains legible as exact DDL statements.
 
-PHASE_0_SCHEMA_VERSION = 11
+PHASE_0_SCHEMA_VERSION = 12
 
 MIGRATIONS: tuple[tuple[int, str, str], ...] = (
     (
@@ -1013,6 +1013,32 @@ MIGRATIONS: tuple[tuple[int, str, str], ...] = (
             rendered_context_hash TEXT CHECK(rendered_context_hash IS NULL OR length(rendered_context_hash)=64)
         );
         CREATE INDEX phase4_execution_link_state_idx ON phase4_execution_link(state);
+        """,
+    ),
+    (
+        12,
+        "V2 Phase 5 scoring lineage and bounded committee view",
+        """
+        CREATE TABLE scoring_lineage (
+            lineage_hash TEXT PRIMARY KEY,
+            lineage_spec_version INTEGER NOT NULL CHECK(lineage_spec_version > 0),
+            candidate_id TEXT NOT NULL REFERENCES candidate(candidate_id),
+            pipeline_run_id TEXT NOT NULL REFERENCES pipeline_run(run_id),
+            body_json TEXT NOT NULL CHECK(json_valid(body_json)),
+            body_chars INTEGER NOT NULL CHECK(body_chars >= 0),
+            built_at TEXT NOT NULL,
+            UNIQUE(candidate_id, lineage_spec_version)
+        );
+        CREATE INDEX scoring_lineage_run_idx ON scoring_lineage(pipeline_run_id);
+        CREATE TRIGGER scoring_lineage_no_update BEFORE UPDATE ON scoring_lineage BEGIN SELECT RAISE(ABORT, 'scoring_lineage is append-only'); END;
+        CREATE TRIGGER scoring_lineage_no_delete BEFORE DELETE ON scoring_lineage BEGIN SELECT RAISE(ABORT, 'scoring_lineage is append-only'); END;
+        CREATE TABLE committee_run_lineage (
+            committee_run_id TEXT PRIMARY KEY REFERENCES committee_run(committee_run_id),
+            lineage_hash TEXT NOT NULL REFERENCES scoring_lineage(lineage_hash),
+            recorded_at TEXT NOT NULL
+        );
+        CREATE TRIGGER committee_run_lineage_no_update BEFORE UPDATE ON committee_run_lineage BEGIN SELECT RAISE(ABORT, 'committee_run_lineage is append-only'); END;
+        CREATE TRIGGER committee_run_lineage_no_delete BEFORE DELETE ON committee_run_lineage BEGIN SELECT RAISE(ABORT, 'committee_run_lineage is append-only'); END;
         """,
     ),
 )

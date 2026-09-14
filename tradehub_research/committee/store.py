@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501 -- long SQL projections mirror immutable row layouts.
 import hashlib
+import json
 import re
 import sqlite3
 from collections.abc import Callable, Mapping
@@ -272,9 +273,17 @@ class CommitteeStore:
         prompt_versions: Mapping[str, Any],
         assessment_schema_version: int,
         provider_routes: object | None = None,
+        lineage_hash: str | None = None,
     ) -> str:
         del provider_routes
         roles = list(NEUTRAL_ROLES)
+        # ``lineage_hash`` is recorded in the append-only ``committee_run_lineage``
+        # mapping table, never as a column on ``committee_run``: that keeps the
+        # historical table shape (and therefore pre-#67 code on a migrated
+        # database) intact, and keeps the association deterministic and
+        # append-only.  It is deliberately NOT part of the logical identity --
+        # the run is pinned by ``pack_hash`` (the bounded view), and the view body
+        # embeds its lineage hash, so pack_hash -> lineage_hash is functional.
         logical = {
             "candidate_id": candidate_id,
             "pack_hash": pack_hash,
@@ -319,12 +328,56 @@ class CommitteeStore:
             if stored is not None:
                 if tuple(stored) != values:
                     raise DeterminismError("committee run identity collision")
+                self._record_lineage(db, run_id, pack_hash, lineage_hash)
                 return run_id
             db.execute(
                 "INSERT INTO committee_run(committee_run_id,candidate_id,pipeline_run_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (run_id, candidate_id, candidate[0], *values[2:], utc_now()),
             )
+            self._record_lineage(db, run_id, pack_hash, lineage_hash)
         return run_id
+
+    @staticmethod
+    def _record_lineage(db: Any, run_id: str, pack_hash: str, lineage_hash: str | None) -> None:
+        """Record (or verify) the append-only run -> lineage association.
+
+        The pairing is cross-checked against the pinned view's own embedded
+        ``lineage.lineage_hash`` (review finding P2, round 2): the mapping table
+        must never be the caller's word for which lineage a view corresponds to,
+        because the scorer trusts it as the scoring input of record. Legacy runs
+        created before #67 simply have no mapping row.
+        """
+        if lineage_hash is None:
+            return
+        existing = db.execute(
+            "SELECT lineage_hash FROM committee_run_lineage WHERE committee_run_id=?", (run_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != lineage_hash:
+                raise DeterminismError("committee run lineage collision")
+            return
+        view = db.execute(
+            "SELECT body_json FROM evidence_pack WHERE pack_hash=?", (pack_hash,)
+        ).fetchone()
+        if view is None:
+            raise ValueError(f"unknown evidence pack: {pack_hash}")
+        embedded = (json.loads(view["body_json"]).get("lineage") or {}).get("lineage_hash")
+        if embedded != lineage_hash:
+            raise DeterminismError(
+                "committee run lineage does not match the pinned view's own lineage reference"
+            )
+        if (
+            db.execute(
+                "SELECT lineage_hash FROM scoring_lineage WHERE lineage_hash=?", (lineage_hash,)
+            ).fetchone()
+            is None
+        ):
+            raise ValueError(f"unknown scoring lineage: {lineage_hash}")
+        db.execute(
+            "INSERT INTO committee_run_lineage(committee_run_id,lineage_hash,recorded_at) "
+            "VALUES (?,?,?)",
+            (run_id, lineage_hash, utc_now()),
+        )
 
     def record_transition(
         self,
