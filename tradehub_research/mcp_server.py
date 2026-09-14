@@ -22,30 +22,26 @@ def resolve_evidence_artifact(
     candidate has outstanding committee work.
     """
     with database.connect(read_only=True) as db:
-        outstanding_pins = {
+        # One statement, one read snapshot: issued work pins (unattempted work)
+        # and live pins (runs that exist but are not terminal) are collected
+        # together. The live-pin half closes the window between run creation and
+        # the first issued work item (review finding P3, round 2); a single query
+        # avoids a window where the two could disagree.
+        allowed_pins = {
             row[0]
             for row in db.execute(
                 "SELECT DISTINCT w.pack_hash FROM committee_run c "
                 "JOIN committee_work w ON w.committee_run_id=c.committee_run_id "
                 "LEFT JOIN model_call_attempt a ON a.work_id=w.work_id "
-                "WHERE c.candidate_id=? AND a.attempt_id IS NULL",
-                (candidate_id,),
-            )
-        }
-        # Runs that exist but are not finished: their artifacts are live pins too,
-        # which closes the window between run creation and the first issued work
-        # item (review finding P3, round 2).
-        live_pins = {
-            row[0]
-            for row in db.execute(
+                "WHERE c.candidate_id=? AND a.attempt_id IS NULL "
+                "UNION "
                 "SELECT DISTINCT r.pack_hash FROM committee_run r WHERE r.candidate_id=? AND "
                 "COALESCE((SELECT t.to_state FROM committee_transition t "
                 "WHERE t.committee_run_id=r.committee_run_id ORDER BY t.rowid DESC LIMIT 1), "
                 "'PENDING_NEUTRALS') NOT IN ('SCORED','BLOCKED','ESCALATE')",
-                (candidate_id,),
+                (candidate_id, candidate_id),
             )
         }
-        allowed_pins = outstanding_pins | live_pins
         if pack_hash:
             if allowed_pins and pack_hash not in allowed_pins:
                 raise ValueError(

@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from test_committee_identity_migration import (  # noqa: E402 - sibling test fixture
@@ -148,6 +149,44 @@ def test_lineage_mapping_must_match_the_pinned_view_reference(tmp_path):
             prompt_versions={"neutral": "v2", "red_team": "v2", "arbiter": "v2"},
             assessment_schema_version=1,
         )
+
+
+def test_aggregate_representatives_are_always_citable_rows(tmp_path):
+    """Review finding P1 (round 3): a screen's declared evidence_ids is often a
+    subset of the ids its raw features reference, so sampling the raw series
+    could advertise an id that never becomes an evidence row."""
+    database, candidate_id = identity_fixture(tmp_path / "mismatch.db")
+    view = CommitteeViewBuilder(database).build(candidate_id).body
+    presented = {row["evidence_id"] for row in view["evidence"]}
+    frozen = set()
+    with database.connect(read_only=True) as db:
+        for row in db.execute("SELECT evidence_id FROM evidence_event"):
+            frozen.add(row[0])
+    aggregates = [entry for screen in view["screens"] for entry in screen["series_aggregates"]]
+    assert aggregates
+    for entry in aggregates:
+        advertised = set(entry["representative_evidence_ids"])
+        assert advertised <= presented, "every advertised representative must be a view row"
+        assert advertised <= frozen, "advertised representatives must exist as evidence"
+        assert entry["observations_presented"] == len(advertised)
+        assert entry["observations_omitted"] == entry["observation_count"] - len(advertised)
+    # The series here references 50 observations while only 12 exist as evidence
+    # rows, so the sample must have been drawn only from the admissible 12.
+    assert len(frozen) == 14  # 12 bars + val1 + val2
+    for entry in aggregates:
+        assert entry["observations_presented"] <= 4
+    # The raw_features copy of each aggregate must agree with the summary copy.
+    for screen in view["screens"]:
+        for entry in screen["series_aggregates"]:
+            feature = entry["path"].split("/raw_features/")[1]
+            cursor: Any = screen["raw_features"]
+            for part in feature.split("/"):
+                cursor = cursor[part]
+            assert set(cursor["representative_evidence_ids"]) == set(
+                entry["representative_evidence_ids"]
+            )
+            assert cursor["observations_presented"] == entry["observations_presented"]
+            assert cursor["observations_omitted"] == entry["observations_omitted"]
 
 
 def test_pre_work_window_cannot_admit_a_stale_artifact(tmp_path):

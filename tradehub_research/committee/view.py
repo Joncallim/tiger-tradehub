@@ -99,17 +99,32 @@ def _observation_sort_key(item: dict[str, Any]) -> tuple[str, str]:
     return (str(item.get("session_date") or ""), str(item.get("evidence_id") or ""))
 
 
-def _series_aggregate(value: dict[str, Any], sources: list[Any]) -> dict[str, Any]:
+def _series_aggregate(
+    value: dict[str, Any], sources: list[Any], admissible_ids: set[str]
+) -> dict[str, Any]:
+    """Summarise one observation series deterministically.
+
+    ``observation_count`` and ``lineage_set_hash`` describe the **complete**
+    series.  The representative sample is drawn only from observations that
+    actually exist as evidence rows for this candidate (review finding P1, round
+    3): a screen's declared ``evidence_ids`` is commonly a curated subset of the
+    ids referenced by its raw features, so sampling the raw series could
+    advertise an id that can never be presented -- and therefore never be cited.
+    """
     items = [item for item in sources if isinstance(item, dict)]
-    ordered = sorted(items, key=_observation_sort_key)
+    admissible = [
+        item for item in items if admissible_ids and str(item.get("evidence_id")) in admissible_ids
+    ]
+    ordered = sorted(admissible, key=_observation_sort_key)
     identity = sorted(
         canonical_json(
             {key: item.get(key) for key in ("evidence_id", "session_date", "value", "unit", "role")}
         )
         for item in items
     )
-    total = len(ordered)
-    if total <= MAX_SERIES_REPRESENTATIVES:
+    full_sorted = sorted(items, key=_observation_sort_key)
+    total = len(items)
+    if len(ordered) <= MAX_SERIES_REPRESENTATIVES:
         presented = ordered
     else:
         head = MAX_SERIES_REPRESENTATIVES // 2
@@ -122,7 +137,9 @@ def _series_aggregate(value: dict[str, Any], sources: list[Any]) -> dict[str, An
         "observations_presented": len(presented),
         "observations_omitted": total - len(presented),
         "session_date_range": (
-            [ordered[0].get("session_date"), ordered[-1].get("session_date")] if ordered else None
+            [full_sorted[0].get("session_date"), full_sorted[-1].get("session_date")]
+            if full_sorted
+            else None
         ),
         "representative_observations": presented,
         "representative_evidence_ids": [
@@ -141,6 +158,7 @@ def aggregate_series(
     path: str,
     aggregates: list[dict[str, Any]],
     aggregated_ids: set[str],
+    admissible_ids: set[str],
 ) -> Any:
     """Replace every observation series with a deterministic aggregate.
 
@@ -152,31 +170,27 @@ def aggregate_series(
     them makes the two sets agree exactly: every series observation is either a
     published representative row (visible and citable) or an explicitly counted
     aggregate omission (invisible).
+
+    ``aggregates`` collects ``{"path", "aggregate"}`` pairs so the caller can
+    trim each aggregate to the observations it actually presented, keeping the
+    model-visible copy and the summary copy in agreement.
     """
     if isinstance(value, dict):
         sources = value.get("sources")
         if isinstance(sources, list):
-            aggregate = _series_aggregate(value, sources)
+            aggregate = _series_aggregate(value, sources, admissible_ids)
             aggregated_ids.update(series_observation_ids(value))
-            aggregates.append(
-                {
-                    "path": path,
-                    "observation_count": aggregate["observation_count"],
-                    "observations_presented": aggregate["observations_presented"],
-                    "observations_omitted": aggregate["observations_omitted"],
-                    "session_date_range": aggregate["session_date_range"],
-                    "lineage_set_hash": aggregate["lineage_set_hash"],
-                    "representative_evidence_ids": aggregate["representative_evidence_ids"],
-                }
-            )
+            aggregates.append({"path": path, "aggregate": aggregate})
             return aggregate
         return {
-            key: aggregate_series(value[key], f"{path}/{key}", aggregates, aggregated_ids)
+            key: aggregate_series(
+                value[key], f"{path}/{key}", aggregates, aggregated_ids, admissible_ids
+            )
             for key in sorted(value)
         }
     if isinstance(value, list):
         return [
-            aggregate_series(item, f"{path}/{index}", aggregates, aggregated_ids)
+            aggregate_series(item, f"{path}/{index}", aggregates, aggregated_ids, admissible_ids)
             for index, item in enumerate(value)
         ]
     return value
@@ -250,37 +264,41 @@ class CommitteeViewBuilder:
     def _build(self, db: Any, inputs: FrozenInputs, lineage: ScoringLineage) -> CommitteeView:
         truncations: list[dict[str, Any]] = []
         screens: list[dict[str, Any]] = []
+        screen_aggregates: dict[str, list[dict[str, Any]]] = {}
         aggregated_ids: set[str] = set()
         representative_ids: list[str] = []
         series_references = 0
+        admissible_ids = set(inputs.evidence_rows)
         for item in inputs.results:
             row = item.row
             spec = item.spec
-            aggregates: list[dict[str, Any]] = []
+            pairs: list[dict[str, Any]] = []
             features = aggregate_series(
                 json.loads(row["raw_features_json"]),
                 f"screens/{row['screen_result_id']}/raw_features",
-                aggregates,
+                pairs,
                 aggregated_ids,
+                admissible_ids,
             )
             features = truncate_strings(
                 features, f"screens/{row['screen_result_id']}/raw_features", truncations
             )
             evidence_ids = list(item.evidence_ids)
-            series_references += sum(entry["observation_count"] for entry in aggregates)
-            for entry in aggregates:
-                for evidence_id in entry["representative_evidence_ids"]:
+            series_references += sum(pair["aggregate"]["observation_count"] for pair in pairs)
+            for pair in pairs:
+                for evidence_id in pair["aggregate"]["representative_evidence_ids"]:
                     if evidence_id not in representative_ids:
                         representative_ids.append(evidence_id)
-            if aggregates:
+            screen_aggregates[row["screen_result_id"]] = pairs
+            if pairs:
                 # Series screens present their representative observations; the
                 # complete id set is committed by digest instead of being
                 # re-serialized (thousands of ids would consume the budget that
                 # belongs to interpretive evidence).
                 presented_ids = [
                     evidence_id
-                    for entry in aggregates
-                    for evidence_id in entry["representative_evidence_ids"]
+                    for pair in pairs
+                    for evidence_id in pair["aggregate"]["representative_evidence_ids"]
                 ][:MAX_VIEW_EVIDENCE_ROWS]
             else:
                 presented_ids = evidence_ids[:MAX_VIEW_EVIDENCE_ROWS]
@@ -305,9 +323,11 @@ class CommitteeViewBuilder:
                     "evidence_id_set_hash": hash_prefixed(
                         "screen-evidence-ids-v1", sorted(evidence_ids)
                     ),
-                    "representation": _AGGREGATE if aggregates else "BOUNDED",
+                    "representation": _AGGREGATE if pairs else "BOUNDED",
                     "raw_features": features,
-                    "series_aggregates": aggregates,
+                    # Filled after admission so the summary can only ever list
+                    # representatives that really are presented evidence rows.
+                    "series_aggregates": [],
                 }
             )
         screens.sort(
@@ -426,6 +446,48 @@ class CommitteeViewBuilder:
         ]
         presented = [row for row in presented if row is not None]
         visible_ids = {row["evidence_id"] for row in presented}
+        # Trim every aggregate to the observations actually presented, so the
+        # model-visible aggregate copy and the per-screen summary agree exactly
+        # and neither can advertise an id that is not a citable evidence row
+        # (review finding P1, round 3).
+        for screen in screens:
+            meta: list[dict[str, Any]] = []
+            for pair in screen_aggregates[screen["screen_result_id"]]:
+                aggregate = pair["aggregate"]
+                admitted = [
+                    evidence_id
+                    for evidence_id in aggregate["representative_evidence_ids"]
+                    if evidence_id in visible_ids
+                ]
+                aggregate["representative_evidence_ids"] = admitted
+                aggregate["representative_observations"] = [
+                    observation
+                    for observation in aggregate["representative_observations"]
+                    if str(observation.get("evidence_id")) in visible_ids
+                ]
+                aggregate["observations_presented"] = len(admitted)
+                aggregate["observations_omitted"] = aggregate["observation_count"] - len(admitted)
+                meta.append(
+                    {
+                        "path": pair["path"],
+                        "observation_count": aggregate["observation_count"],
+                        "observations_presented": aggregate["observations_presented"],
+                        "observations_omitted": aggregate["observations_omitted"],
+                        "session_date_range": aggregate["session_date_range"],
+                        "lineage_set_hash": aggregate["lineage_set_hash"],
+                        "representative_evidence_ids": admitted,
+                    }
+                )
+            screen["series_aggregates"] = meta
+            if meta:
+                screen["evidence_ids"] = [
+                    evidence_id
+                    for entry in meta
+                    for evidence_id in entry["representative_evidence_ids"]
+                ]
+                screen["evidence_ids_omitted"] = screen["evidence_id_count"] - len(
+                    screen["evidence_ids"]
+                )
         representative_presented = sum(
             1 for evidence_id in representative_ids if evidence_id in visible_ids
         )
