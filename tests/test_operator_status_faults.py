@@ -646,7 +646,9 @@ def test_runner_ledger_behind_an_unsearchable_directory_is_unreadable(tmp_path, 
     ledger.write_text('{"kind": "runner_run_receipt_v1", "at": "2026-09-14T00:00:00Z"}\n')
     locked.chmod(0o000)
     try:
-        assert ledger.exists() is False, "exists() swallows EACCES -- the trap"
+        # NOTE: Path.exists() does NOT reliably swallow EACCES -- on CPython
+        # 3.10-3.12 it RAISES, on 3.14 it returns False. That version
+        # dependence is exactly why the code under test must not use it.
         out = _status(
             tmp_path,
             monkeypatch,

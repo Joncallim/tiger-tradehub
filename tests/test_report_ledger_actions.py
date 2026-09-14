@@ -219,7 +219,8 @@ def test_ledger_behind_an_unsearchable_directory_is_unknown(tmp_path):
     path.write_text("{}\n")
     locked.chmod(0o000)
     try:
-        assert path.exists() is False, "exists() swallows the EACCES -- the trap"
+        # Path.exists() is version-dependent under EACCES (3.10-3.12 raise,
+        # 3.14 returns False) -- precisely why the fix uses an explicit stat().
         acts = _ledger_actions(path, date.today().isoformat())
     finally:
         locked.chmod(0o700)
