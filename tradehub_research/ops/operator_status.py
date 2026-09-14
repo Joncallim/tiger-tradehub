@@ -209,10 +209,20 @@ def _runner_receipts() -> dict[str, Any]:
       ``malformed``, count ``None`` -- the number of good lines is not a
       trustworthy total, so it is reported as UNKNOWN rather than as a partial
       count that reads like a real one.
+
+    Existence is probed with an EXPLICIT ``stat()``, never ``Path.exists()``:
+    ``exists()`` swallows EVERY ``OSError`` (EACCES included) and returns
+    ``False``, which would render an unreadable ledger as the documented "no
+    receipts yet" absence -- the exact false-empty-state this surface must never
+    produce. Only ``FileNotFoundError`` counts as an absence here.
     """
     try:
-        if not RUNNER_RECEIPTS.exists():
-            return {"count": 0, "latest": None, "status": "unavailable"}
+        RUNNER_RECEIPTS.stat()
+    except FileNotFoundError:
+        return {"count": 0, "latest": None, "status": "unavailable"}
+    except OSError as exc:
+        return {"count": None, "latest": None, "status": f"unreadable:{type(exc).__name__}"}
+    try:
         text = RUNNER_RECEIPTS.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         return {"count": None, "latest": None, "status": f"unreadable:{type(exc).__name__}"}

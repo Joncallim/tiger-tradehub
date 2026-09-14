@@ -687,10 +687,13 @@ def test_runner_receipts_unreadable_is_distinguishable_from_absent(tmp_path, mon
     target.write_text("{}\n")
 
     class _Unreadable:
-        def exists(self):
-            return True
+        def stat(self):
+            raise PermissionError("EACCES")
 
-        def read_text(self, *args, **kwargs):
+        def exists(self):  # documents the trap: exists() would swallow EACCES
+            return False
+
+        def read_text(self, *args, **kwargs):  # pragma: no cover
             raise PermissionError("EACCES")
 
     monkeypatch.setattr(ops, "RUNNER_RECEIPTS", _Unreadable())

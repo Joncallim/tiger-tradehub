@@ -609,10 +609,15 @@ def test_unreadable_runner_ledger_is_surfaced_without_crashing(tmp_path, monkeyp
     """The runner ledger is part of the audited surface: unreadable != 0 receipts."""
 
     class _Unreadable:
-        def exists(self):
-            return True
+        """exists() lies False while stat() raises -- the EACCES-swallow trap."""
 
-        def read_text(self, *args, **kwargs):
+        def exists(self):
+            return False
+
+        def stat(self):
+            raise PermissionError("EACCES")
+
+        def read_text(self, *args, **kwargs):  # pragma: no cover - never reached
             raise PermissionError("EACCES")
 
     out = _status(
@@ -622,10 +627,37 @@ def test_unreadable_runner_ledger_is_surfaced_without_crashing(tmp_path, monkeyp
         receipts=_Unreadable(),
     )
     receipts = out["decision_chain"]["runner_receipts"]
-    assert receipts["status"].startswith("unreadable:")
-    assert receipts["count"] is None
+    assert receipts["status"] == "unreadable:PermissionError", receipts
+    assert receipts["count"] is None, "an EACCES must never render as 0 receipts"
     # The rest of the payload is intact.
     assert out["report_status"] is not None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory mode bits")
+def test_runner_ledger_behind_an_unsearchable_directory_is_unreadable(tmp_path, monkeypatch):
+    """The deployed shape: /var/lib/tradehub-research/autonomy is 0750.
+
+    A report identity that is not tradehub-autonomy gets EACCES, which
+    ``Path.exists()`` swallows and reports as False -- i.e. as "no receipts yet".
+    """
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    ledger = locked / "paper_run_ledger.jsonl"
+    ledger.write_text('{"kind": "runner_run_receipt_v1", "at": "2026-09-14T00:00:00Z"}\n')
+    locked.chmod(0o000)
+    try:
+        assert ledger.exists() is False, "exists() swallows EACCES -- the trap"
+        out = _status(
+            tmp_path,
+            monkeypatch,
+            authority_dir=_authority_dir(tmp_path),
+            receipts=ledger,
+        )
+    finally:
+        locked.chmod(0o700)
+    receipts = out["decision_chain"]["runner_receipts"]
+    assert receipts["status"] == "unreadable:PermissionError", receipts
+    assert receipts["count"] is None
 
 
 # --------------------------------------------------------------------------

@@ -48,19 +48,32 @@ def _broker_today(path: Path) -> dict:
         return {}
 
 
-def _history(path: Path) -> list[dict]:
-    """Broker history rows; an ABSENT or UNREADABLE history is an empty list.
+class HistoryRows(NamedTuple):
+    """Broker history rows, plus the error type when the file could not be read."""
 
-    An empty history renders as ``unavailable`` P&L (never ``$0``), so returning
-    nothing for an unreadable file is honest -- but it must not raise: a
-    corrupted/truncated analytics file previously crashed the weekly report.
+    rows: list[dict]
+    error: str | None = None
+
+
+def _history(path: Path) -> HistoryRows:
+    """Broker history rows; an ABSENT history is a documented empty history.
+
+    Existence is probed with an explicit ``stat()``, never ``Path.exists()``:
+    ``exists()`` swallows every ``OSError`` (EACCES included) and returns
+    ``False``, which would conflate "the history cannot be read" with "there is
+    no history yet". An UNREADABLE history is reported with its error type (the
+    P&L then renders as ``unavailable``, never ``$0``) and never raises.
     """
     try:
-        if not path.exists():
-            return []
+        path.stat()
+    except FileNotFoundError:
+        return HistoryRows([])
+    except OSError as exc:
+        return HistoryRows([], type(exc).__name__)
+    try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return []
+    except (OSError, UnicodeError) as exc:
+        return HistoryRows([], type(exc).__name__)
     rows = []
     for line in text.splitlines():
         if not line.strip():
@@ -72,7 +85,7 @@ def _history(path: Path) -> list[dict]:
         if isinstance(parsed, dict) and parsed.get("date"):
             rows.append(parsed)
     rows.sort(key=lambda item: item["date"])
-    return rows
+    return HistoryRows(rows)
 
 
 def _week_ago_value(rows: list[dict]) -> float | None:
@@ -137,10 +150,19 @@ def _ledger_actions(ledger_path: Path, today: str) -> LedgerActions:
     service) yields ``None`` counts plus the error type: the report says the
     ledger is unavailable rather than claiming nothing happened, and it must
     never raise out of report generation.
+
+    Existence is probed with an explicit ``stat()``, never ``Path.exists()``:
+    ``exists()`` swallows every ``OSError`` (EACCES included) and returns
+    ``False``, which is how a genuine read failure used to render as a
+    legitimate "No action" day. Only ``FileNotFoundError`` is an absence.
     """
     try:
-        if not ledger_path.exists():
-            return LedgerActions(0, 0, 0)
+        ledger_path.stat()
+    except FileNotFoundError:
+        return LedgerActions(0, 0, 0)
+    except OSError as exc:
+        return LedgerActions(None, None, None, type(exc).__name__)
+    try:
         text = ledger_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         return LedgerActions(None, None, None, type(exc).__name__)
@@ -235,7 +257,11 @@ def build_weekly_report(
 ) -> str:
     paths = paths or research_paths()
     broker = analytics if analytics is not None else _broker_today(LATEST)
-    rows = history if history is not None else _history(HISTORY)
+    if history is not None:
+        rows, history_error = history, None
+    else:
+        loaded = _history(HISTORY)
+        rows, history_error = loaded.rows, loaded.error
     fwd = forward_health(experiment_db=experiment_db)
     refr = refresh_health(settings=settings, paths=paths)
 
@@ -262,6 +288,8 @@ def build_weekly_report(
         system.append(f"{acts.unknown} outcome(s) unknown")
     if acts.error:
         system.append(f"action ledger unavailable ({acts.error})")
+    if history_error:
+        system.append(f"broker history unavailable ({history_error})")
 
     data = {
         "asset_value": asset_value,
