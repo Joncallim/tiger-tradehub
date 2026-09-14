@@ -2232,6 +2232,10 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         "tests/test_research_adapters.py",
         # #51 autonomous-PAPER runner tests (execution-plane capability)
         "tests/test_autonomy_paper.py",
+        # Proposal-authority boundary: asserts the autonomy runner reads ONLY
+        # the research-written projection and rejects a tampered/absent one.
+        # It is an execution-boundary test, not research code.
+        "tests/test_proposal_authority.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of
         # execution vocabulary in the research capability profile
         "tests/test_research_capability.py",

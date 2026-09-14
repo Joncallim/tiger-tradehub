@@ -135,13 +135,24 @@ def test_persisted_nonfixture_proposal_exports_once_and_receives_dry_run_receipt
 
     proposal_run = next(summary for summary in summaries if summary.proposal_count == 1)
     inbox = tmp_path / "proposal-inbox"
-    first_export = export_eligible_proposals(database, run_id=proposal_run.run_id, inbox=inbox)
-    second_export = export_eligible_proposals(database, run_id=proposal_run.run_id, inbox=inbox)
+    authority_dir = tmp_path / "authority"
+    first_export = export_eligible_proposals(
+        database, run_id=proposal_run.run_id, inbox=inbox, authority_dir=authority_dir
+    )
+    second_export = export_eligible_proposals(
+        database, run_id=proposal_run.run_id, inbox=inbox, authority_dir=authority_dir
+    )
     assert first_export["eligible_exports"] == second_export["eligible_exports"]
     proposal_id = first_export["eligible_exports"][0]
     envelope = json.loads((inbox / f"{proposal_id}.json").read_text())
     assert envelope["proposal"]["proposal_mode"] == "PAPER"
     assert envelope["proposal"]["policy_version"] == "paper-provisional-v1"
+    # The narrow authority projection is published for autonomy and stays
+    # narrow: no evidence, no model prose, no credentials.
+    authority = json.loads((authority_dir / f"{proposal_id}.json").read_text())
+    assert authority["autonomy_eligible"] is True
+    assert authority["proposal_id"] == proposal_id
+    assert not ({"evidence", "claims", "thesis"} & set(authority))
 
     policy_path = tmp_path / "paper-autonomy-policy.json"
     policy_path.write_text(json.dumps(autonomy_policy.default_policy_payload()))
@@ -156,6 +167,7 @@ def test_persisted_nonfixture_proposal_exports_once_and_receives_dry_run_receipt
         ledger=tmp_path / "paper-run-ledger.jsonl",
         budget_db=tmp_path / "paper-budget.sqlite",
         api_client=client,
+        authority_dir=authority_dir,
         now=proposal_time.replace(tzinfo=timezone.utc),
     )
 

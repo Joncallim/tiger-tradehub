@@ -66,6 +66,9 @@ SANCTIONED_FILES = {
     "tests/test_phase4_runtime_production_seam.py",
     # #51 autonomous-PAPER runner tests (execution-plane capability)
     "tests/test_autonomy_paper.py",
+    # Proposal-authority boundary test: deliberately imports the execution
+    # runner to prove it reads only the research-written projection.
+    "tests/test_proposal_authority.py",
     # the oracle module itself (hex-encoded terms; RA-03 repeats this pattern)
     "tests/test_portfolio_boundary.py",
 }

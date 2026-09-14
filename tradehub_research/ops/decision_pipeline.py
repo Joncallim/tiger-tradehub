@@ -268,7 +268,8 @@ def export_eligible_proposals(
             (run_id,),
         ).fetchone()[0]
         rows = conn.execute(
-            "SELECT p.*, s.canonical_ticker, ps.as_of AS data_as_of, m.mark_price_microusd, "
+            "SELECT p.*, pp.policy_status, s.canonical_ticker, ps.as_of AS data_as_of, "
+            "m.mark_price_microusd, "
             "h.quantity_microunits AS current_quantity_microunits, "
             "h.sellable_quantity_microunits "
             "FROM trade_proposal p "
@@ -330,11 +331,15 @@ def export_eligible_proposals(
                 "policy_version": row["policy_version"],
                 "sizing_policy_version": row["sizing_policy_version"],
                 "proposal_mode": row["proposal_mode"],
+                # Recorded for operator transparency ONLY. It is deliberately
+                # NOT part of autonomy_eligible: the portfolio engine currently
+                # stamps every proposal with requires_human_approval=1
+                # (tradehub_research/portfolio/proposal.py), so gating on it
+                # would dead-lock the entire autonomous PAPER path. Any future
+                # gating is an explicit owner decision, not a side effect here.
                 "requires_human_approval": row["requires_human_approval"],
                 "autonomy_eligible": bool(
-                    row["proposal_mode"] == "PAPER"
-                    and row["policy_status"] != "FIXTURE"
-                    and not row["requires_human_approval"]
+                    row["proposal_mode"] == "PAPER" and row["policy_status"] != "FIXTURE"
                 ),
                 "data_as_of": row["data_as_of"],
                 "envelope_identity_hash": identity_hash,

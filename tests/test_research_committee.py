@@ -1294,7 +1294,12 @@ def test_ready_to_score_status_recovers_after_injected_score_failure(tmp_path):
 
 
 def test_async_finalizer_resumes_already_scored_original_pipeline_once(tmp_path, monkeypatch):
-    """A post-score crash must not strand the original pipeline on timer retry."""
+    """A post-score timer retry must neither strand nor re-score the pipeline.
+
+    The operational epoch is the DURABLE score set, never the pipeline
+    evidence cutoff, and the durable handoff that anchors it is supplied
+    explicitly so this stays environment-independent.
+    """
     from tradehub_research.ops import decision_pipeline
 
     store, run, pack_hash = _committee(tmp_path / "finalizer-retry.db")
@@ -1309,21 +1314,40 @@ def test_async_finalizer_resumes_already_scored_original_pipeline_once(tmp_path,
         == "SCORED"
     )
 
-    resumed: list[str] = []
+    score_set = decision_pipeline.current_score_set(store.database, "run")
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "schema_version": "paper-portfolio-handoff-v2",
+                "account_type": "PAPER",
+                "environment": "PAPER_SANDBOX",
+                "account_status": "Funded",
+                "as_of": score_set["score_ready_at"],
+                "positions": [],
+                "cash": "1000000.00",
+                "nav": "1000000.00",
+            }
+        )
+    )
+
+    calls: list[tuple[str, str]] = []
 
     def resume(database, *, pipeline_run_id, decision_as_of, **_kwargs):
         assert database is store.database
-        assert decision_as_of == "2025-02-01T00:00:00Z"
-        resumed.append(pipeline_run_id)
+        calls.append((pipeline_run_id, decision_as_of))
         return {"status": "HEALTHY_ZERO_ACTION", "eligible_exports": []}
 
     monkeypatch.setattr(decision_pipeline, "run_portfolio_decision", resume)
-    first = decision_pipeline.finalize_async_committee_decisions(store.database)
-    second = decision_pipeline.finalize_async_committee_decisions(store.database)
+    first = decision_pipeline.finalize_async_committee_decisions(store.database, handoff=handoff)
+    second = decision_pipeline.finalize_async_committee_decisions(store.database, handoff=handoff)
 
     assert [item["pipeline_run_id"] for item in first["finalized"]] == ["run"]
     assert [item["pipeline_run_id"] for item in second["finalized"]] == ["run"]
-    assert resumed == ["run", "run"]
+    assert [call[0] for call in calls] == ["run", "run"]
+    # Two-clock contract: the epoch is the score set, NOT the evidence cutoff.
+    assert all(call[1] == score_set["score_ready_at"] for call in calls)
+    assert all(call[1] != "2025-02-01T00:00:00Z" for call in calls)
     with store.database.connect(read_only=True) as db:
         assert (
             db.execute(
