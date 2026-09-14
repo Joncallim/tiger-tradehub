@@ -126,6 +126,7 @@ def ctx(tmp_path):
     inbox = tmp_path / "inbox"
     ledger = tmp_path / "ledger.jsonl"
     budget_db = tmp_path / "budget.sqlite"
+    authority_dir = tmp_path / "authority"
     settings = ResearchSettings(api_token="test-token")
     return {
         "policy_path": policy_file,
@@ -133,6 +134,7 @@ def ctx(tmp_path):
         "inbox": inbox,
         "ledger": ledger,
         "budget_db": budget_db,
+        "authority_dir": authority_dir,
         "settings": settings,
         "client": FakeClient(),
     }
@@ -153,6 +155,7 @@ def _run(ctx, **kwargs):
         ledger=ctx["ledger"],
         budget_db=ctx["budget_db"],
         api_client=ctx["client"],
+        authority_dir=ctx["authority_dir"],
         now=NOW,
         **kwargs,
     )
@@ -232,13 +235,22 @@ def test_untyped_envelope_yields_zero_writes(ctx):
     assert any("typed proposal" in r["reason"] for r in summary["refusals"])
 
 
-def test_nonfixture_envelope_requires_persisted_ledger_proposal(ctx):
+def test_nonfixture_envelope_requires_published_authority(ctx):
     """Shared inbox transport is never authority for a real PAPER action."""
     _write_inbox(ctx, _envelope(fixture=False))
     summary = _run(ctx)
     assert summary["orders"] == 0
-    assert any("research ledger" in r["reason"] for r in summary["refusals"])
+    assert any("proposal authority" in r["reason"] for r in summary["refusals"])
     assert not any(path == "/orders/preview" for path, _ in ctx["client"].calls)
+
+
+def test_empty_inbox_exits_before_any_broker_call(ctx):
+    """An empty inbox must not poll the broker at all (no proof, no allowlist)."""
+    summary = _run(ctx)
+    assert summary["status"] == "IDLE_EMPTY_INBOX"
+    assert summary["orders"] == 0
+    assert summary["paper_proof"] is None
+    assert ctx["client"].calls == []
 
 
 def test_daily_order_count_budget(ctx):
@@ -335,9 +347,11 @@ def test_indeterminate_submit_is_recorded(ctx):
 
 
 def test_no_action_cycle_is_valid(ctx):
-    summary = _run(ctx)  # empty inbox
-    assert summary["status"] == "OK"
+    summary = _run(ctx)  # empty inbox: idle without touching the broker
+    assert summary["status"] == "IDLE_EMPTY_INBOX"
     assert summary["orders"] == 0
+    assert summary["paper_proof"] is None
+    assert ctx["client"].calls == []
     assert summary["proposals_seen"] == 0
 
 

@@ -1,12 +1,15 @@
 [Unit]
-Description=TradeHub autonomous PAPER runner timer (consumes finalized PAPER envelopes)
+Description=TradeHub autonomous PAPER runner timer (bounded recovery poll)
 
 [Timer]
-# Committee assessments arrive asynchronously.  A short deterministic poll
-# consumes only already-exported envelopes; empty inboxes are healthy zero
-# action and no model is ever invoked here.
-OnBootSec=5min
-OnUnitActiveSec=5min
+# Event-driven first: tradehub-paper-autonomy.path starts a pass immediately
+# when a proposal envelope is exported. This timer is only a bounded RECOVERY
+# poll for a missed path event (or a restart mid-export). It must never be a
+# tight poll: the runner exits before any broker call when the inbox is empty,
+# but a 5-minute cadence still produced hundreds of meaningless broker
+# PAPER-proof receipts.
+OnBootSec=15min
+OnUnitActiveSec=30min
 Persistent=true
 
 [Install]

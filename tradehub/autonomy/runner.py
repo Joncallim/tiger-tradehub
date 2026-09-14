@@ -23,7 +23,9 @@ Zero eligible proposals -> zero orders (a successful run).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -32,13 +34,20 @@ from tradehub.autonomy import kill_switch
 from tradehub.autonomy.budgets import BUDGET_DB, charge, daily_usage
 from tradehub.autonomy.policy import POLICY_FILE, PaperAutonomyPolicy, load_policy
 from tradehub_research.config import ResearchSettings
-from tradehub_research.db import ResearchDB, utc_now
+from tradehub_research.db import utc_now
+from tradehub_research.screens import canonical_json
 
 INBOX_DIR = Path("/var/lib/tradehub/autonomy/proposals")
 PROCESSED_DIR = INBOX_DIR / "processed"
 LEDGER_FILE = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
+# The ONLY research-written artifact this identity may read. The autonomy
+# identity never opens research.db.
+AUTHORITY_DIR = Path(
+    os.getenv("TRADEHUB_PROPOSAL_AUTHORITY_DIR", "/var/lib/tradehub/autonomy/authority")
+)
+AUTHORITY_SCHEMA_VERSION = "paper-proposal-authority-v1"
 
-EXECUTION_API = __import__("os").getenv("TRADEHUB_EXECUTION_API", "http://127.0.0.1:8787")
+EXECUTION_API = os.getenv("TRADEHUB_EXECUTION_API", "http://127.0.0.1:8787")
 AUTONOMOUS_TAG = "autonomous-paper-v1"
 
 
@@ -111,71 +120,54 @@ def prove_paper_account(client, settings: ResearchSettings) -> dict:
     return proof
 
 
-def _resolve_ticker(research_db: ResearchDB | None):
-    def resolve(security_id: str, as_of: str) -> str | None:
-        # Best-effort identity cross-check: absent/unavailable research DB
-        # degrades to None (the envelope symbol is authoritative); a DB error
-        # must never block the runner's own validation in isolated runs.
-        if research_db is None:
-            return None
-        try:
-            with research_db.connect(read_only=True) as conn:
-                row = conn.execute(
-                    "SELECT canonical_ticker FROM security WHERE security_id=?", (security_id,)
-                ).fetchone()
-            return str(row["canonical_ticker"]).upper() if row and row["canonical_ticker"] else None
-        except Exception:  # noqa: BLE001 -- best-effort cross-check
-            return None
+def _validate_proposal_authority(
+    authority_dir: Path | None, envelope: dict, *, fixture: bool
+) -> dict:
+    """Bind a runnable envelope to the research-published authority projection.
 
-    return resolve
-
-
-def _validate_persisted_proposal(
-    research_db: ResearchDB | None, envelope: dict, *, fixture: bool
-) -> None:
-    """Bind a runnable envelope to the immutable research decision ledger.
-
-    Files in the shared inbox are transport, not authority.  Real proposals
-    must exist in the same research database, remain PAPER/non-FIXTURE, be
-    explicitly autonomous-eligible, and agree on all order-driving identity
-    fields.  Only marked acceptance fixtures bypass this database check.
+    The autonomy identity has NO research-database access. Authority is the
+    narrow research-written projection published BEFORE the envelope; an
+    envelope whose authority record is absent, ineligible, or inconsistent
+    fails closed. Only marked acceptance fixtures bypass this check.
     """
     if fixture:
-        return
-    if research_db is None:
-        raise AutonomyRefusal("research ledger unavailable; refusing non-fixture envelope")
+        return {}
+    if authority_dir is None:
+        raise AutonomyRefusal("proposal authority directory unavailable; refusing")
     proposal = envelope.get("proposal")
     if not isinstance(proposal, dict):
         raise AutonomyRefusal("envelope has no typed proposal")
     proposal_id = proposal.get("proposal_id")
     if not isinstance(proposal_id, str) or not proposal_id:
         raise AutonomyRefusal("proposal missing proposal_id")
+    path = authority_dir / f"{proposal_id}.json"
     try:
-        with research_db.connect(read_only=True) as conn:
-            row = conn.execute(
-                "SELECT p.proposal_id,p.security_id,p.action,p.max_quantity_microunits,"
-                "p.completion_quantity_microunits,p.max_notional_microusd,p.target_weight_ppm,"
-                "p.current_weight_ppm,p.score_snapshot_id,p.portfolio_snapshot_id,"
-                "p.policy_version,p.sizing_policy_version,p.proposal_mode,"
-                "p.requires_human_approval,s.canonical_ticker,ps.as_of AS data_as_of,"
-                "pp.policy_status FROM trade_proposal p "
-                "JOIN portfolio_policy pp ON pp.policy_version=p.policy_version "
-                "JOIN security s ON s.security_id=p.security_id "
-                "JOIN portfolio_snapshot ps ON ps.snapshot_id=p.portfolio_snapshot_id "
-                "WHERE p.proposal_id=?",
-                (proposal_id,),
-            ).fetchone()
-    except Exception as exc:  # noqa: BLE001 -- closed boundary on ledger failure
-        raise AutonomyRefusal(f"research ledger lookup failed: {type(exc).__name__}") from exc
-    if row is None:
-        raise AutonomyRefusal("proposal is absent from persisted research ledger")
-    if row["proposal_mode"] != "PAPER" or row["policy_status"] == "FIXTURE":
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise AutonomyRefusal("no persisted proposal authority; refusing") from exc
+    except (OSError, ValueError) as exc:
+        raise AutonomyRefusal(f"proposal authority unreadable: {type(exc).__name__}") from exc
+    if not isinstance(record, dict):
+        raise AutonomyRefusal("proposal authority is not an object")
+    if record.get("schema_version") != AUTHORITY_SCHEMA_VERSION:
+        raise AutonomyRefusal("unexpected proposal authority schema")
+    if record.get("proposal_id") != proposal_id:
+        raise AutonomyRefusal("proposal authority id mismatch")
+    if not record.get("autonomy_eligible"):
         raise AutonomyRefusal("persisted proposal is not eligible PAPER/non-FIXTURE")
-    if str(envelope.get("symbol", "")).upper() != str(row["canonical_ticker"]).upper():
-        raise AutonomyRefusal("envelope symbol does not match persisted proposal")
-    if str(envelope.get("data_as_of", ""))[:10] != str(row["data_as_of"])[:10]:
-        raise AutonomyRefusal("envelope data_as_of does not match persisted proposal")
-    fields = (
+    # Recompute the stable envelope identity (wall-clock metadata excluded) and
+    # require exact equality with the published authority.
+    stable = dict(envelope)
+    stable.pop("exported_at", None)
+    identity = hashlib.sha256(canonical_json(stable).encode()).hexdigest()
+    if record.get("envelope_identity_hash") != identity:
+        raise AutonomyRefusal("envelope identity does not match published authority")
+    symbol = str(envelope.get("symbol") or "").upper()
+    if not symbol or symbol != str(record.get("canonical_symbol") or "").upper():
+        raise AutonomyRefusal("envelope symbol does not match published authority")
+    if str(envelope.get("data_as_of", ""))[:10] != str(record.get("data_as_of"))[:10]:
+        raise AutonomyRefusal("envelope data_as_of does not match published authority")
+    for field in (
         "security_id",
         "action",
         "max_quantity_microunits",
@@ -187,10 +179,10 @@ def _validate_persisted_proposal(
         "portfolio_snapshot_id",
         "policy_version",
         "sizing_policy_version",
-    )
-    for field in fields:
-        if proposal.get(field) != row[field]:
-            raise AutonomyRefusal(f"envelope {field} does not match persisted proposal")
+    ):
+        if proposal.get(field) != record.get(field):
+            raise AutonomyRefusal(f"envelope {field} does not match published authority")
+    return record
 
 
 def _proposal_age_ok(proposal: dict, policy: PaperAutonomyPolicy, now: datetime) -> bool:
@@ -307,6 +299,7 @@ def run_autonomy(
     now: datetime | None = None,
     paper_proof: dict | None = None,
     kill_switch_path: Path | None = None,
+    authority_dir: Path | None = AUTHORITY_DIR,
 ) -> dict:
     """One deterministic autonomous-PAPER run. Returns the run summary.
 
@@ -320,6 +313,28 @@ def run_autonomy(
     if policy.kill_switch or kill_switch.is_blocked(kill_path):
         return {"status": "BLOCKED", "reason": "kill switch engaged", "orders": 0}
     kill_switch.assert_allowed(kill_path)
+
+    inbox.mkdir(parents=True, exist_ok=True)
+    processed_dir = inbox / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    envelope_files = sorted(inbox.glob("*.json"))
+    day = now.date().isoformat()
+    if not envelope_files:
+        # Nothing to do: exit BEFORE any broker interaction. No PAPER proof,
+        # no allowlist query, no budget read, no ledger receipt. Polling the
+        # broker for a run that cannot act is meaningless load and meaningless
+        # evidence.
+        return {
+            "status": "IDLE_EMPTY_INBOX",
+            "reason": "no proposal envelopes pending; broker untouched",
+            "policy_version": policy.policy_version,
+            "orders": 0,
+            "proposals_seen": 0,
+            "refusals": [],
+            "executions": [],
+            "paper_proof": None,
+            "at": utc_now(),
+        }
 
     client = api_client or _client(settings)
     try:
@@ -335,12 +350,6 @@ def run_autonomy(
         }
     allowlist = allowlist or set(client.get("/config/allowlist").get("symbols", []))
 
-    inbox.mkdir(parents=True, exist_ok=True)
-    processed_dir = inbox / "processed"
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    envelope_files = sorted(inbox.glob("*.json"))
-    day = now.date().isoformat()
-
     summary = {
         "status": "OK",
         "policy_version": policy.policy_version,
@@ -353,12 +362,6 @@ def run_autonomy(
             k: proof.get(k) for k in ("environment", "account", "account_status", "assets_ok")
         },
     }
-
-    try:
-        research_db = ResearchDB(settings.db_path, settings.busy_timeout_ms)
-    except Exception:  # noqa: BLE001 -- absent DB degrades the cross-check
-        research_db = None
-    resolve = _resolve_ticker(research_db)
 
     for path in envelope_files:
         try:
@@ -373,25 +376,17 @@ def run_autonomy(
         proposal_id = proposal.get("proposal_id", path.stem)
         try:
             _validate_envelope(envelope, policy, now)
-            _validate_persisted_proposal(
-                research_db,
+            authority = _validate_proposal_authority(
+                authority_dir,
                 envelope,
                 fixture=bool(envelope.get("fixture")),
             )
             _validate_exposure(proposal, policy)
-            symbol = str(envelope.get("symbol") or "").upper()
+            # The published authority record — not the inbox file — is the
+            # source of the order-driving symbol.
+            symbol = str(authority.get("canonical_symbol") or envelope.get("symbol") or "").upper()
             if not symbol:
                 raise AutonomyRefusal("envelope missing authoritative symbol")
-            # Cross-check against the research identity when resolvable: a
-            # mismatch between the exported symbol and the PIT identity is a
-            # refusal (the DB may be absent in isolated acceptance runs).
-            db_symbol = resolve(
-                str(proposal.get("security_id", "")), str(envelope.get("data_as_of", ""))
-            )
-            if db_symbol and db_symbol != symbol:
-                raise AutonomyRefusal(
-                    f"symbol mismatch: envelope {symbol!r} vs identity {db_symbol!r}"
-                )
             if symbol not in {s.upper() for s in allowlist}:
                 raise AutonomyRefusal(f"symbol {symbol!r} not in the execution allowlist")
             notional_microusd = int(proposal.get("max_notional_microusd") or 0)

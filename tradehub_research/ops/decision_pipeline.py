@@ -15,6 +15,7 @@ policy, or portfolio state is an explicit, successful no-action outcome.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -35,9 +36,12 @@ from tradehub_research.portfolio.handoff import (
 from tradehub_research.portfolio.policy import PolicyRegistry, build_policy
 from tradehub_research.portfolio.snapshot import build_signal_input, build_snapshot
 from tradehub_research.portfolio.types import PolicyStatus
+from tradehub_research.screens import canonical_json
 
 PAPER_PROVISIONAL_POLICY_VERSION = "paper-provisional-v1"
 DEFAULT_AUTONOMY_INBOX = Path("/var/lib/tradehub/autonomy/proposals")
+DEFAULT_AUTHORITY_DIR = Path("/var/lib/tradehub/autonomy/authority")
+AUTHORITY_SCHEMA_VERSION = "paper-proposal-authority-v1"
 DEFAULT_PORTFOLIO_HANDOFF = Path("/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.json")
 DEFAULT_PORTFOLIO_HANDOFF_HISTORY = Path(
     "/var/lib/tradehub-research/handoff/paper_portfolio_snapshot.jsonl"
@@ -219,8 +223,39 @@ def unknown_portfolio_snapshot(*, decision_as_of: str, pipeline_run_id: str):
     )
 
 
+def _publish_authority(authority_dir: Path, record: dict[str, Any]) -> Path:
+    """Atomically publish the narrow autonomy-readable authority projection.
+
+    This is the ONLY research artifact the autonomy identity may read. It
+    carries order-driving identity and eligibility only: no evidence rows, no
+    model prose, no research tables, no credentials. Publication is
+    idempotent-by-equality so a re-export cannot silently rewrite authority.
+    """
+    authority_dir.mkdir(parents=True, exist_ok=True)
+    path = authority_dir / f"{record['proposal_id']}.json"
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"proposal authority unreadable for {record['proposal_id']}") from exc
+        if existing != record:
+            raise ValueError(f"proposal authority collision for {record['proposal_id']}")
+        return path
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    temporary.chmod(0o640)
+    temporary.replace(path)
+    return path
+
+
 def export_eligible_proposals(
-    database: ResearchDB, *, run_id: str, inbox: Path | None = None
+    database: ResearchDB,
+    *,
+    run_id: str,
+    inbox: Path | None = None,
+    authority_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Export immutable non-fixture proposals as equality-checked envelopes."""
     inbox = inbox or Path(os.environ.get("TRADEHUB_AUTONOMY_INBOX", DEFAULT_AUTONOMY_INBOX))
@@ -272,6 +307,40 @@ def export_eligible_proposals(
         # Export identity excludes wall-clock observability metadata.
         stable = dict(envelope)
         stable.pop("exported_at")
+        identity_hash = hashlib.sha256(canonical_json(stable).encode()).hexdigest()
+        # Publication order is load-bearing. The research proposal is already
+        # persisted; AUTHORITY is published before the ENVELOPE so an autonomy
+        # reader can never observe an envelope without its authority record.
+        _publish_authority(
+            authority_dir
+            or Path(os.environ.get("TRADEHUB_PROPOSAL_AUTHORITY_DIR", DEFAULT_AUTHORITY_DIR)),
+            {
+                "schema_version": AUTHORITY_SCHEMA_VERSION,
+                "proposal_id": row["proposal_id"],
+                "security_id": row["security_id"],
+                "canonical_symbol": str(row["canonical_ticker"]).upper(),
+                "action": row["action"],
+                "max_quantity_microunits": row["max_quantity_microunits"],
+                "completion_quantity_microunits": row["completion_quantity_microunits"],
+                "max_notional_microusd": row["max_notional_microusd"],
+                "current_weight_ppm": row["current_weight_ppm"],
+                "target_weight_ppm": row["target_weight_ppm"],
+                "score_snapshot_id": row["score_snapshot_id"],
+                "portfolio_snapshot_id": row["portfolio_snapshot_id"],
+                "policy_version": row["policy_version"],
+                "sizing_policy_version": row["sizing_policy_version"],
+                "proposal_mode": row["proposal_mode"],
+                "requires_human_approval": row["requires_human_approval"],
+                "autonomy_eligible": bool(
+                    row["proposal_mode"] == "PAPER"
+                    and row["policy_status"] != "FIXTURE"
+                    and not row["requires_human_approval"]
+                ),
+                "data_as_of": row["data_as_of"],
+                "envelope_identity_hash": identity_hash,
+                "created_at": row["created_at"],
+            },
+        )
         body = json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n"
         path = inbox / f"{row['proposal_id']}.json"
         if path.exists():
@@ -349,9 +418,11 @@ def run_portfolio_decision(
 ) -> dict[str, Any]:
     """Two-clock decision entry point.
 
-    ``evidence_as_of`` is the frozen pipeline market/evidence cutoff. It bounds
-    every model fact and every packed evidence row (PIT firewall) and never
-    moves forward because committee models finished later.
+    ``evidence_as_of`` is NOT caller-controlled. It is always derived from
+    ``pipeline_run.as_of`` — the frozen market/evidence cutoff that bounds every
+    packed evidence row and every model fact (PIT firewall). A caller-supplied
+    value is accepted only when it equals that cutoff, so moving decision time
+    can never move the evidence cutoff.
 
     ``decision_as_of`` is the actual operational decision time and must be
     >= every persisted score's ``computed_at`` for this run so an
@@ -359,7 +430,20 @@ def run_portfolio_decision(
 
     Score ``computed_at`` is never backdated to satisfy this contract.
     """
-    if evidence_as_of is not None and normalize_ts(decision_as_of) < normalize_ts(evidence_as_of):
+    with database.connect(read_only=True) as conn:
+        run_row = conn.execute(
+            "SELECT as_of FROM pipeline_run WHERE run_id=?", (pipeline_run_id,)
+        ).fetchone()
+    if run_row is None:
+        raise ValueError(f"unknown pipeline run: {pipeline_run_id}")
+    canonical_evidence_as_of = normalize_ts(str(run_row["as_of"]))
+    if evidence_as_of is not None and normalize_ts(evidence_as_of) != canonical_evidence_as_of:
+        raise ValueError(
+            "evidence_as_of must equal pipeline_run.as_of "
+            f"({canonical_evidence_as_of}); got {normalize_ts(evidence_as_of)}"
+        )
+    evidence_as_of = canonical_evidence_as_of
+    if normalize_ts(decision_as_of) < canonical_evidence_as_of:
         raise ValueError("decision_as_of must not precede evidence_as_of")
     with database.connect(read_only=True) as conn:
         future = conn.execute(
@@ -383,7 +467,7 @@ def run_portfolio_decision(
         inbox=inbox,
         snapshot=snapshot,
     )
-    result.setdefault("evidence_as_of", normalize_ts(evidence_as_of) if evidence_as_of else None)
+    result.setdefault("evidence_as_of", canonical_evidence_as_of)
     result.setdefault("decision_as_of", normalize_ts(decision_as_of))
     return result
 
@@ -459,6 +543,153 @@ def _run_portfolio_decision_inner(
     }
 
 
+SCORE_SET_HASH_PREFIX = "tradehub-score-set-v1"
+
+
+def _score_set_hash(score_snapshot_ids: list[str]) -> str:
+    """Canonical durable identity of a score set."""
+    return hashlib.sha256(
+        (SCORE_SET_HASH_PREFIX + "\0" + canonical_json(sorted(score_snapshot_ids))).encode()
+    ).hexdigest()
+
+
+def current_score_set(database: ResearchDB, pipeline_run_id: str) -> dict[str, Any]:
+    """The durable score set for a pipeline run.
+
+    ``score_ready_at`` is MAX(computed_at) of the CURRENT persisted score set —
+    a durable input, never a fresh wall clock.
+    """
+    with database.connect(read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT s.snapshot_id, s.computed_at FROM score_snapshot s "
+            "JOIN committee_run c ON c.committee_run_id=s.committee_run_id "
+            "WHERE c.pipeline_run_id=? ORDER BY s.snapshot_id",
+            (pipeline_run_id,),
+        ).fetchall()
+    ids = [str(r["snapshot_id"]) for r in rows]
+    ready = max((normalize_ts(str(r["computed_at"])) for r in rows), default=None)
+    return {
+        "score_snapshot_ids": ids,
+        "score_ready_at": ready,
+        "score_set_hash": _score_set_hash(ids) if ids else None,
+    }
+
+
+def find_finalized_decision(
+    database: ResearchDB, pipeline_run_id: str, score_snapshot_ids: list[str]
+) -> dict[str, Any] | None:
+    """The durable portfolio run already covering exactly this score set.
+
+    Idempotency keys on (pipeline_run_id, score set) — never on wall clock — so
+    a later timer tick over the same durable score set must reuse the existing
+    decision rather than append a duplicate observation.
+    """
+    wanted = sorted(score_snapshot_ids)
+    if not wanted:
+        return None
+    with database.connect(read_only=True) as conn:
+        runs = conn.execute(
+            "SELECT run_id, decision_as_of, portfolio_snapshot_id, policy_version "
+            "FROM portfolio_run WHERE pipeline_run_id=? ORDER BY rowid",
+            (pipeline_run_id,),
+        ).fetchall()
+        for run in runs:
+            covered = conn.execute(
+                "SELECT DISTINCT score_snapshot_id FROM portfolio_state_observation "
+                "WHERE run_id=? AND score_snapshot_id IS NOT NULL",
+                (run["run_id"],),
+            ).fetchall()
+            covered_ids = sorted(str(r["score_snapshot_id"]) for r in covered)
+            if covered_ids and covered_ids == wanted:
+                return {
+                    "run_id": str(run["run_id"]),
+                    "decision_as_of": normalize_ts(str(run["decision_as_of"])),
+                    "portfolio_snapshot_id": run["portfolio_snapshot_id"],
+                    "policy_version": run["policy_version"],
+                }
+    return None
+
+
+def _handoff_payloads_at_or_after(score_ready_at: str, path: Path | None) -> list[dict[str, Any]]:
+    """Sanitized handoff payloads observed at/after score_ready_at, ascending."""
+    items: list[dict[str, Any]] = []
+    if path is not None:
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            items = [loaded] if isinstance(loaded, dict) else []
+        except (OSError, ValueError):
+            items = []
+    else:
+        try:
+            items = [
+                json.loads(line)
+                for line in DEFAULT_PORTFOLIO_HANDOFF_HISTORY.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError):
+            items = []
+    ready = datetime.fromisoformat(normalize_ts(score_ready_at).replace("Z", "+00:00"))
+    kept: list[tuple[datetime, dict[str, Any]]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            observed = datetime.fromisoformat(str(item.get("as_of", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if observed >= ready:
+            kept.append((observed, item))
+    return [item for _, item in sorted(kept, key=lambda pair: pair[0])]
+
+
+def resolve_decision_epoch(
+    database: ResearchDB,
+    *,
+    pipeline_run_id: str,
+    score_ready_at: str,
+    handoff: Path | None = None,
+) -> tuple[str, Any]:
+    """Pick a STABLE operational decision epoch for a new score set.
+
+    Preferred: a valid sanitized handoff already knowable at ``score_ready_at``
+    ⇒ ``decision_as_of = score_ready_at``.
+
+    Otherwise bind to the EARLIEST subsequently persisted valid handoff, so
+    later timer ticks converge on the same epoch instead of silently advancing
+    to "latest handoff now" on every poll.
+
+    Raises ``PortfolioStateUnavailable`` when no usable epoch exists yet; the
+    caller must treat that as fail-closed and must NOT invent a clock.
+    """
+    try:
+        snapshot = load_sanitized_paper_snapshot(
+            database,
+            decision_as_of=score_ready_at,
+            pipeline_run_id=pipeline_run_id,
+            path=handoff,
+        )
+        return score_ready_at, snapshot
+    except (PortfolioHandoffUnavailable, OSError, ValueError):
+        pass
+    for payload in _handoff_payloads_at_or_after(score_ready_at, handoff):
+        as_of = normalize_ts(str(payload.get("as_of", "")))
+        try:
+            snapshot = load_paper_portfolio_snapshot_payload(
+                database,
+                decision_as_of=as_of,
+                pipeline_run_id=pipeline_run_id,
+                payload=payload,
+            )
+            return as_of, snapshot
+        except (PortfolioHandoffUnavailable, OSError, ValueError):
+            continue
+    raise PortfolioStateUnavailable(
+        "no usable sanitized PAPER handoff for this score set; refusing to advance decision_as_of"
+    )
+
+
 def finalize_async_committee_decisions(
     database: ResearchDB,
     *,
@@ -500,16 +731,10 @@ def finalize_async_committee_decisions(
         pipeline_run_id = str(row["pipeline_run_id"])
         scores = persist_ready_scores(database, pipeline_run_id)
         # create_snapshot is idempotent, but only reports a snapshot while a
-        # run is READY_TO_SCORE.  Count durable snapshots separately so a
-        # retry resumes a previously scored original pipeline run.
-        with database.connect(read_only=True) as conn:
-            persisted_score_count = conn.execute(
-                "SELECT count(*) FROM score_snapshot s "
-                "JOIN committee_run c ON c.committee_run_id=s.committee_run_id "
-                "WHERE c.pipeline_run_id=?",
-                (pipeline_run_id,),
-            ).fetchone()[0]
-        if not persisted_score_count:
+        # run is READY_TO_SCORE.  The durable score set is therefore read back
+        # separately so a retry resumes a previously scored original pipeline.
+        score_set = current_score_set(database, pipeline_run_id)
+        if not score_set["score_snapshot_ids"]:
             results.append(
                 {
                     "pipeline_run_id": pipeline_run_id,
@@ -519,6 +744,30 @@ def finalize_async_committee_decisions(
                 }
             )
             continue
+
+        # Idempotency by durable score set: a second tick over the SAME score
+        # set must reuse the existing decision, not append another observation
+        # merely because its clock differs.
+        existing = find_finalized_decision(
+            database, pipeline_run_id, score_set["score_snapshot_ids"]
+        )
+        if existing is not None:
+            recovered = export_eligible_proposals(database, run_id=existing["run_id"], inbox=inbox)
+            results.append(
+                {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": "REUSED",
+                    "decision_as_of": existing["decision_as_of"],
+                    "score_set_hash": score_set["score_set_hash"],
+                    "score_ready_at": score_set["score_ready_at"],
+                    "portfolio_run": existing,
+                    "proposal_count": len(recovered["eligible_exports"]),
+                    **scores,
+                    **recovered,
+                }
+            )
+            continue
+
         with database.connect(read_only=True) as conn:
             run_row = conn.execute(
                 "SELECT as_of FROM pipeline_run WHERE run_id=?", (pipeline_run_id,)
@@ -533,22 +782,23 @@ def finalize_async_committee_decisions(
                 }
             )
             continue
+
+        # New score set: bind a stable durable epoch. No fresh utc_now() per
+        # tick — an epoch is chosen once from durable inputs and reused after.
         try:
+            decision_as_of, snapshot = resolve_decision_epoch(
+                database,
+                pipeline_run_id=pipeline_run_id,
+                score_ready_at=str(score_set["score_ready_at"]),
+                handoff=handoff,
+            )
             decision = run_portfolio_decision(
                 database,
                 pipeline_run_id=pipeline_run_id,
-                decision_as_of=str(run_row["as_of"]),
+                decision_as_of=decision_as_of,
+                evidence_as_of=str(run_row["as_of"]),
                 inbox=inbox,
-                snapshot=(
-                    load_sanitized_paper_snapshot(
-                        database,
-                        decision_as_of=str(run_row["as_of"]),
-                        pipeline_run_id=pipeline_run_id,
-                        path=handoff,
-                    )
-                    if handoff is not None
-                    else None
-                ),
+                snapshot=snapshot,
             )
         except (ValueError, OSError) as exc:
             decision = {
@@ -556,7 +806,15 @@ def finalize_async_committee_decisions(
                 "reason": f"{type(exc).__name__}: {exc}",
                 "eligible_exports": [],
             }
-        results.append({"pipeline_run_id": pipeline_run_id, **scores, **decision})
+        results.append(
+            {
+                "pipeline_run_id": pipeline_run_id,
+                **scores,
+                **decision,
+                "score_set_hash": score_set["score_set_hash"],
+                "score_ready_at": score_set["score_ready_at"],
+            }
+        )
     return {"status": "OK", "finalized": results, "created_at": utc_now()}
 
 

@@ -17,10 +17,21 @@ from typing import Any
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.ops.common import ResearchPaths, research_paths
+from tradehub_research.ops.decision_pipeline import DEFAULT_AUTHORITY_DIR
 from tradehub_research.ops.health import forward_health, refresh_health
 from tradehub_research.validation.experiment_db import ExperimentDB
 
 RUNNER_RECEIPTS = Path("/var/lib/tradehub-research/autonomy/paper_run_ledger.jsonl")
+
+
+def _authority_record_count() -> int:
+    """Durable count of exported proposals (research-written authority records)."""
+    if not DEFAULT_AUTHORITY_DIR.is_dir():
+        return 0
+    try:
+        return sum(1 for p in DEFAULT_AUTHORITY_DIR.glob("*.json") if p.is_file())
+    except OSError:
+        return 0
 
 
 def _runner_receipts() -> dict[str, Any]:
@@ -74,30 +85,48 @@ def operator_status(
             except ValueError:
                 last_cycle = None
 
-    # Decision ledger: a no-proposal run is first-class, not an error.
+    # Decision ledger: a no-proposal run is first-class, not an error. EVERY
+    # field is derived from durable state, so asynchronous finalizer work can
+    # never make the chain inconsistent with a stale cycle-log snapshot.
     proposal = None
-    chain = {"portfolio_runs": 0, "proposals": 0, "eligible_exports": 0}
+    chain = {
+        "portfolio_runs": 0,
+        "observations": 0,
+        "proposals": 0,
+        "authority_records": 0,
+        "eligible_exports": 0,
+    }
     with research_db.connect(read_only=True) as conn:
         try:
+            chain["portfolio_runs"] = conn.execute("SELECT count(*) FROM portfolio_run").fetchone()[
+                0
+            ]
+            chain["observations"] = conn.execute(
+                "SELECT count(*) FROM portfolio_state_observation"
+            ).fetchone()[0]
             row = conn.execute(
-                "SELECT run_id, created_at FROM portfolio_run ORDER BY created_at DESC LIMIT 1"
+                "SELECT run_id, pipeline_run_id, decision_as_of, created_at "
+                "FROM portfolio_run ORDER BY created_at DESC, rowid DESC LIMIT 1"
             ).fetchone()
             if row:
                 run_id = str(row["run_id"])
-                proposal = {"run_id": run_id, "created_at": str(row["created_at"])}
-                chain["portfolio_runs"] = 1
+                proposal = {
+                    "run_id": run_id,
+                    "pipeline_run_id": str(row["pipeline_run_id"]),
+                    "decision_as_of": str(row["decision_as_of"]),
+                    "created_at": str(row["created_at"]),
+                }
                 chain["proposals"] = conn.execute(
                     "SELECT count(*) FROM trade_proposal WHERE decision_id IN "
                     "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
                     (run_id,),
                 ).fetchone()[0]
-                chain["eligible_exports"] = sum(
-                    1
-                    for item in (last_cycle or {}).get("decision", {}).get("eligible_exports", [])
-                    if isinstance(item, str)
-                )
         except Exception:  # noqa: BLE001 -- optional table
             proposal = None
+    # Exported authority records are the durable proof of export, written by
+    # research at export time regardless of which tick produced them.
+    chain["authority_records"] = _authority_record_count()
+    chain["eligible_exports"] = chain["authority_records"]
 
     # Validation: regime + snapshot presence.
     validation = {}

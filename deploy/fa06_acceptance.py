@@ -29,6 +29,23 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}")
 
 
+def _count_production_predictions(path: str) -> int | None:
+    """Read-only count of genuine production forward predictions (None if unreadable)."""
+    code, out = sh(
+        [
+            "sqlite3",
+            path,
+            "SELECT count(*) FROM forward_prediction WHERE provenance='production'",
+        ]
+    )
+    if code != 0:
+        return None
+    try:
+        return int(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
 def sh(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -114,16 +131,24 @@ def main() -> int:
         code, _ = sh(["systemctl", "is-enabled", f"{timer}.timer"])
         check(f"timer enabled {timer}", code == 0)
 
-    # 6. No duplicate forward prediction (capture dedupe) through the actual
-    # deployed service environment, never a developer/home-worktree Python.
+    # 6. Forward-capture idempotency with REAL evidence: re-running the
+    # deployed capture service must insert no duplicate production
+    # prediction. A systemd `Result=success` status alone is NOT evidence.
+    experiment_db = "/var/lib/tradehub-research/experiment.db"
+    before = _count_production_predictions(experiment_db)
     code, _ = sh(["systemctl", "start", "tradehub-forward-capture.service"], timeout=600)
     result_code, result = sh(
         ["systemctl", "show", "tradehub-forward-capture.service", "-p", "Result", "--value"]
     )
+    after = _count_production_predictions(experiment_db)
     check(
         "forward capture idempotent (no dupes)",
-        code == 0 and result_code == 0 and result.strip() == "success",
-        result[-200:],
+        code == 0
+        and result_code == 0
+        and result.strip() == "success"
+        and before is not None
+        and before == after,
+        f"service={result.strip()} production_predictions {before} -> {after}",
     )
 
     # 7. No duplicate broker action: execution dry-run invariant.

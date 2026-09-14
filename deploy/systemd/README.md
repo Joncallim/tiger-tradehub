@@ -34,6 +34,12 @@ setfacl -m u:tradehub-research:rwx,m::rwx /var/lib/tradehub/autonomy/proposals
 # Research-created envelopes must remain readable by the autonomy runner even
 # under a restrictive umask.  The exporter also creates files mode 0640.
 setfacl -m d:u:tradehub-autonomy:r-x,d:m::rwx /var/lib/tradehub/autonomy/proposals
+
+# Proposal-authority projection: the ONLY research artifact the autonomy
+# identity may read. Research owns + writes it; autonomy reads it and cannot
+# write it. The setgid bit makes new records inherit the autonomy group so the
+# 0640 record files stay readable by autonomy alone.
+install -d -o tradehub-research -g tradehub-autonomy -m 2750 /var/lib/tradehub/autonomy/authority
 # Provision the files with explicit modes; do not rely on the caller's umask.
 install -o root -g tradehub-execution -m 0640 /path/to/execution.env /etc/tradehub/execution.env
 install -o root -g tradehub-research -m 0640 /path/to/research.env /etc/tradehub/research.env
@@ -51,10 +57,17 @@ execution environment file.
 Store research-only values in `/etc/tradehub/research.env`, mode `0640`,
 owner `root:tradehub-research`; set `RESEARCH_API_TOKEN` to a strong random research-only bearer and `RESEARCH_DB_PATH=/var/lib/tradehub-research/research.db` there. It must contain only `RESEARCH_*` settings and must not contain execution or Tiger credentials.
 
-Set `TRADEHUB_DRY_RUN=true` in `/etc/tradehub/autonomy.env`, the environment
-read by the only process that calls the guarded execution API.  This is the
-authoritative execution-boundary setting; a value in `research.env` has no
-broker-write effect.
+Set `TRADEHUB_DRY_RUN=true` in `/etc/tradehub/execution.env` — the environment
+read by `tradehub-execution.service`, which is the process that actually talks
+to the broker.  **This is the authoritative broker-write guard**: `Settings`
+loads it from `execution.env` only, so no other environment file can enable a
+live write.
+
+`/etc/tradehub/autonomy.env` MAY also set `TRADEHUB_DRY_RUN=true` as
+defence-in-depth, and it is checked by the provisioning probe, but it is *not*
+execution authority: the autonomy process cannot place a broker write other
+than through the guarded execution API, whose dry-run state comes from
+`execution.env`.  A value in `research.env` has no broker-write effect at all.
 
 Install and enable the units:
 
@@ -112,7 +125,15 @@ probe=/var/lib/tradehub/autonomy/proposals/.acl-probe.$$
 runuser -u tradehub-research -- sh -ceu 'p="$1"; test -x /var/lib/tradehub; test -x /var/lib/tradehub/autonomy; test -w /var/lib/tradehub/autonomy/proposals; : > "$p"; chmod 0640 "$p"; test ! -r /var/lib/tradehub/autonomy/kill_switch; test ! -w /var/lib/tradehub/autonomy/kill_switch; test ! -r /etc/tradehub/execution.env; test ! -r /etc/tradehub/autonomy.env' sh "$probe"
 runuser -u tradehub-autonomy -- test -r "$probe"
 rm -f "$probe"
+# AUTHORITATIVE broker-write guard: the execution service environment.
+grep -qx 'TRADEHUB_DRY_RUN=true' /etc/tradehub/execution.env
+# Defence-in-depth only; NOT execution authority.
 grep -qx 'TRADEHUB_DRY_RUN=true' /etc/tradehub/autonomy.env
+# Proposal-authority projection: research writes it, autonomy reads it, and
+# autonomy still cannot read the research databases.
+runuser -u tradehub-research -- sh -ceu 'test -w /var/lib/tradehub/autonomy/authority; printf "{}" > /var/lib/tradehub/autonomy/authority/.probe.json; chmod 0640 /var/lib/tradehub/autonomy/authority/.probe.json'
+runuser -u tradehub-autonomy -- sh -ceu 'test -r /var/lib/tradehub/autonomy/authority/.probe.json; test ! -w /var/lib/tradehub/autonomy/authority/.probe.json; test ! -r /var/lib/tradehub-research/research.db; test ! -r /var/lib/tradehub-research/experiment.db'
+rm -f /var/lib/tradehub/autonomy/authority/.probe.json
 ```
 
 The last check is mandatory execution-boundary evidence. It is not satisfied
