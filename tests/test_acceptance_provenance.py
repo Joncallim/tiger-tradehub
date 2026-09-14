@@ -474,6 +474,109 @@ def test_decision_ledger_totals_are_none_not_a_silent_zero_on_failure(tmp_path, 
     assert out.get("report_status") is not None
 
 
+def test_eligible_exports_is_none_when_only_the_export_lookup_fails(tmp_path, monkeypatch):
+    """The exact P1: the latest decision resolves, then the export lookup breaks.
+
+    This must NOT crash the payload and must NOT report 'this decision exported
+    nothing' — eligible_exports is None with the error recorded.
+    """
+    import sqlite3 as _sqlite3
+    from types import SimpleNamespace
+
+    from tradehub_research.ops import operator_status as ops
+
+    real = _sqlite3.connect(tmp_path / "s.db")
+    real.row_factory = _sqlite3.Row
+    real.execute("CREATE TABLE pipeline_run (run_id TEXT, as_of TEXT, started_at TEXT)")
+    real.execute(
+        "CREATE TABLE portfolio_run (run_id TEXT, pipeline_run_id TEXT, "
+        "decision_as_of TEXT, created_at TEXT)"
+    )
+    real.execute("CREATE TABLE portfolio_state_observation (decision_id TEXT, run_id TEXT)")
+    real.execute("CREATE TABLE committee_run (committee_run_id TEXT, pipeline_run_id TEXT)")
+    real.execute("CREATE TABLE score_snapshot (snapshot_id TEXT, committee_run_id TEXT)")
+    real.execute("CREATE TABLE trade_proposal (proposal_id TEXT, decision_id TEXT)")
+    real.execute(
+        "INSERT INTO portfolio_run VALUES ('r1','genuine-a','2026-09-10T00:00:00Z','2026-09-10')"
+    )
+    real.commit()
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            if "trade_proposal" in sql:
+                raise _sqlite3.OperationalError("simulated: export lookup failed")
+            return real.execute(sql, params)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _DB:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def connect(self, *args, **kwargs):
+            return _Conn()
+
+    class _EmptyCursor:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class _EmptyConn:
+        def execute(self, sql, params=()):
+            return _EmptyCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _ExpDB:
+        def connect(self, *args, **kwargs):
+            return _EmptyConn()
+
+    monkeypatch.setattr(ops, "ResearchDB", _DB)
+    monkeypatch.setattr(
+        ops,
+        "refresh_health",
+        lambda **kwargs: {"securities_expected": 0, "with_bars": 0, "stale_count": 0},
+    )
+    monkeypatch.setattr(
+        ops,
+        "forward_health",
+        lambda **kwargs: {"production_predictions": 0, "predictions_due": 0, "matured": {}},
+    )
+    monkeypatch.setattr(ops, "_authority_record_count", lambda: 0)
+    monkeypatch.setattr(ops, "_runner_receipts", lambda: {"count": 0})
+    monkeypatch.setattr(ops, "_published_authority_ids", lambda: set())
+
+    paths = SimpleNamespace(
+        research_db=tmp_path / "r.db",
+        experiment_db=tmp_path / "e.db",
+        research_dir=tmp_path,
+    )
+    out = ops.operator_status(
+        settings=SimpleNamespace(busy_timeout_ms=5000), experiment_db=_ExpDB(), paths=paths
+    )
+
+    chain = out["decision_chain"]
+    # The latest decision resolved (so this is the RIGHT branch)...
+    assert chain["latest_decision"]["run_id"] == "r1", chain["latest_decision"]
+    # ...and the failed export lookup is honest and recorded, not a 0 or a crash.
+    assert chain["latest_decision"]["eligible_exports"] is None, chain["latest_decision"]
+    assert chain["latest_decision"]["exported_proposal_ids"] is None
+    errors = chain["query_errors"]
+    assert "eligible_exports" in errors, errors
+    assert errors["eligible_exports"].startswith("OperationalError")
+    assert out.get("report_status") is not None
+
+
 def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):
     """A NULL/unattributable run id is never genuine production."""
     con = sqlite3.connect(tmp_path / "nulls.db")

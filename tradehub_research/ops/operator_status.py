@@ -242,53 +242,69 @@ def operator_status(
     # authority records. Deliberately NOT the lifetime authority-file count and
     # deliberately NOT the cycle log, so an asynchronous finalizer run is
     # reflected immediately even when cycle-log.jsonl has not changed.
-    exported_ids: list[str] = []
+    exported_ids: list[str] | None = []
     if latest_run_id is not None:
-        with research_db.connect(read_only=True) as conn:
-            rows = conn.execute(
-                "SELECT proposal_id FROM trade_proposal WHERE decision_id IN "
-                "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
-                (latest_run_id,),
-            ).fetchall()
-        proposal_ids = {str(r["proposal_id"]) for r in rows}
-        latest_proposals = len(proposal_ids)
-        exported_ids = sorted(_published_authority_ids() & proposal_ids)
+        try:
+            with research_db.connect(read_only=True) as conn:
+                rows = conn.execute(
+                    "SELECT proposal_id FROM trade_proposal WHERE decision_id IN "
+                    "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
+                    (latest_run_id,),
+                ).fetchall()
+            proposal_ids = {str(r["proposal_id"]) for r in rows}
+            latest_proposals = len(proposal_ids)
+            exported_ids = sorted(_published_authority_ids() & proposal_ids)
+        except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+            # A failed export lookup must NOT take the whole status down, and
+            # must not masquerade as "this decision exported nothing".
+            chain_errors["eligible_exports"] = f"{type(exc).__name__}: {exc}"
+            latest_proposals = None
+            exported_ids = None
     chain["latest_decision"] = {
         "run_id": latest_run_id,
         "pipeline_run_id": latest_pipeline_run_id,
         "decision_as_of": latest_decision_as_of,
         "created_at": latest_created_at,
         "proposals": latest_proposals,
-        "eligible_exports": len(exported_ids),
+        "eligible_exports": None if exported_ids is None else len(exported_ids),
         "exported_proposal_ids": exported_ids,
     }
 
     # Validation: regime + snapshot presence.
+    # "no data yet" and "the query broke" must be DISTINGUISHABLE, so a failure
+    # is recorded rather than silently reported as an absent regime/snapshot.
     validation = {}
-    with experiment_db.connect(read_only=True) as conn:
-        try:
-            reg = conn.execute(
-                "SELECT regime_id, status, sealed_at FROM evaluation_regime "
-                "ORDER BY sealed_at DESC LIMIT 1"
-            ).fetchone()
-            validation["regime"] = {
-                "regime_id": str(reg["regime_id"]) if reg else None,
-                "status": str(reg["status"]) if reg else None,
-                "sealed_at": str(reg["sealed_at"]) if reg else None,
-            }
-        except Exception:  # noqa: BLE001
-            validation["regime"] = None
-        try:
-            snap = conn.execute(
-                "SELECT snapshot_id, source_commit, created_at FROM dataset_snapshot "
-                "ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
-            validation["snapshot"] = {
-                "snapshot_id": str(snap["snapshot_id"]) if snap else None,
-                "source_commit": str(snap["source_commit"]) if snap else None,
-            }
-        except Exception:  # noqa: BLE001
-            validation["snapshot"] = None
+    try:
+        with experiment_db.connect(read_only=True) as conn:
+            try:
+                reg = conn.execute(
+                    "SELECT regime_id, status, sealed_at FROM evaluation_regime "
+                    "ORDER BY sealed_at DESC LIMIT 1"
+                ).fetchone()
+                validation["regime"] = {
+                    "regime_id": str(reg["regime_id"]) if reg else None,
+                    "status": str(reg["status"]) if reg else None,
+                    "sealed_at": str(reg["sealed_at"]) if reg else None,
+                }
+            except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+                validation["regime"] = None
+                chain_errors["validation_regime"] = f"{type(exc).__name__}: {exc}"
+            try:
+                snap = conn.execute(
+                    "SELECT snapshot_id, source_commit, created_at FROM dataset_snapshot "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+                validation["snapshot"] = {
+                    "snapshot_id": str(snap["snapshot_id"]) if snap else None,
+                    "source_commit": str(snap["source_commit"]) if snap else None,
+                }
+            except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+                validation["snapshot"] = None
+                chain_errors["validation_snapshot"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001 -- recorded, never silent
+        validation["regime"] = None
+        validation["snapshot"] = None
+        chain_errors["validation_connect"] = f"{type(exc).__name__}: {exc}"
 
     return {
         "generated_at": utc_now(),
