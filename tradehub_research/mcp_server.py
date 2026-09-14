@@ -24,17 +24,38 @@ def create_server(database: ResearchDB | None = None) -> Any:
     mcp = FastMCP("tiger-tradehub-research")
 
     @mcp.tool()
-    def get_evidence_pack(candidate_id: str) -> dict[str, Any]:
-        """Return the immutable research evidence pack for a candidate."""
+    def get_evidence_pack(candidate_id: str, pack_hash: str | None = None) -> dict[str, Any]:
+        """Return the committee evidence view (bounded) for a candidate.
+
+        Defaults to the newest artifact for the candidate.  Passing ``pack_hash``
+        returns that exact frozen artifact, so a historical committee run can be
+        served the representation it was pinned to.  The response states which
+        representation it is and, for a view, the scoring lineage it references.
+        """
         with database.connect(read_only=True) as db:
-            row = db.execute(
-                "SELECT pack_hash,body_json FROM evidence_pack "
-                "WHERE candidate_id=? ORDER BY pack_spec_version DESC LIMIT 1",
-                (candidate_id,),
-            ).fetchone()
+            if pack_hash:
+                row = db.execute(
+                    "SELECT pack_hash,pack_spec_version,body_json FROM evidence_pack "
+                    "WHERE candidate_id=? AND pack_hash=?",
+                    (candidate_id, pack_hash),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT pack_hash,pack_spec_version,body_json FROM evidence_pack "
+                    "WHERE candidate_id=? ORDER BY pack_spec_version DESC LIMIT 1",
+                    (candidate_id,),
+                ).fetchone()
         if row is None:
             raise ValueError(f"no evidence pack for candidate: {candidate_id}")
-        return {"pack_hash": row["pack_hash"], "body": json.loads(row["body_json"])}
+        body = json.loads(row["body_json"])
+        lineage = body.get("lineage") if isinstance(body.get("lineage"), dict) else {}
+        return {
+            "pack_hash": row["pack_hash"],
+            "pack_spec_version": row["pack_spec_version"],
+            "representation": body.get("representation", "LEGACY_SCORING_PACK"),
+            "lineage_hash": lineage.get("lineage_hash"),
+            "body": body,
+        }
 
     @mcp.tool()
     def submit_assessment(

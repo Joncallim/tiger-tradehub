@@ -30,7 +30,14 @@ from tradehub_research.db import ResearchDB
 
 EXPECTED_SCHEMAS = {
     "get_evidence_pack": {
-        "properties": {"candidate_id": {"title": "Candidate Id", "type": "string"}},
+        "properties": {
+            "candidate_id": {"title": "Candidate Id", "type": "string"},
+            "pack_hash": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": "Pack Hash",
+            },
+        },
         "required": ["candidate_id"],
         "title": "get_evidence_packArguments",
         "type": "object",

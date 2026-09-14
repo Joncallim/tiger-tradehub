@@ -22,10 +22,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from tradehub_research.committee.pack import EvidencePackBuilder, PackBuildError
+from tradehub_research.committee.lineage import ScoringLineageBuilder
+from tradehub_research.committee.pack import PackBuildError
 from tradehub_research.committee.routing import CommitteeRouter
 from tradehub_research.committee.scoring import Scorer
 from tradehub_research.committee.store import CommitteeStore
+from tradehub_research.committee.view import CommitteeViewBuilder
 from tradehub_research.db import ResearchDB, normalize_ts, utc_now
 from tradehub_research.portfolio.engine import PortfolioEngine
 from tradehub_research.portfolio.handoff import (
@@ -158,10 +160,15 @@ def queue_committee_work(database: ResearchDB, pipeline_run_id: str) -> dict[str
     for row in candidates:
         candidate_id = str(row["candidate_id"])
         try:
-            pack = EvidencePackBuilder(database).build(candidate_id)
+            # #67: scoring consumes the complete lineage; the model reads the
+            # bounded view.  The view is what the committee run is pinned to,
+            # and it references the lineage by hash.
+            lineage = ScoringLineageBuilder(database).build(candidate_id)
+            view = CommitteeViewBuilder(database).build(candidate_id, lineage=lineage)
             run_id = store.create_or_resume_committee_run(
                 candidate_id=candidate_id,
-                pack_hash=pack.pack_hash,
+                pack_hash=view.pack_hash,
+                lineage_hash=lineage.lineage_hash,
                 committee_policy_version=1,
                 comparator_config_hash=comparator_hash,
                 scoring_config_hash=scoring_hash,

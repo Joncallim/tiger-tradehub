@@ -1,35 +1,55 @@
-"""Build the immutable, point-in-time evidence pack v1."""
+"""Build the immutable, point-in-time evidence pack v1.
+
+Pack v1 is the **legacy scoring pack**: it was simultaneously the scorer's input
+and the committee's context, which is why an unbounded momentum lineage could
+block a candidate entirely (#67).  New committee work uses
+``committee.lineage.ScoringLineageBuilder`` (scoring) plus
+``committee.view.CommitteeViewBuilder`` (bounded model view).  This module is
+retained unchanged-in-output so historical packs remain reproducible and
+verifiable, and it still serves as the pack for acceptance fixtures.
+"""
 
 from __future__ import annotations
 
 # ruff: noqa: E501 -- long SQL projections mirror immutable row layouts.
-import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from tradehub_research.committee.bounds import (
+    MAX_BODY_BYTES,
+    MAX_EVIDENCE_ROWS,
+    MAX_FEATURE_SOURCES,
+    MAX_STRING_CODEPOINTS,
+    MAX_STRUCTURED_BYTES,
+    MAX_STRUCTURED_KEYS,
+    TRUNCATION_SUFFIX,
+    bound_feature,
+    bound_structured,
+    hash_prefixed,
+    truncate_strings,
+)
+from tradehub_research.committee.frozen_inputs import (
+    FrozenInputs,
+    PackBuildError,
+    compute_groups,
+    identity_body,
+    load_frozen_inputs,
+)
 from tradehub_research.db import ResearchDB, normalize_ts, utc_now
 from tradehub_research.screen_store import DeterminismError
 from tradehub_research.screens import canonical_json
-from tradehub_research.universe import SecurityIdentityStore
 
 PACK_SPEC_VERSION = 1
-MAX_EVIDENCE_ROWS = 256
-MAX_FEATURE_SOURCES = 40
-MAX_STRING_CODEPOINTS = 512
-MAX_STRUCTURED_KEYS = 32
-MAX_STRUCTURED_BYTES = 4096
-MAX_BODY_BYTES = 160_000
-TRUNCATION_SUFFIX = "…[truncated]"
 
-
-class PackBuildError(RuntimeError):
-    """The frozen Phase-1 inputs cannot produce a conforming pack."""
-
-    def __init__(self, code: str):
-        super().__init__(code)
-        self.code = code
+# Historical private names, kept importable for callers that referenced them.
+_hash = hash_prefixed
+_truncate_strings = truncate_strings
+_bound_structured = bound_structured
+_bound_feature = bound_feature
+_groups = compute_groups
 
 
 @dataclass(frozen=True)
@@ -42,75 +62,14 @@ class EvidencePack:
         return canonical_json(self.body)
 
 
-def _hash(prefix: str, value: object) -> str:
-    return hashlib.sha256((prefix + "\0" + canonical_json(value)).encode()).hexdigest()
-
-
-def _truncate_strings(value: Any, path: str, records: list[dict[str, Any]]) -> Any:
-    if isinstance(value, str) and len(value) > MAX_STRING_CODEPOINTS:
-        records.append({"kind": "string", "path": path, "original_codepoints": len(value)})
-        return value[: MAX_STRING_CODEPOINTS - len(TRUNCATION_SUFFIX)] + TRUNCATION_SUFFIX
-    if isinstance(value, list):
-        return [
-            _truncate_strings(item, f"{path}/{index}", records) for index, item in enumerate(value)
-        ]
-    if isinstance(value, dict):
-        return {
-            key: _truncate_strings(value[key], f"{path}/{key}", records) for key in sorted(value)
-        }
-    return value
-
-
-def _bound_structured(
-    fields: dict[str, Any], evidence_id: str, records: list[dict[str, Any]]
-) -> dict[str, Any]:
-    keys = sorted(fields)
-    if len(keys) > MAX_STRUCTURED_KEYS:
-        records.append(
-            {
-                "kind": "structured_keys",
-                "evidence_id": evidence_id,
-                "omitted": len(keys) - MAX_STRUCTURED_KEYS,
-            }
-        )
-        keys = keys[:MAX_STRUCTURED_KEYS]
-    bounded = _truncate_strings(
-        {key: fields[key] for key in keys}, f"evidence/{evidence_id}/structured_fields", records
+def _freshness_days(as_of: str, public_available_time: str) -> int:
+    return max(
+        0,
+        (
+            datetime.fromisoformat(normalize_ts(as_of).replace("Z", "+00:00"))
+            - datetime.fromisoformat(normalize_ts(public_available_time).replace("Z", "+00:00"))
+        ).days,
     )
-    if len(canonical_json(bounded).encode()) > MAX_STRUCTURED_BYTES:
-        raise PackBuildError("PACK_TOO_LARGE")
-    return bounded
-
-
-def _bound_feature(value: Any, path: str, records: list[dict[str, Any]]) -> Any:
-    value = _truncate_strings(value, path, records)
-    if isinstance(value, dict):
-        return {
-            key: _bound_feature(item, f"{path}/{key}", records)
-            for key, item in sorted(value.items())
-        }
-    if isinstance(value, list) and path.endswith("/sources"):
-
-        def order(item: Any) -> tuple[str, str]:
-            if not isinstance(item, dict):
-                return ("", canonical_json(item))
-            return (str(item.get("public_available_time", "")), str(item.get("evidence_id", "")))
-
-        ordered = sorted(value, key=order, reverse=True)
-        if len(ordered) > MAX_FEATURE_SOURCES:
-            records.append(
-                {
-                    "kind": "feature_sources",
-                    "path": path,
-                    "omitted": len(ordered) - MAX_FEATURE_SOURCES,
-                }
-            )
-        return ordered[:MAX_FEATURE_SOURCES]
-    if isinstance(value, list):
-        return [
-            _bound_feature(item, f"{path}/{index}", records) for index, item in enumerate(value)
-        ]
-    return value
 
 
 class EvidencePackBuilder:
@@ -146,45 +105,13 @@ class EvidencePackBuilder:
     build_and_persist = build
 
     def _build(self, db: sqlite3.Connection, candidate_id: str) -> EvidencePack:
-        candidate = db.execute(
-            "SELECT c.*,p.as_of,p.universe_hash,p.screen_manifest_hash,p.funnel_config_hash,"
-            "p.input_view_hash,p.input_snapshot_id,p.flags_json,s.canonical_ticker,s.name,s.sector,"
-            "s.sector_coverage_status FROM candidate c JOIN pipeline_run p ON p.run_id=c.run_id "
-            "JOIN security s ON s.security_id=c.security_id WHERE c.candidate_id=?",
-            (candidate_id,),
-        ).fetchone()
-        if candidate is None:
-            raise KeyError(f"unknown candidate: {candidate_id}")
-        if candidate["is_control"]:
-            raise PackBuildError("CONTROL_CANDIDATE")
-        result_ids = json.loads(candidate["screen_result_ids_json"])
-        if not isinstance(result_ids, list):
-            raise PackBuildError("INVALID_SCREEN_RESULTS")
-        results = []
-        frozen_ids: set[str] = set()
-        passing_ids: set[str] = set()
-        for result_id in sorted(set(result_ids)):
-            row = db.execute(
-                "SELECT r.*,d.family,d.screen_id,d.screen_version,d.spec_json FROM screen_result r "
-                "JOIN screen_definition d ON d.config_hash=r.config_hash WHERE r.screen_result_id=?",
-                (result_id,),
-            ).fetchone()
-            if (
-                row is None
-                or row["run_id"] != candidate["run_id"]
-                or row["security_id"] != candidate["security_id"]
-            ):
-                raise PackBuildError("SCREEN_CANDIDATE_MISMATCH")
-            evidence_ids = sorted(set(json.loads(row["evidence_ids_json"])))
-            frozen_ids.update(evidence_ids)
-            if row["passed"]:
-                passing_ids.update(evidence_ids)
-            spec = json.loads(row["spec_json"])
-            results.append((row, evidence_ids, spec))
-
-        ordered_ids = sorted(frozen_ids, key=lambda item: (item not in passing_ids, item))
+        inputs = load_frozen_inputs(db, candidate_id)
+        candidate = inputs.candidate
+        ordered_ids = sorted(
+            inputs.frozen_ids, key=lambda item: (item not in inputs.passing_ids, item)
+        )
         truncations: list[dict[str, Any]] = []
-        if len(passing_ids) > MAX_EVIDENCE_ROWS:
+        if len(inputs.passing_ids) > MAX_EVIDENCE_ROWS:
             raise PackBuildError("PACK_TOO_LARGE")
         if len(ordered_ids) > MAX_EVIDENCE_ROWS:
             truncations.append(
@@ -192,37 +119,9 @@ class EvidencePackBuilder:
             )
             ordered_ids = ordered_ids[:MAX_EVIDENCE_ROWS]
         selected = set(ordered_ids)
-        evidence_rows: dict[str, sqlite3.Row] = {}
-        clusters: dict[str, list[str]] = {}
-        for evidence_id in ordered_ids:
-            row = db.execute(
-                "SELECT e.*,s.source_type,s.hierarchy_tier FROM evidence_event e "
-                "JOIN evidence_source s ON s.source_id=e.source_id WHERE e.evidence_id=?",
-                (evidence_id,),
-            ).fetchone()
-            if row is None:
-                raise PackBuildError("MISSING_EVIDENCE")
-            if row["security_id"] != candidate["security_id"]:
-                raise PackBuildError("EVIDENCE_SECURITY_MISMATCH")
-            if row["public_available_time"] is None or normalize_ts(
-                row["public_available_time"]
-            ) > normalize_ts(candidate["as_of"]):
-                raise PackBuildError("EVIDENCE_NOT_POINT_IN_TIME")
-            if row["pat_provenance"] not in ("source_reported", "derived_from_index"):
-                raise PackBuildError("EVIDENCE_PROVENANCE")
-            if row["withdrawn"]:
-                raise PackBuildError("EVIDENCE_WITHDRAWN")
-            evidence_rows[evidence_id] = row
-            clusters[evidence_id] = [
-                item[0]
-                for item in db.execute(
-                    "SELECT m.cluster_id FROM evidence_cluster_member m JOIN evidence_cluster c "
-                    "ON c.cluster_id=m.cluster_id WHERE m.evidence_id=? AND c.formed_at<=? ORDER BY m.cluster_id",
-                    (evidence_id, candidate["as_of"]),
-                )
-            ]
-
-        groups = self._groups(evidence_rows, clusters, passing_ids)
+        evidence_rows: dict[str, Any] = {item: inputs.evidence_rows[item] for item in ordered_ids}
+        clusters: dict[str, list[str]] = {item: inputs.clusters[item] for item in ordered_ids}
+        groups = self._groups(evidence_rows, clusters, set(inputs.passing_ids))
         successors = {
             row["supersedes_evidence_id"]: evidence_id
             for evidence_id, row in evidence_rows.items()
@@ -233,17 +132,6 @@ class EvidencePackBuilder:
             row = evidence_rows[evidence_id]
             fields = _bound_structured(
                 json.loads(row["structured_fields"]), evidence_id, truncations
-            )
-            from datetime import datetime
-
-            freshness = max(
-                0,
-                (
-                    datetime.fromisoformat(normalize_ts(candidate["as_of"]).replace("Z", "+00:00"))
-                    - datetime.fromisoformat(
-                        normalize_ts(row["public_available_time"]).replace("Z", "+00:00")
-                    )
-                ).days,
             )
             evidence.append(
                 {
@@ -262,11 +150,14 @@ class EvidencePackBuilder:
                     "superseded_within_pack_by": successors.get(evidence_id),
                     "cluster_ids": clusters[evidence_id],
                     "underlying_group": groups[evidence_id],
-                    "freshness_days": freshness,
+                    "freshness_days": _freshness_days(
+                        candidate["as_of"], row["public_available_time"]
+                    ),
                 }
             )
         screens = []
-        for row, evidence_ids, spec in results:
+        for item in inputs.results:
+            row, evidence_ids, spec = item.row, item.evidence_ids, item.spec
             screens.append(
                 {
                     "family": row["family"],
@@ -282,7 +173,7 @@ class EvidencePackBuilder:
                     "confidence": row["confidence"],
                     "data_quality": row["data_quality"],
                     "reason_codes": sorted(set(json.loads(row["reason_codes_json"]))),
-                    "evidence_ids": [item for item in evidence_ids if item in selected],
+                    "evidence_ids": [entry for entry in evidence_ids if entry in selected],
                     "raw_features": _bound_feature(
                         json.loads(row["raw_features_json"]),
                         f"screens/{row['screen_result_id']}/raw_features",
@@ -290,37 +181,14 @@ class EvidencePackBuilder:
                     ),
                 }
             )
-        screens.sort(key=lambda item: (item["family"], item["screen_id"], item["screen_version"]))
-        flags = sorted(set(json.loads(candidate["flags_json"] or "[]")))
-        ticker_as_of = SecurityIdentityStore.ticker_at_connection(
-            db, candidate["security_id"], candidate["as_of"]
+        screens.sort(
+            key=lambda entry: (entry["family"], entry["screen_id"], entry["screen_version"])
         )
-        if (
-            ticker_as_of is None
-            and not SecurityIdentityStore.has_authoritative_ticker_history_connection(
-                db, candidate["security_id"]
-            )
-        ):
-            ticker_as_of = candidate["canonical_ticker"]
         body: dict[str, Any] = {
             "pack_spec_version": PACK_SPEC_VERSION,
             "candidate": {"candidate_id": candidate_id, "security_id": candidate["security_id"]},
-            "run": {
-                "run_id": candidate["run_id"],
-                "as_of": candidate["as_of"],
-                "universe_hash": candidate["universe_hash"],
-                "screen_manifest_hash": candidate["screen_manifest_hash"],
-                "funnel_config_hash": candidate["funnel_config_hash"],
-                "input_view_hash": candidate["input_view_hash"],
-                "input_snapshot_id": candidate["input_snapshot_id"],
-                "flags": flags,
-            },
-            "identity": {
-                "ticker_as_of": ticker_as_of,
-                "name": candidate["name"],
-                "sector": candidate["sector"],
-                "sector_coverage_status": candidate["sector_coverage_status"],
-            },
+            "run": inputs.run_body(),
+            "identity": identity_body(inputs, db),
             "screens": screens,
             "evidence": evidence,
             "bounds": {"evidence_rows": len(evidence), "body_chars": 0, "truncations": truncations},
@@ -338,47 +206,9 @@ class EvidencePackBuilder:
 
     @staticmethod
     def _groups(
-        rows: dict[str, sqlite3.Row], clusters: dict[str, list[str]], passing: set[str]
+        rows: dict[str, Any], clusters: dict[str, list[str]], passing: set[str] | frozenset[str]
     ) -> dict[str, str]:
-        groups: dict[str, str] = {}
-        non_xbrl = []
-        for evidence_id, row in rows.items():
-            fields = json.loads(row["structured_fields"])
-            if fields.get("record_type") == "xbrl_fact":
-                accession = str(fields.get("accession", "")).strip()
-                if not accession and evidence_id in passing:
-                    raise PackBuildError("UNGROUPABLE_XBRL")
-                groups[evidence_id] = (
-                    f"xbrl:{row['source_id']}:{accession}"
-                    if accession
-                    else f"event:{row['source_id']}:{evidence_id}"
-                )
-            else:
-                non_xbrl.append(evidence_id)
-        # Connected components are source-local and connected by any shared PIT-valid cluster.
-        unseen = set(non_xbrl)
-        while unseen:
-            root = min(unseen)
-            component = {root}
-            queue = [root]
-            unseen.remove(root)
-            while queue:
-                current = queue.pop()
-                for other in sorted(unseen):
-                    if rows[other]["source_id"] == rows[current]["source_id"] and set(
-                        clusters[other]
-                    ) & set(clusters[current]):
-                        unseen.remove(other)
-                        component.add(other)
-                        queue.append(other)
-            all_clusters = sorted({cluster for item in component for cluster in clusters[item]})
-            for item in component:
-                groups[item] = (
-                    f"cluster:{rows[item]['source_id']}:{all_clusters[0]}"
-                    if all_clusters
-                    else f"event:{rows[item]['source_id']}:{item}"
-                )
-        return groups
+        return compute_groups(rows, clusters, passing)
 
     def _persist(self, db: sqlite3.Connection, candidate_id: str, pack: EvidencePack) -> None:
         body_json = pack.body_json
@@ -402,3 +232,19 @@ class EvidencePackBuilder:
             "INSERT INTO evidence_pack(pack_hash,pack_spec_version,candidate_id,pipeline_run_id,body_json,body_chars,built_at) VALUES (?,?,?,?,?,?,?)",
             (*expected, utc_now()),
         )
+
+
+__all__ = [
+    "MAX_BODY_BYTES",
+    "MAX_EVIDENCE_ROWS",
+    "MAX_FEATURE_SOURCES",
+    "MAX_STRING_CODEPOINTS",
+    "MAX_STRUCTURED_BYTES",
+    "MAX_STRUCTURED_KEYS",
+    "PACK_SPEC_VERSION",
+    "TRUNCATION_SUFFIX",
+    "EvidencePack",
+    "EvidencePackBuilder",
+    "FrozenInputs",
+    "PackBuildError",
+]

@@ -291,11 +291,7 @@ class Scorer:
             state = self._state(db, run_id)
             if state != "READY_TO_SCORE":
                 raise ValueError("committee is not ready to score")
-            pack = json.loads(
-                db.execute(
-                    "SELECT body_json FROM evidence_pack WHERE pack_hash=?", (run["pack_hash"],)
-                ).fetchone()[0]
-            )
+            (scoring_screens, scoring_evidence, _artifact) = self._scoring_artifact(db, run)
             spec = json.loads(
                 db.execute(
                     "SELECT spec_json FROM scoring_version WHERE config_hash=?",
@@ -322,8 +318,8 @@ class Scorer:
                     (run_id,),
                 )
             )
-            result = score_screens(pack["screens"], pack["evidence"], spec)
-            screen_hashes = _semantic_screen_hashes(pack["screens"])
+            result = score_screens(scoring_screens, scoring_evidence, spec)
+            screen_hashes = _semantic_screen_hashes(scoring_screens)
             logical = {
                 "scoring_config_hash": run["scoring_config_hash"],
                 "candidate_id": run["candidate_id"],
@@ -467,6 +463,40 @@ class Scorer:
             ),
         )
 
+    @staticmethod
+    def _scoring_artifact(
+        db: Any, committee_run: Any
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        """Resolve the scoring input of record for one committee run (#67).
+
+        A run created by #67 carries ``lineage_hash`` and scores from the
+        complete scoring lineage.  A run created before #67 carries only a pack
+        hash; it scores from that legacy pack v1 body so historical results stay
+        reproducible.  A bounded committee view is never a scoring input, and
+        saying so loudly here is the point: this is the boundary that model-view
+        size limits must not be able to cross.
+        """
+        keys = set(committee_run.keys()) if hasattr(committee_run, "keys") else set()
+        lineage_hash = committee_run["lineage_hash"] if "lineage_hash" in keys else None
+        if lineage_hash:
+            row = db.execute(
+                "SELECT body_json FROM scoring_lineage WHERE lineage_hash=?", (lineage_hash,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown scoring lineage: {lineage_hash}")
+            body = json.loads(row[0])
+            return body["screens"], body["evidence_identity"], f"lineage:{lineage_hash}"
+        record = db.execute(
+            "SELECT body_json FROM evidence_pack WHERE pack_hash=?",
+            (committee_run["pack_hash"],),
+        ).fetchone()
+        if record is None:
+            raise KeyError(f"unknown evidence pack: {committee_run['pack_hash']}")
+        body = json.loads(record[0])
+        if "view_spec_version" in body:
+            raise ValueError("bounded committee view must never be a scoring input")
+        return body["screens"], body["evidence"], f"legacy-pack-v1:{committee_run['pack_hash']}"
+
     def _trajectory(
         self,
         db: Any,
@@ -489,15 +519,15 @@ class Scorer:
         if prior["scoring_config_hash"] != run["scoring_config_hash"]:
             return "SCORING_VERSION_CHANGE", "REBASED", None, None
         old_run = db.execute(
-            "SELECT pack_hash FROM committee_run WHERE committee_run_id=?",
+            "SELECT * FROM committee_run WHERE committee_run_id=?",
             (prior["committee_run_id"],),
         ).fetchone()
-        old_pack = json.loads(
-            db.execute(
-                "SELECT body_json FROM evidence_pack WHERE pack_hash=?", (old_run[0],)
-            ).fetchone()[0]
-        )
-        old_screens = _semantic_screen_hashes(old_pack["screens"])
+        # The prior run's SEMANTIC screens must be read from the same kind of
+        # artifact as the current run's.  Loading the prior pack here would
+        # compare a bounded model view against the scoring lineage and
+        # manufacture a SCREEN_METHODOLOGY_CHANGE out of a representation change.
+        old_screens_body, old_evidence, _old_artifact = self._scoring_artifact(db, old_run)
+        old_screens = _semantic_screen_hashes(old_screens_body)
         if (
             prior["scored_evidence_hash"] == result["scored_evidence_hash"]
             and old_screens != screen_hashes
@@ -510,7 +540,10 @@ class Scorer:
             if prior["conviction"] != result["conviction"]:
                 raise DeterminismError("model reassessment changed conviction")
             return "MODEL_REASSESSMENT", "STABLE", 0, None
-        old_ids = {row["evidence_id"] for row in self._scored_records(old_pack)}
+        old_ids = {
+            row["evidence_id"]
+            for row in self._scored_records({"screens": old_screens_body, "evidence": old_evidence})
+        }
         new_ids = {row["evidence_id"] for row in result["scored_evidence"]}
         changed = old_ids ^ new_ids
         correction = bool(changed) and self._all_in_correction_chains(

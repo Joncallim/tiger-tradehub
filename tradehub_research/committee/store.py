@@ -272,9 +272,15 @@ class CommitteeStore:
         prompt_versions: Mapping[str, Any],
         assessment_schema_version: int,
         provider_routes: object | None = None,
+        lineage_hash: str | None = None,
     ) -> str:
         del provider_routes
         roles = list(NEUTRAL_ROLES)
+        # ``lineage_hash`` is deliberately NOT part of the logical identity: the
+        # committee run is pinned by ``pack_hash`` (the bounded view), and the
+        # view body embeds its lineage hash, so pack_hash -> lineage_hash is
+        # functional.  Adding it here would mint new run ids for existing runs
+        # and break idempotent resume.
         logical = {
             "candidate_id": candidate_id,
             "pack_hash": pack_hash,
@@ -296,6 +302,7 @@ class CommitteeStore:
             scoring_config_hash,
             canonical_json(dict(prompt_versions)),
             assessment_schema_version,
+            lineage_hash,
         )
         with self.database.connect() as db:
             candidate = db.execute(
@@ -313,7 +320,7 @@ class CommitteeStore:
             ):
                 raise ValueError("committee run candidate/pack mismatch")
             stored = db.execute(
-                "SELECT committee_run_id,candidate_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version FROM committee_run WHERE committee_run_id=?",
+                "SELECT committee_run_id,candidate_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version,lineage_hash FROM committee_run WHERE committee_run_id=?",
                 (run_id,),
             ).fetchone()
             if stored is not None:
@@ -321,7 +328,7 @@ class CommitteeStore:
                     raise DeterminismError("committee run identity collision")
                 return run_id
             db.execute(
-                "INSERT INTO committee_run(committee_run_id,candidate_id,pipeline_run_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO committee_run(committee_run_id,candidate_id,pipeline_run_id,pack_hash,role_set_json,committee_policy_version,comparator_config_hash,scoring_config_hash,prompt_versions_json,assessment_schema_version,lineage_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (run_id, candidate_id, candidate[0], *values[2:], utc_now()),
             )
         return run_id

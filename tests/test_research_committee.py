@@ -168,7 +168,7 @@ def _fixture(
 
 def test_schema_v9_fresh_and_append_only(tmp_path):
     database = ResearchDB(tmp_path / "fresh.db")
-    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 11
+    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 12
     with database.connect() as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"evidence_pack", "committee_run", "score_snapshot"} <= tables
@@ -185,7 +185,7 @@ def test_schema_v7_upgrade_is_additive(tmp_path):
         for version, description, sql in MIGRATIONS[:7]:
             db.executescript(sql)
             db.execute("INSERT INTO schema_version VALUES (?,?,?)", (version, "now", description))
-    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 11
+    assert database.migrate() == PHASE_0_SCHEMA_VERSION == 12
 
 
 def test_pack_exact_groups_supersession_and_hash_retry(tmp_path):
@@ -1602,7 +1602,7 @@ def test_candidate_trends_follow_as_of_not_snapshot_hash(tmp_path):
                 ),
             )
             raw.execute(
-                "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     f"committee-{run_id}",
                     candidate_id,
@@ -1615,6 +1615,7 @@ def test_candidate_trends_follow_as_of_not_snapshot_hash(tmp_path):
                     "{}",
                     1,
                     as_of,
+                    None,
                 ),
             )
         for snapshot_id, run_id, conviction in (
@@ -1690,7 +1691,7 @@ def test_prior_snapshot_selection_excludes_future_as_of(tmp_path):
             ),
         )
         raw.execute(
-            "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO committee_run VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "future-committee",
                 "candidate",
@@ -1703,6 +1704,7 @@ def test_prior_snapshot_selection_excludes_future_as_of(tmp_path):
                 "{}",
                 1,
                 "2026-01-01Z",
+                None,
             ),
         )
         raw.execute(

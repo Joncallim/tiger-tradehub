@@ -9,10 +9,11 @@ from typing import Any
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
-from tradehub_research.committee.pack import EvidencePackBuilder
+from tradehub_research.committee.lineage import ScoringLineageBuilder
 from tradehub_research.committee.routing import CommitteeRouter
 from tradehub_research.committee.scoring import Scorer
 from tradehub_research.committee.store import CommitteeStore
+from tradehub_research.committee.view import CommitteeViewBuilder
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
 
@@ -56,12 +57,16 @@ def create_run(
 ) -> dict[str, Any]:
     try:
         candidate_id = body["candidate_id"]
-        pack = EvidencePackBuilder(database).build(candidate_id)
+        # #67: the scorer consumes the complete lineage; models read the bounded
+        # view that references it.
+        lineage = ScoringLineageBuilder(database).build(candidate_id)
+        pack = CommitteeViewBuilder(database).build(candidate_id, lineage=lineage)
         store = CommitteeStore(database)
         comparator, scoring = store.ensure_registry_rows()
         run_id = store.create_or_resume_committee_run(
             candidate_id=candidate_id,
             pack_hash=pack.pack_hash,
+            lineage_hash=lineage.lineage_hash,
             committee_policy_version=int(body.get("committee_policy_version", 1)),
             comparator_config_hash=body.get("comparator_config_hash", comparator),
             scoring_config_hash=body.get("scoring_config_hash", scoring),
