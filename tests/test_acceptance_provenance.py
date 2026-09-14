@@ -470,6 +470,12 @@ def test_decision_ledger_totals_are_none_not_a_silent_zero_on_failure(tmp_path, 
     errors = chain["query_errors"]
     assert "portfolio_runs_total" in errors and "observations_total" in errors, errors
     assert errors["portfolio_runs_total"].startswith("OperationalError")
+    # The latest-decision ROW FETCH also failed here, so its dependent fields
+    # must be unknown too — NOT a legitimate-looking 0 proposals / 0 exports.
+    assert chain["latest_decision"]["proposals"] is None, chain["latest_decision"]
+    assert chain["latest_decision"]["eligible_exports"] is None, chain["latest_decision"]
+    assert chain["latest_decision"]["exported_proposal_ids"] is None
+    assert "latest_decision" in errors
     # The payload is still complete.
     assert out.get("report_status") is not None
 
@@ -658,6 +664,36 @@ def test_published_authority_ids_never_raises_on_a_bad_directory(monkeypatch):
     assert ops._published_authority_ids() == set()
     assert ops._authority_record_count() == 0
     assert Path  # keep the import meaningful
+
+
+def test_runner_receipts_unreadable_is_distinguishable_from_absent(tmp_path, monkeypatch):
+    """An UNREADABLE receipt file must not read as 'no receipts' and must not raise."""
+    from tradehub_research.ops import operator_status as ops
+
+    # ABSENT file -> 'unavailable'
+    monkeypatch.setattr(ops, "RUNNER_RECEIPTS", tmp_path / "nope.jsonl")
+    assert ops._runner_receipts()["status"] == "unavailable"
+
+    # UNREADABLE file (exists, but reading raises) -> distinguishable, no raise.
+    target = tmp_path / "ledger.jsonl"
+    target.write_text("{}\n")
+
+    class _Unreadable:
+        def exists(self):
+            return True
+
+        def read_text(self, *args, **kwargs):
+            raise PermissionError("EACCES")
+
+    monkeypatch.setattr(ops, "RUNNER_RECEIPTS", _Unreadable())
+    out = ops._runner_receipts()
+    assert out["status"].startswith("unreadable:"), out
+    assert out["count"] == 0
+
+    # A MALFORMED line is likewise distinguishable.
+    monkeypatch.setattr(ops, "RUNNER_RECEIPTS", target)
+    target.write_text("not json\n")
+    assert ops._runner_receipts()["status"] == "malformed"
 
 
 def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):

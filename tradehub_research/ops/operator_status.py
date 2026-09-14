@@ -187,6 +187,7 @@ def operator_status(
         "ON r.run_id = o.run_id WHERE " + obs_sql,
         obs_params,
     )
+    latest_decision_ok = True
     try:
         with research_db.connect(read_only=True) as conn:
             row = conn.execute(
@@ -198,6 +199,7 @@ def operator_status(
     except Exception as exc:  # noqa: BLE001 -- recorded, never silent
         chain_errors["latest_decision"] = f"{type(exc).__name__}: {exc}"
         row = None
+        latest_decision_ok = False
     chain["query_errors"] = chain_errors
     if row:
         latest_run_id = str(row["run_id"])
@@ -291,6 +293,11 @@ def operator_status(
             chain_errors["eligible_exports"] = f"{type(exc).__name__}: {exc}"
             latest_proposals = None
             exported_ids = None
+    elif not latest_decision_ok:
+        # The row fetch itself failed, so "no decision" would be a LIE. Report
+        # the dependent fields as unknown rather than as a legitimate zero.
+        latest_proposals = None
+        exported_ids = None
     chain["latest_decision"] = {
         "run_id": latest_run_id,
         "pipeline_run_id": latest_pipeline_run_id,
