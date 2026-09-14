@@ -44,7 +44,8 @@ def capture_production_predictions(
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
     store = ScreenStore(research_db)
 
-    gsql, gparams = genuine_clause()
+    # pipeline_run's OWN identity column is run_id (it has no pipeline_run_id).
+    gsql, gparams = genuine_clause(column="run_id")
     if run_id is None:
         with research_db.connect(read_only=True) as conn:
             row = conn.execute(

@@ -2,16 +2,27 @@
 
 An ENTER-from-flat test alone hides the quantity bug, so this module proves the
 interface between the REAL sizing code that populates a proposal and the REAL
-production runner that consumes it:
+production runner that consumes it.
 
-    tradehub_research.portfolio.sizing.size_buy / size_sell   (the producer)
-      -> proposal quantity fields
-      -> authority record + envelope
-      -> production runner (fixture_mode=False)                (the consumer)
-      -> capturing execution client: preview quantity == DELTA, never completion
+SCOPE — what is and is NOT proven here (kept explicit, do not overread):
+  PROVEN:
+    - the PRODUCER numbers are real: tradehub_research.portfolio.sizing
+      size_buy/size_sell output, not hand-picked constants, and they are
+      target-consistent (completion == current +/- delta; full exit -> 0).
+    - the CONSUMER is real: the PRODUCTION runner (fixture_mode=False) forwards
+      max_quantity_microunits (the delta) and never completion_quantity_microunits.
+  NOT PROVEN HERE:
+    - the persisted-proposal -> envelope field mapping. This module assembles the
+      envelope per the documented contract rather than driving
+      export_eligible_proposals, because the engine's state machine will not
+      emit HOLD->ADD / HOLD->TRIM from a cold disposable DB. The real exporter IS
+      exercised end-to-end for the ENTER case in
+      tests/test_disposable_e2e_p66.py, and its proposal dict is the persisted
+      row verbatim (only ticker/data_as_of/mark/current/sellable are re-added),
+      so it cannot alias max_quantity onto completion. A real-chain ADD/TRIM
+      export test is tracked as follow-up.
 
-`max_quantity_microunits` is the ORDER (delta); `completion_quantity_microunits`
-is the TARGET post-trade holding. Never touches the canonical production DB.
+Never touches the canonical production database.
 """
 
 from __future__ import annotations

@@ -10,6 +10,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from tradehub_research.ops.acceptance_rows import (
     ACCEPTANCE_RUN_PREFIXES,
     acceptance_clause,
@@ -68,7 +70,7 @@ def _mini_db(tmp_path):
         "CREATE TABLE portfolio_run (run_id TEXT, pipeline_run_id TEXT, "
         "decision_as_of TEXT, created_at TEXT)"
     )
-    con.execute("CREATE TABLE portfolio_state_observation (run_id TEXT, pipeline_run_id TEXT)")
+    con.execute("CREATE TABLE portfolio_state_observation (run_id TEXT)")
     con.executemany(
         "INSERT INTO portfolio_run VALUES (?,?,?,?)",
         [
@@ -79,13 +81,8 @@ def _mini_db(tmp_path):
         ],
     )
     con.executemany(
-        "INSERT INTO portfolio_state_observation VALUES (?,?)",
-        [
-            ("gen-1", "bcb73591996077de45a9c5e6ea8d72be2dd3781d870e999dbd9809bde83f5ef8"),
-            ("gen-2", "another-genuine-run"),
-            ("acc-1", "pr66-acceptance-0"),
-            ("acc-2", "pr66-acceptance-v2-3"),
-        ],
+        "INSERT INTO portfolio_state_observation VALUES (?)",
+        [("gen-1",), ("gen-2",), ("acc-1",), ("acc-2",)],
     )
     con.commit()
     return con
@@ -130,8 +127,60 @@ def test_operator_status_source_wires_the_shared_clause_and_reports_the_split():
     assert "observations_all_total" in src
 
 
-def test_forward_capture_never_captures_an_acceptance_run():
+def test_forward_capture_selects_the_latest_genuine_run_behaviourally(tmp_path):
+    """Executes the REAL selection query against a schema-accurate pipeline_run.
+
+    pipeline_run's own identity column is ``run_id`` (it has NO pipeline_run_id
+    column), so the genuine filter must be built with column="run_id". A
+    default-column filter here throws OperationalError: no such column, which
+    would break every unattended capture run.
+    """
+    con = sqlite3.connect(tmp_path / "capture.db")
+    con.execute("CREATE TABLE pipeline_run (run_id TEXT, as_of TEXT, started_at TEXT)")
+    con.executemany(
+        "INSERT INTO pipeline_run VALUES (?,?,?)",
+        [
+            ("genuine-old", "2026-09-08", "2026-09-08T00:00:00Z"),
+            ("pr66-acceptance-0", "2026-09-14", "2026-09-14T10:00:00Z"),
+            ("pr66-acceptance-v2-3", "2026-09-14", "2026-09-14T11:00:00Z"),
+            ("genuine-new", "2026-09-10", "2026-09-10T00:00:00Z"),
+        ],
+    )
+    con.commit()
+
+    gsql, gparams = genuine_clause(column="run_id")
+    picked = con.execute(
+        f"SELECT run_id FROM pipeline_run WHERE {gsql} ORDER BY started_at DESC LIMIT 1",
+        gparams,
+    ).fetchone()[0]
+    assert picked == "genuine-new", "must skip the newer acceptance runs"
+    assert not is_acceptance_run(picked)
+
+    # The default column would NOT work against this table at all.
+    bad_sql, bad_params = genuine_clause()
+    with pytest.raises(sqlite3.OperationalError):
+        con.execute(
+            f"SELECT run_id FROM pipeline_run WHERE {bad_sql} LIMIT 1", bad_params
+        ).fetchone()
+
+
+def test_forward_capture_uses_the_run_id_column_for_pipeline_run():
+    """Source guard: the pipeline_run filter must not use the default column."""
     src = (ROOT / "tradehub_research" / "ops" / "forward_capture.py").read_text(encoding="utf-8")
+    assert 'genuine_clause(column="run_id")' in src
     assert "is_acceptance_run" in src
     assert "SKIPPED_ACCEPTANCE_RUN" in src
-    assert "genuine_clause()" in src
+
+
+def test_null_rows_partition_into_acceptance_not_genuine(tmp_path):
+    """A NULL/unattributable run id is never genuine production."""
+    con = sqlite3.connect(tmp_path / "nulls.db")
+    con.execute("CREATE TABLE r (pipeline_run_id TEXT)")
+    con.executemany("INSERT INTO r VALUES (?)", [(None,), ("",), ("genuine-run",)])
+    gsql, gparams = genuine_clause()
+    asql, aparams = acceptance_clause()
+    genuine = {r[0] for r in con.execute(f"SELECT pipeline_run_id FROM r WHERE {gsql}", gparams)}
+    acceptance = {r[0] for r in con.execute(f"SELECT pipeline_run_id FROM r WHERE {asql}", aparams)}
+    assert genuine == {"genuine-run"}
+    assert acceptance == {None, ""}
+    assert len(genuine) + len(acceptance) == 3

@@ -110,6 +110,7 @@ def operator_status(
     # counts, portfolio performance, forward-learning results, evidence
     # conclusions, or adaptive training/evaluation inputs.
     gsql, gparams = genuine_clause()
+    obs_sql, obs_params = genuine_clause(column="r.pipeline_run_id")
     provenance: dict[str, Any] = {
         "acceptance_run_prefixes": list(ACCEPTANCE_RUN_PREFIXES),
         "portfolio_runs": {"genuine": 0, "acceptance": 0},
@@ -130,8 +131,8 @@ def operator_status(
             ).fetchone()[0]
             chain["observations_total"] = conn.execute(
                 "SELECT count(*) FROM portfolio_state_observation o JOIN portfolio_run r "
-                "ON r.run_id = o.run_id WHERE r." + gsql,
-                gparams,
+                "ON r.run_id = o.run_id WHERE " + obs_sql,
+                obs_params,
             ).fetchone()[0]
             row = conn.execute(
                 "SELECT run_id, pipeline_run_id, decision_as_of, created_at "

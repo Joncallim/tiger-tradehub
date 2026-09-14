@@ -50,10 +50,16 @@ def is_acceptance_run(pipeline_run_id: str | None) -> bool:
 
 
 def genuine_clause(column: str = "pipeline_run_id") -> tuple[str, tuple[str, ...]]:
-    return (
-        " AND ".join(f"{column} NOT LIKE ?" for _ in ACCEPTANCE_RUN_PREFIXES),
-        tuple(f"{prefix}%" for prefix in ACCEPTANCE_RUN_PREFIXES),
-    )
+    """SQL predicate for GENUINE production rows.
+
+    Exactly complementary to ``acceptance_clause``: NULL and empty run ids are
+    never genuine production (matching ``is_acceptance_run``), so they are
+    excluded here as well as claimed there.
+    """
+    preds = [f"{column} NOT LIKE ?" for _ in ACCEPTANCE_RUN_PREFIXES]
+    preds.append(f"{column} IS NOT NULL")
+    preds.append(f"{column} != ''")
+    return (" AND ".join(preds), tuple(f"{prefix}%" for prefix in ACCEPTANCE_RUN_PREFIXES))
 
 
 def acceptance_clause(column: str = "pipeline_run_id") -> tuple[str, tuple[str, ...]]:
