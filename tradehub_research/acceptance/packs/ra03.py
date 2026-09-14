@@ -2239,6 +2239,12 @@ def ra03_26_no_execution_leakage(tmp: Path) -> None:
         # Autonomy state-transition / path-trigger boundary tests (execution
         # plane): policy enforcement + no-broker-on-empty-inbox evidence.
         "tests/test_autonomy_state_transitions.py",
+        # P1 runner-boundary regressions (execution plane): fixture authority
+        # can never be self-granted from the inbox; order quantity is the delta.
+        "tests/test_autonomy_runner_p1.py",
+        # Disposable-DB E2E: exporter + production runner boundary against a
+        # throwaway migrated database (execution plane).
+        "tests/test_disposable_e2e_p66.py",
         # pre-existing capability/acceptance tests: they assert the ABSENCE of
         # execution vocabulary in the research capability profile
         "tests/test_research_capability.py",

@@ -96,19 +96,19 @@ def _publish(authority_dir: Path, envelope: dict, **overrides) -> dict:
 def test_exact_match_is_accepted(tmp_path):
     envelope = _envelope()
     _publish(tmp_path, envelope)
-    record = _validate_proposal_authority(tmp_path, envelope, fixture=False)
+    record = _validate_proposal_authority(tmp_path, envelope, fixture_mode=False)
     assert record["proposal_id"] == "prop-1"
     assert record["canonical_symbol"] == "AAPL"
 
 
 def test_absent_authority_fails_closed(tmp_path):
     with pytest.raises(AutonomyRefusal, match="no persisted proposal authority"):
-        _validate_proposal_authority(tmp_path, _envelope(), fixture=False)
+        _validate_proposal_authority(tmp_path, _envelope(), fixture_mode=False)
 
 
 def test_unavailable_authority_directory_fails_closed():
     with pytest.raises(AutonomyRefusal, match="authority directory unavailable"):
-        _validate_proposal_authority(None, _envelope(), fixture=False)
+        _validate_proposal_authority(None, _envelope(), fixture_mode=False)
 
 
 @pytest.mark.parametrize(
@@ -128,7 +128,7 @@ def test_authority_mismatch_fails_closed(tmp_path, overrides):
     envelope = _envelope()
     _publish(tmp_path, envelope, **overrides)
     with pytest.raises(AutonomyRefusal):
-        _validate_proposal_authority(tmp_path, envelope, fixture=False)
+        _validate_proposal_authority(tmp_path, envelope, fixture_mode=False)
 
 
 def test_tampered_envelope_identity_fails_closed(tmp_path):
@@ -136,21 +136,21 @@ def test_tampered_envelope_identity_fails_closed(tmp_path):
     _publish(tmp_path, envelope)
     tampered = _envelope(max_notional_microusd=1_000_000)  # envelope changed after publish
     with pytest.raises(AutonomyRefusal, match="identity does not match"):
-        _validate_proposal_authority(tmp_path, tampered, fixture=False)
+        _validate_proposal_authority(tmp_path, tampered, fixture_mode=False)
 
 
 def test_ineligible_authority_fails_closed(tmp_path):
     envelope = _envelope()
     _publish(tmp_path, envelope, autonomy_eligible=False)
     with pytest.raises(AutonomyRefusal, match="not eligible PAPER/non-FIXTURE"):
-        _validate_proposal_authority(tmp_path, envelope, fixture=False)
+        _validate_proposal_authority(tmp_path, envelope, fixture_mode=False)
 
 
 def test_wrong_authority_schema_fails_closed(tmp_path):
     envelope = _envelope()
     _publish(tmp_path, envelope, schema_version="paper-proposal-authority-v0")
     with pytest.raises(AutonomyRefusal, match="unexpected proposal authority schema"):
-        _validate_proposal_authority(tmp_path, envelope, fixture=False)
+        _validate_proposal_authority(tmp_path, envelope, fixture_mode=False)
 
 
 def test_authority_id_mismatch_fails_closed(tmp_path):
@@ -159,7 +159,7 @@ def test_authority_id_mismatch_fails_closed(tmp_path):
     record["proposal_id"] = "someone-else"  # file name still prop-1.json
     (tmp_path / "prop-1.json").write_text(json.dumps(record, sort_keys=True))
     with pytest.raises(AutonomyRefusal, match="authority id mismatch"):
-        _validate_proposal_authority(tmp_path, envelope, fixture=False)
+        _validate_proposal_authority(tmp_path, envelope, fixture_mode=False)
 
 
 def test_authority_publication_is_idempotent_and_never_rewritten(tmp_path):
@@ -198,7 +198,7 @@ def test_state_field_mismatch_is_refused(tmp_path, field, tampered):
     envelope = _envelope()
     _publish(tmp_path, envelope, **{field: tampered})
     with pytest.raises(AutonomyRefusal, match=field):
-        _validate_proposal_authority(tmp_path, envelope, fixture=False)
+        _validate_proposal_authority(tmp_path, envelope, fixture_mode=False)
 
 
 def test_state_transition_is_recorded_in_authority(tmp_path):
@@ -218,8 +218,15 @@ def test_internally_inconsistent_state_transition_is_refused(tmp_path):
     envelope = _envelope()  # fields say WATCH->ENTER
     _publish(tmp_path, envelope, state_transition="HOLD->EXIT")
     with pytest.raises(AutonomyRefusal, match="internally inconsistent"):
-        _validate_proposal_authority(tmp_path, envelope, fixture=False)
+        _validate_proposal_authority(tmp_path, envelope, fixture_mode=False)
 
 
 def test_marked_fixture_bypasses_authority(tmp_path):
-    assert _validate_proposal_authority(tmp_path, _envelope(), fixture=True) == {}
+    assert _validate_proposal_authority(tmp_path, _envelope(), fixture_mode=True) == {}
+
+
+def test_production_mode_refuses_an_unmarked_envelope(tmp_path):
+    """Production: no authority record, no execution. Fixture mode is the only
+    way past, and it can never be requested by the envelope itself."""
+    with pytest.raises(AutonomyRefusal, match="no persisted proposal authority"):
+        _validate_proposal_authority(tmp_path, _envelope(), fixture_mode=False)

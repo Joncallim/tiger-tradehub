@@ -75,11 +75,12 @@ def _envelope(
     fixture_tag: str | None = None,
     created_at: str | None = None,
     quantity: int = 100_000_000,
+    completion: int | None = None,
     notional: int = 1_000_000_000,
     weight: int = 10_000,
     current_qty: int | None = None,
     sellable: int | None = None,
-    mark: int = 15_000_000,
+    mark: int = 10_000_000,
     security_id: str = "S1",
     current_state: str | None = None,
     proposed_state: str | None = None,
@@ -89,7 +90,16 @@ def _envelope(
         "security_id": security_id,
         "action": action,
         "max_quantity_microunits": quantity,
-        "completion_quantity_microunits": quantity,
+        # completion = the TARGET post-trade holding. When a current holding is
+        # modelled it must be a consistent delta (ENABLE tests to differ), so the
+        # default is derived from it rather than aliased to the order quantity.
+        "completion_quantity_microunits": (
+            quantity
+            if completion is not None or current_qty in (None, 0)
+            else (int(current_qty) + quantity if action == "BUY" else int(current_qty) - quantity)
+        )
+        if completion is None
+        else completion,
         "max_notional_microusd": notional,
         "target_weight_ppm": weight,
         "current_weight_ppm": 0 if action == "BUY" else weight,
@@ -154,7 +164,14 @@ def _write_inbox(ctx, envelope) -> Path:
     return path
 
 
-def _run(ctx, **kwargs):
+def _run(ctx, fixture_mode: bool = True, **kwargs):
+    """Invoke the runner.
+
+    This module IS the explicitly isolated acceptance harness, so it opts into
+    ``fixture_mode`` out of band. Production (and the deployed systemd unit)
+    never sets it, so every production envelope requires persisted authority.
+    Tests that must exercise the PRODUCTION contract pass fixture_mode=False.
+    """
     return run_autonomy(
         settings=ctx["settings"],
         policy_path=ctx["policy_path"],
@@ -163,6 +180,7 @@ def _run(ctx, **kwargs):
         budget_db=ctx["budget_db"],
         api_client=ctx["client"],
         authority_dir=ctx["authority_dir"],
+        fixture_mode=fixture_mode,
         now=NOW,
         **kwargs,
     )
@@ -245,7 +263,7 @@ def test_untyped_envelope_yields_zero_writes(ctx):
 def test_nonfixture_envelope_requires_published_authority(ctx):
     """Shared inbox transport is never authority for a real PAPER action."""
     _write_inbox(ctx, _envelope(fixture=False))
-    summary = _run(ctx)
+    summary = _run(ctx, fixture_mode=False)
     assert summary["orders"] == 0
     assert any("proposal authority" in r["reason"] for r in summary["refusals"])
     assert not any(path == "/orders/preview" for path, _ in ctx["client"].calls)
@@ -362,11 +380,20 @@ def test_no_action_cycle_is_valid(ctx):
     assert summary["proposals_seen"] == 0
 
 
-def test_fixture_proposal_requires_marked_tag(ctx):
-    _write_inbox(ctx, _envelope("prop-fx", fixture=True, fixture_tag="wrong"))
-    summary = _run(ctx)
-    assert summary["orders"] == 0
-    assert any("acceptance-fixture" in r["reason"] for r in summary["refusals"])
+def test_fixture_fields_are_refused_in_production_regardless_of_tag(ctx):
+    """The tag is irrelevant: fixture authority can never come from the inbox.
+
+    Even a correctly-formatted acceptance tag is refused in production mode.
+    """
+    for tag in ("wrong", "paper-acceptance-fixture-v1"):
+        ctx["client"].calls.clear()
+        _write_inbox(ctx, _envelope("prop-fx", fixture=True, fixture_tag=tag))
+        summary = _run(ctx, fixture_mode=False)
+        assert summary["orders"] == 0
+        assert any("fixture authority" in r["reason"] for r in summary["refusals"]), (
+            f"tag={tag!r} reasons={summary['refusals']}"
+        )
+        assert [p for p, _ in ctx["client"].calls if p.startswith("/orders/")] == []
 
 
 def test_runner_has_no_llm_and_no_raw_evidence(tmp_path):

@@ -16,6 +16,10 @@ from typing import Any
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
+from tradehub_research.ops.acceptance_rows import (
+    ACCEPTANCE_RUN_PREFIXES,
+    genuine_clause,
+)
 from tradehub_research.ops.common import ResearchPaths, research_paths
 from tradehub_research.ops.decision_pipeline import DEFAULT_AUTHORITY_DIR
 from tradehub_research.ops.health import forward_health, refresh_health
@@ -101,6 +105,18 @@ def operator_status(
     latest_decision_as_of: str | None = None
     latest_created_at: str | None = None
     latest_proposals = 0
+    # ACCEPTANCE rows are durable, append-only deployment-verification rows.
+    # They are reported separately and NEVER mixed into genuine-production
+    # counts, portfolio performance, forward-learning results, evidence
+    # conclusions, or adaptive training/evaluation inputs.
+    gsql, gparams = genuine_clause()
+    provenance: dict[str, Any] = {
+        "acceptance_run_prefixes": list(ACCEPTANCE_RUN_PREFIXES),
+        "portfolio_runs": {"genuine": 0, "acceptance": 0},
+        "observations": {"genuine": 0, "acceptance": 0},
+        "score_snapshots": {"genuine": 0, "acceptance": 0},
+        "committee_runs": {"genuine": 0, "acceptance": 0},
+    }
     chain: dict[str, Any] = {
         "portfolio_runs_total": 0,
         "observations_total": 0,
@@ -110,14 +126,18 @@ def operator_status(
     with research_db.connect(read_only=True) as conn:
         try:
             chain["portfolio_runs_total"] = conn.execute(
-                "SELECT count(*) FROM portfolio_run"
+                "SELECT count(*) FROM portfolio_run WHERE " + gsql, gparams
             ).fetchone()[0]
             chain["observations_total"] = conn.execute(
-                "SELECT count(*) FROM portfolio_state_observation"
+                "SELECT count(*) FROM portfolio_state_observation o JOIN portfolio_run r "
+                "ON r.run_id = o.run_id WHERE r." + gsql,
+                gparams,
             ).fetchone()[0]
             row = conn.execute(
                 "SELECT run_id, pipeline_run_id, decision_as_of, created_at "
-                "FROM portfolio_run ORDER BY created_at DESC, rowid DESC LIMIT 1"
+                "FROM portfolio_run WHERE " + gsql + " "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                gparams,
             ).fetchone()
             if row:
                 latest_run_id = str(row["run_id"])
@@ -134,6 +154,35 @@ def operator_status(
         except Exception:  # noqa: BLE001 -- optional table
             proposal = None
     chain["authority_records_total"] = _authority_record_count()
+    # Genuine vs acceptance split for the decision chain. Deterministic and
+    # derived from durable run-id labelling only.
+    try:
+        with research_db.connect(read_only=True) as conn:
+            for key, table in (
+                ("portfolio_runs", "portfolio_run"),
+                ("observations", "portfolio_state_observation"),
+                ("score_snapshots", "score_snapshot"),
+                ("committee_runs", "committee_run"),
+            ):
+                if table == "portfolio_state_observation":
+                    total = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                    genuine = conn.execute(
+                        f"SELECT count(*) FROM {table} o JOIN portfolio_run r "
+                        f"ON r.run_id = o.run_id WHERE r." + gsql,
+                        gparams,
+                    ).fetchone()[0]
+                else:
+                    total = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                    genuine = conn.execute(
+                        f"SELECT count(*) FROM {table} WHERE " + gsql, gparams
+                    ).fetchone()[0]
+                provenance[key] = {
+                    "genuine": int(genuine),
+                    "acceptance": int(total) - int(genuine),
+                }
+    except Exception:  # noqa: BLE001 -- optional tables
+        pass
+    chain["provenance"] = provenance
     # The LATEST DECISION's eligible exports are derived from durable state:
     # the proposals persisted for that run, intersected with the published
     # authority records. Deliberately NOT the lifetime authority-file count and

@@ -73,6 +73,13 @@ SANCTIONED_FILES = {
     # import the execution runner to prove policy enforcement and the
     # no-broker-on-empty-inbox contract.
     "tests/test_autonomy_state_transitions.py",
+    # P1 runner-boundary regressions: prove a production envelope cannot
+    # self-grant fixture authority, and that the order size is the quantity
+    # DELTA. Execution-plane tests by construction.
+    "tests/test_autonomy_runner_p1.py",
+    # Disposable-DB E2E: drives the real exporter + production runner boundary
+    # (execution plane) against a throwaway migrated database.
+    "tests/test_disposable_e2e_p66.py",
     # the oracle module itself (hex-encoded terms; RA-03 repeats this pattern)
     "tests/test_portfolio_boundary.py",
 }
