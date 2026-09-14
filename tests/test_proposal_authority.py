@@ -85,6 +85,10 @@ def _publish(authority_dir: Path, envelope: dict, **overrides) -> dict:
         "created_at": "2026-09-14T00:00:00Z",
     }
     record.update(overrides)
+    # Keep the record internally consistent unless a test deliberately
+    # overrides the convenience string to prove the consistency check fires.
+    if "state_transition" not in overrides:
+        record["state_transition"] = f"{record['current_state']}->{record['proposed_state']}"
     _publish_authority(authority_dir, record)
     return record
 
@@ -203,6 +207,18 @@ def test_state_transition_is_recorded_in_authority(tmp_path):
     assert record["current_state"] == "WATCH"
     assert record["proposed_state"] == "ENTER"
     assert record["state_transition"] == "WATCH->ENTER"
+
+
+def test_internally_inconsistent_state_transition_is_refused(tmp_path):
+    """A producer bug writing a mismatched convenience string must be caught.
+
+    The runner recomputes the gate from the record's own bound fields, so the
+    stored string must agree with them or the record is refused outright.
+    """
+    envelope = _envelope()  # fields say WATCH->ENTER
+    _publish(tmp_path, envelope, state_transition="HOLD->EXIT")
+    with pytest.raises(AutonomyRefusal, match="internally inconsistent"):
+        _validate_proposal_authority(tmp_path, envelope, fixture=False)
 
 
 def test_marked_fixture_bypasses_authority(tmp_path):

@@ -165,6 +165,12 @@ def _validate_proposal_authority(
     symbol = str(envelope.get("symbol") or "").upper()
     if not symbol or symbol != str(record.get("canonical_symbol") or "").upper():
         raise AutonomyRefusal("envelope symbol does not match published authority")
+    # The record's own convenience string must agree with its own bound fields.
+    # A producer that wrote a mismatched state_transition is refused outright,
+    # so the policy gate below never has to trust it.
+    derived = f"{record.get('current_state')}->{record.get('proposed_state')}"
+    if record.get("state_transition") not in (None, derived):
+        raise AutonomyRefusal("proposal authority state_transition is internally inconsistent")
     if str(envelope.get("data_as_of", ""))[:10] != str(record.get("data_as_of"))[:10]:
         raise AutonomyRefusal("envelope data_as_of does not match published authority")
     for field in (
@@ -400,10 +406,15 @@ def run_autonomy(
             # This is enforcement of policy.allowed_state_transitions (not a new
             # investment rule) and it runs BEFORE any exposure check, budget
             # charge, or broker call.
-            transition = str(
-                authority.get("state_transition")
-                or f"{proposal.get('current_state')}->{proposal.get('proposed_state')}"
-            )
+            #
+            # The transition is RECOMPUTED from the authority record's own bound
+            # fields, never read from a stored convenience string, so this gate
+            # stays independent of any producer-side formatting bug.
+            if authority:
+                transition = f"{authority.get('current_state')}->{authority.get('proposed_state')}"
+            else:
+                # fixture bypass: no authority record exists by design
+                transition = f"{proposal.get('current_state')}->{proposal.get('proposed_state')}"
             if transition not in set(policy.allowed_state_transitions):
                 raise AutonomyRefusal(
                     f"state transition {transition!r} is not allowed by "

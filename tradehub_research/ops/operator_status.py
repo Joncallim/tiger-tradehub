@@ -130,11 +130,7 @@ def operator_status(
                     "decision_as_of": latest_decision_as_of,
                     "created_at": latest_created_at,
                 }
-                latest_proposals = conn.execute(
-                    "SELECT count(*) FROM trade_proposal WHERE decision_id IN "
-                    "(SELECT decision_id FROM portfolio_state_observation WHERE run_id=?)",
-                    (latest_run_id,),
-                ).fetchone()[0]
+                latest_proposals = 0
         except Exception:  # noqa: BLE001 -- optional table
             proposal = None
     chain["authority_records_total"] = _authority_record_count()

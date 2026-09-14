@@ -188,25 +188,31 @@ def main() -> int:
     )
 
     # 5c. Autonomy with an EMPTY inbox must succeed WITHOUT contacting the
-    # broker, and must leave durable evidence saying so.
+    # broker, and must leave FRESH durable evidence of that specific run. The
+    # 30-minute recovery timer also emits IDLE_EMPTY_INBOX receipts, so the
+    # receipt timestamp must CHANGE for this invocation — otherwise a
+    # "ran but did nothing" regression would pass on a stale ledger tail.
     receipt_before = _last_runner_receipt()
     code, _ = sh(["systemctl", "start", "tradehub-paper-autonomy.service"], timeout=600)
     rcode, result = sh(
         ["systemctl", "show", "tradehub-paper-autonomy.service", "-p", "Result", "--value"]
     )
     receipt_after = _last_runner_receipt()
+    before_at = (receipt_before or {}).get("at")
+    after_at = (receipt_after or {}).get("at")
     check(
-        "autonomy empty-inbox invocation ok (no broker call)",
+        "autonomy empty-inbox invocation ok (no broker call, fresh receipt)",
         code == 0
         and rcode == 0
         and result.strip() == "success"
         and receipt_after is not None
+        and after_at is not None
+        and after_at != before_at
         and receipt_after.get("status") == "IDLE_EMPTY_INBOX"
         and receipt_after.get("broker_contacted") is False
         and receipt_after.get("orders") == 0,
-        f"Result={result.strip()} receipt={receipt_after}",
+        f"Result={result.strip()} receipt at {before_at} -> {after_at}",
     )
-    del receipt_before
 
     # 6. Forward-capture idempotency with REAL evidence: re-running the
     # deployed capture service must insert no duplicate production
