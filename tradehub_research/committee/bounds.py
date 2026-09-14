@@ -48,6 +48,10 @@ MAX_EVIDENCE_ROWS = 256
 #: before hashing. See `scoring.methodology_evidence_projection`.
 SEMANTIC_EVIDENCE_PROJECTION_VERSION = 1
 
+#: Version of the confluence-group projection applied to scored evidence rows.
+#: See `frozen_inputs.scoring_group_labels`.
+SCORING_GROUP_PROJECTION_VERSION = 1
+
 # Number of representative observations retained per aggregated series feature.
 MAX_SERIES_REPRESENTATIVES = 4
 

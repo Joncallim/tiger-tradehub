@@ -13,6 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from tradehub_research.committee.bounds import MAX_EVIDENCE_ROWS
 from tradehub_research.db import normalize_ts
 from tradehub_research.universe import SecurityIdentityStore
 
@@ -218,10 +219,70 @@ def load_frozen_inputs(db: sqlite3.Connection, candidate_id: str) -> FrozenInput
         results=tuple(results),
         evidence_rows=evidence_rows,
         clusters=clusters,
-        groups=compute_groups(evidence_rows, clusters, passing_ids),
+        groups=scoring_group_labels(
+            evidence_rows,
+            clusters,
+            passing_ids,
+            historical_selection(frozen_ids, passing_ids),
+        ),
         frozen_ids=tuple(sorted(frozen_ids)),
         passing_ids=frozenset(passing_ids),
     )
+
+
+def historical_selection(frozen_ids: Any, passing: set[str] | frozenset[str]) -> tuple[str, ...]:
+    """The rows the historical (v1) derivation covered.
+
+    Exactly pack v1's selection: the first ``MAX_EVIDENCE_ROWS`` ids ordered
+    passing-first, then by id.
+    """
+    ordered = sorted(frozen_ids, key=lambda item: (item not in passing, item))
+    return tuple(ordered[:MAX_EVIDENCE_ROWS])
+
+
+def scoring_group_labels(
+    rows: dict[str, Any],
+    clusters: dict[str, list[str]],
+    passing: set[str] | frozenset[str],
+    selection: tuple[str, ...],
+) -> dict[str, str]:
+    """Confluence groups anchored to the historical (v1) derivation.
+
+    pack v1 derived ``underlying_group`` over its **selected rows only** (the
+    first ``MAX_EVIDENCE_ROWS`` passing-first ids), and that derivation is
+    scoring identity: the same frozen inputs must yield the labels the v1 pack
+    scored, or a representation change alone would move ``scored_evidence_hash``
+    and manufacture ``EVIDENCE_DRIVEN`` (review finding P2, round 4). Because
+    component labels are canonicalised over a component's cluster union, looking
+    at more rows can merge components and shift the label of an already-scored
+    row, so the selection-restricted derivation is authoritative for selected
+    rows.
+
+    Rows outside the selection (they exist only for candidates whose v1 pack
+    could never be built) are attached deterministically afterwards: to the
+    merged component's anchor label when the component contains selected rows,
+    otherwise to the full structural label.
+    """
+    anchor_ids = [item for item in selection if item in rows]
+    anchors = compute_groups(
+        {item: rows[item] for item in anchor_ids},
+        {item: clusters[item] for item in anchor_ids},
+        passing & set(anchor_ids),
+    )
+    labels: dict[str, str] = dict(anchors)
+    if len(anchor_ids) == len(rows):
+        return labels
+    structural = compute_groups(rows, clusters, passing)
+    merged: dict[str, set[str]] = {}
+    for evidence_id, anchor_label in anchors.items():
+        merged.setdefault(structural[evidence_id], set()).add(anchor_label)
+    for evidence_id in rows:
+        if evidence_id in labels:
+            continue
+        component = structural[evidence_id]
+        component_anchors = merged.get(component)
+        labels[evidence_id] = min(component_anchors) if component_anchors else component
+    return labels
 
 
 def compute_groups(

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from tradehub_research.committee.bounds import (
+    SCORING_GROUP_PROJECTION_VERSION,
     SCORING_PROJECTION_VERSION,
     SEMANTIC_EVIDENCE_PROJECTION_VERSION,
     bound_feature,
@@ -153,6 +154,7 @@ class ScoringLineageBuilder:
             "lineage_spec_version": LINEAGE_SPEC_VERSION,
             "scoring_projection_version": SCORING_PROJECTION_VERSION,
             "semantic_evidence_projection_version": SEMANTIC_EVIDENCE_PROJECTION_VERSION,
+            "scoring_group_projection_version": SCORING_GROUP_PROJECTION_VERSION,
             "candidate": {"candidate_id": inputs.candidate_id, "security_id": inputs.security_id},
             "run": inputs.run_body(),
             "identity": identity_body(inputs, db),

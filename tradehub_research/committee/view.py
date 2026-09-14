@@ -60,7 +60,7 @@ VIEW_SPEC_VERSION = 1
 VIEW_PACK_SPEC_VERSION = 2
 REPRESENTATION = "BOUNDED_COMMITTEE_VIEW"
 _AGGREGATE = "DETERMINISTIC_AGGREGATE"
-_SERIES_OMISSION_SEMANTICS = "representation_compaction_full_lineage_retained"
+_SERIES_OMISSION_SEMANTICS = "representation_compaction_of_frozen_observations_retained_in_lineage"
 _INTERPRETIVE_OMISSION_SEMANTICS = "capacity_bound_not_presented_and_not_aggregated"
 
 
@@ -76,6 +76,10 @@ def _omission_semantics() -> dict[str, str]:
     """
     return {
         "series_observations": _SERIES_OMISSION_SEMANTICS,
+        "series_references_outside_frozen_set": (
+            "referenced by a feature's series but not part of this candidate's frozen "
+            "evidence; these are in no lineage and in no aggregate"
+        ),
         "interpretive_rows": _INTERPRETIVE_OMISSION_SEMANTICS,
         "data_quality_signal": (
             "neither omission kind is a data-quality signal; coverage is reported by each "
@@ -97,6 +101,21 @@ class CommitteeView:
 
 def _observation_sort_key(item: dict[str, Any]) -> tuple[str, str]:
     return (str(item.get("session_date") or ""), str(item.get("evidence_id") or ""))
+
+
+def resolve_aggregate(features: Any, path: str) -> dict[str, Any]:
+    """Resolve the *shipped* aggregate object for an aggregate path.
+
+    ``truncate_strings`` rebuilds the feature tree, so the object that ends up in
+    ``screens[].raw_features`` is a copy of the one the builder collected. Trim
+    must be applied to the copy that actually ships (review finding P1, round 4),
+    which is what this locator provides.
+    """
+    relative = path.split("/raw_features/", 1)[1].split("/")
+    cursor: Any = features
+    for part in relative:
+        cursor = cursor[int(part)] if isinstance(cursor, list) else cursor[part]
+    return cursor
 
 
 def _series_aggregate(
@@ -129,12 +148,19 @@ def _series_aggregate(
     else:
         head = MAX_SERIES_REPRESENTATIVES // 2
         presented = ordered[:head] + ordered[-(MAX_SERIES_REPRESENTATIVES - head) :]
+    compacted = len(ordered) - len(presented)
     return {
         "value": value.get("value"),
         "unit": value.get("unit"),
         "representation": _AGGREGATE,
         "observation_count": total,
         "observations_presented": len(presented),
+        # Split deliberately (review finding P3, round 4): observations that are
+        # frozen evidence but only present in aggregate form are retained in the
+        # scoring lineage, while observations referenced by the feature but never
+        # part of this candidate's frozen evidence are in no lineage at all.
+        "observations_compacted": compacted,
+        "observations_not_frozen": total - len(ordered),
         "observations_omitted": total - len(presented),
         "session_date_range": (
             [full_sorted[0].get("session_date"), full_sorted[-1].get("session_date")]
@@ -229,6 +255,11 @@ class CommitteeViewBuilder:
             return stored
         if lineage is None:
             lineage = ScoringLineageBuilder(self.database).build(candidate_id)
+        elif (lineage.body.get("candidate") or {}).get("candidate_id") != candidate_id:
+            # Defence in depth (review finding P3, round 4): the view embeds the
+            # lineage by hash and the run mapping trusts that reference, so a
+            # foreign lineage must never be accepted silently.
+            raise DeterminismError("committee view lineage belongs to a different candidate")
         with self.database.connect() as db:
             db.execute("BEGIN")
             stored = self._verify_stored(
@@ -268,6 +299,7 @@ class CommitteeViewBuilder:
         aggregated_ids: set[str] = set()
         representative_ids: list[str] = []
         series_references = 0
+        series_not_frozen = 0
         admissible_ids = set(inputs.evidence_rows)
         for item in inputs.results:
             row = item.row
@@ -401,13 +433,16 @@ class CommitteeViewBuilder:
         presented_ids: list[str] = []
         reasons: dict[str, int] = {}
         running = 0
+        # Probe rows must not leave truncation receipts behind (review finding P3,
+        # round 4): only the rows that are finally presented are recorded.
+        probe_truncations: list[dict[str, Any]] = []
 
         def _admit(evidence_id: str) -> bool:
             nonlocal running
             if len(presented_ids) >= MAX_VIEW_EVIDENCE_ROWS:
                 reasons["row_cap"] = reasons.get("row_cap", 0) + 1
                 return False
-            probe = self._evidence_row(inputs, evidence_id, {}, truncations)
+            probe = self._evidence_row(inputs, evidence_id, {}, probe_truncations)
             if probe is None:
                 reasons["structured_row_oversize"] = reasons.get("structured_row_oversize", 0) + 1
                 return False
@@ -446,14 +481,17 @@ class CommitteeViewBuilder:
         ]
         presented = [row for row in presented if row is not None]
         visible_ids = {row["evidence_id"] for row in presented}
-        # Trim every aggregate to the observations actually presented, so the
-        # model-visible aggregate copy and the per-screen summary agree exactly
-        # and neither can advertise an id that is not a citable evidence row
-        # (review finding P1, round 3).
+        # Trim the *shipped* copy of every aggregate and derive the per-screen
+        # summary from that same object, so the two can never disagree and neither
+        # can advertise an id that is not a citable evidence row (review findings
+        # P1/P2, round 4). truncate_strings rebuilds the feature tree, so the trim
+        # must resolve the aggregate inside the shipped copy, not the pre-copy
+        # object the builder collected.
         for screen in screens:
             meta: list[dict[str, Any]] = []
+            shipped = screen["raw_features"]
             for pair in screen_aggregates[screen["screen_result_id"]]:
-                aggregate = pair["aggregate"]
+                aggregate = resolve_aggregate(shipped, pair["path"])
                 admitted = [
                     evidence_id
                     for evidence_id in aggregate["representative_evidence_ids"]
@@ -467,11 +505,14 @@ class CommitteeViewBuilder:
                 ]
                 aggregate["observations_presented"] = len(admitted)
                 aggregate["observations_omitted"] = aggregate["observation_count"] - len(admitted)
+                series_not_frozen += aggregate["observations_not_frozen"]
                 meta.append(
                     {
                         "path": pair["path"],
                         "observation_count": aggregate["observation_count"],
                         "observations_presented": aggregate["observations_presented"],
+                        "observations_compacted": aggregate["observations_compacted"],
+                        "observations_not_frozen": aggregate["observations_not_frozen"],
                         "observations_omitted": aggregate["observations_omitted"],
                         "session_date_range": aggregate["session_date_range"],
                         "lineage_set_hash": aggregate["lineage_set_hash"],
@@ -479,15 +520,15 @@ class CommitteeViewBuilder:
                     }
                 )
             screen["series_aggregates"] = meta
-            if meta:
-                screen["evidence_ids"] = [
-                    evidence_id
-                    for entry in meta
-                    for evidence_id in entry["representative_evidence_ids"]
-                ]
-                screen["evidence_ids_omitted"] = screen["evidence_id_count"] - len(
-                    screen["evidence_ids"]
-                )
+            # Every screen, series or not, is reconciled with what was actually
+            # admitted (review finding P2, round 4): a declared id that admission
+            # declined must not be advertised as present with omitted == 0.
+            screen["evidence_ids"] = [
+                evidence_id for evidence_id in screen["evidence_ids"] if evidence_id in visible_ids
+            ]
+            screen["evidence_ids_omitted"] = screen["evidence_id_count"] - len(
+                screen["evidence_ids"]
+            )
         representative_presented = sum(
             1 for evidence_id in representative_ids if evidence_id in visible_ids
         )
@@ -499,6 +540,7 @@ class CommitteeViewBuilder:
             "count": omitted_interpretive + omitted_series,
             "interpretive_omitted": omitted_interpretive,
             "series_observations_omitted": omitted_series,
+            "series_references_not_frozen": series_not_frozen,
             "series_representatives_presented": representative_presented,
             "reasons": dict(sorted(reasons.items())),
             "semantics": skeleton["evidence_omitted"]["semantics"],

@@ -79,11 +79,21 @@ append-only `committee_run_lineage` mapping table (see migration/rollback below)
 
 The view is self-describing and machine-checkable: `representation`,
 `model_honesty.{citation_scope, reasoning_scope, aggregate_fields_are_code_computed,
-omitted_observations_are_not_missing_data,
+series_omissions_are_aggregate_represented, interpretive_omissions_are_not_aggregated,
+omission_counts_are_not_data_quality,
 lineage_set_hash_is_an_identity_not_market_evidence}`,
 `evidence_omitted.{interpretive_omitted, series_observations_omitted,
-omission_semantics}`, per-screen `series_aggregates[]` with counts, session-date
-range and `lineage_set_hash`.
+series_references_not_frozen, series_representatives_presented, semantics}`, and
+per-screen `series_aggregates[]` with `observation_count`,
+`observations_presented`, `observations_compacted`, `observations_not_frozen`,
+session-date range and `lineage_set_hash`.
+
+Two invariants hold by construction and are asserted by regressions: every
+`representative_evidence_ids` entry an aggregate advertises (in the shipped
+`raw_features` copy and in the per-screen summary alike) is a citable
+`body["evidence"]` row, and every screen's `evidence_ids` is reconciled with what
+was actually admitted. Observations a feature references but that are not this
+candidate's frozen evidence are counted separately and carry no retention claim.
 
 The model may cite only evidence rows present in the view (the assessment
 firewall builds `in_pack` from `body["evidence"]`, so an omitted observation id is
@@ -187,6 +197,15 @@ The 160 KB view cap is unchanged (no bound was relaxed to make this fit).
 - [x] explicit statement of what the bounded view omits and how the model is told
 - [x] migration is rollback-safe; v1 artifact identity reproduced
 - [x] committee work pinned to an exact artifact, fail-closed
+
+## Review rounds — independent adversarial review of the complete architecture
+
+| round | verdict | findings | disposition |
+|---|---|---|---|
+| 1 | REJECT | P1 methodology identity inherited the model-facing row cap; P2 exact-pin enforcement; P2 overstated rollback claim; P3 shared omission label | all fixed (`c460124`) |
+| 2 | REJECT | P1 scoring cap aliased to the view cap; P2 small series serialized raw; P2 run→lineage mapping trusted the caller; P3 pre-work window | all fixed (`259ec2a`) |
+| 3 | REJECT | P1 an aggregate could advertise a representative that is never presented | fixed (`ef3ef5b`) |
+| 4 | REJECT | **P1** the trim never reached the shipped `raw_features` copy (`truncate_strings` rebuilds the tree); **P2** screens' `evidence_ids` unreconciled with admission; **P2** confluence groups derived over all frozen rows while pack v1 derived over its selection, so a merge caused by rows outside it could move `scored_evidence_hash`; P3 foreign lineage accepted; P3 doc/skill field-name drift; P3 series counts conflated "not frozen" with "compacted"; P3 probe rows double-recorded truncation receipts | all fixed (`ef3ef5b` → this commit) |
 
 ## First integrated review — REJECT, and disposition
 

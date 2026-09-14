@@ -344,11 +344,14 @@ def test_view_report_is_honest_about_aggregation_and_omission(tmp_path):
     assert body["model_honesty"]["lineage_set_hash_is_an_identity_not_market_evidence"] is True
     # The two omission kinds must not share a label (review finding P3).
     semantics = body["evidence_omitted"]["semantics"]
-    assert semantics["series_observations"] == ("representation_compaction_full_lineage_retained")
+    assert semantics["series_observations"] == (
+        "representation_compaction_of_frozen_observations_retained_in_lineage"
+    )
+    assert "series_references_outside_frozen_set" in semantics
     assert semantics["interpretive_rows"] == ("capacity_bound_not_presented_and_not_aggregated")
     assert semantics["series_observations"] != semantics["interpretive_rows"]
     assert body["series_representation"]["omission_semantics"] == (
-        "representation_compaction_full_lineage_retained"
+        "representation_compaction_of_frozen_observations_retained_in_lineage"
     )
     momentum = next(
         entry for entry in body["screens"] if entry["family"] == "momentum_confirmation"
