@@ -9,12 +9,18 @@ Never modifies state; never tunes anything.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 ALERTS: list[str] = []
 ACK_FILE = Path("/var/lib/tradehub-research/autonomy/acknowledged_events.json")
 DUPLICATE_WINDOW_MINUTES = 60  # a scheduler overlap/restart re-fire hazard window
+#: How long the watch may spend on automatic remediation before it must report.
+#: Bounded recovery: the nightly job reports on schedule and the checkpoint
+#: resumes next cycle instead of the watch sitting inside the provider's hourly
+#: quota window (fetch_one waits up to 12 h by design).
+HEALTH_WATCH_REMEDIATION_SECONDS = float(os.environ.get("TRADEHUB_WATCH_REMEDIATION_SECONDS", 900))
 
 
 def _acknowledged() -> set[tuple[str, str]]:
@@ -98,15 +104,171 @@ def check_cycle_health(paths) -> None:
             _alert(f"duplicate cycle on {day} (as_of {as_of}, {gap_minutes:.0f} min apart)")
 
 
-def check_data_freshness(settings, paths) -> None:
-    """Stale evidence / failed ingestion."""
-    from tradehub_research.ops.health import refresh_health
+def _incident_log(paths):
+    return paths.research_dir / "freshness_incidents.jsonl"
 
-    refr = refresh_health(settings=settings, paths=paths)
-    if refr.get("stale_count"):
-        _alert(f"{refr['stale_count']} securities stale (behind {refr.get('as_of')})")
-    if not refr.get("with_bars") and not refr.get("stale_count"):
-        _alert("no market data present")
+
+def _record_incident(paths, payload: dict) -> None:
+    """Append-only structured evidence. Idempotent per incident_id."""
+    import os as _os
+
+    path = _incident_log(paths)
+    incident = payload.get("incident_id")
+    try:
+        if path.exists() and incident:
+            for line in path.read_text().splitlines():
+                if line.strip() and f'"incident_id": "{incident}"' in line:
+                    return  # already recorded; never double-log the same incident
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError:
+        pass  # evidence must never break the watch
+    del _os
+
+
+def render_freshness_report(audit, after, summary, residual) -> list[str]:
+    """The operator-facing report. Pure: no I/O, so its shape is testable.
+
+    Two forms:
+      * AUTO-RECOVERED -- everything repaired inside the normal cycle. This is a
+        *quiet success report*, not an alert, and carries no examples because
+        there is nothing for a human to do.
+      * DATA FRESHNESS DEGRADED -- actionable: root causes grouped, oldest
+        unresolved datum, downstream protection, and per-symbol examples.
+    """
+    lines: list[str] = []
+    if not audit.stale:
+        return lines  # no incident at all: the watch stays silent
+    if not after.stale:
+        lines.append("TRADEHUB WATCH — AUTO-RECOVERED")
+        lines.append(f"Expected session: {audit.expected_session}")
+        lines.append(f"Initially stale: {audit.stale_count}")
+        lines.append(f"Repaired: {summary['repaired']}")
+        lines.append(f"Excluded legitimate exceptions: {summary['excluded']}")
+        lines.append("Remaining stale: 0")
+        lines.append("Downstream signals: healthy")
+        return lines
+
+    oldest = min((s.last_bar for s in after.stale if s.last_bar), default=None)
+    lines.append("TRADEHUB WATCH — DATA FRESHNESS DEGRADED")
+    lines.append(f"Expected session: {audit.expected_session}")
+    lines.append(f"Universe: {audit.universe:,}")
+    lines.append(f"Fresh: {audit.fresh:,}")
+    lines.append(f"Initially stale: {audit.stale_count:,}")
+    lines.append("")
+    lines.append("Automatic remediation:")
+    lines.append(f"- {summary['repaired']:,} repaired successfully")
+    lines.append(f"- {summary['excluded']:,} excluded as valid non-trading/delisted exceptions")
+    lines.append(f"- {after.stale_count:,} remain unresolved")
+    lines.append("")
+    lines.append("Root causes:")
+    for cause, members in sorted(audit.groups.items(), key=lambda kv: -len(kv[1])):
+        lines.append(f"- {len(members):,} {cause.replace('_', ' ').lower()}")
+    if oldest:
+        lines.append("")
+        lines.append(f"Oldest unresolved data: {oldest}")
+    lines.append("")
+    lines.append("Downstream protection:")
+    lines.append(f"- {residual['active']:,} securities marked DATA_STALE")
+    lines.append("- excluded from affected signals")
+    if summary.get("quota_blocked"):
+        lines.append("- remediation paused on the provider quota reserve (resumes next cycle)")
+    lines.append("")
+    lines.append("Status: NEEDS ATTENTION")
+    examples = after.stale[:8]
+    if examples:
+        lines.append("")
+        lines.append("Unresolved examples:")
+        for s in examples:
+            lines.append(
+                f"{s.ticker} — {s.last_bar or 'no bars'} — {s.classification} — "
+                f"{s.last_attempt_at or 'not attempted'}"
+            )
+    return lines
+
+
+def check_data_freshness(settings, paths) -> None:
+    """Diagnose -> remediate -> verify -> protect downstream -> report.
+
+    Replaces the passive "N securities stale" alert. Emits a report only after
+    remediation has run (or when the condition needs a human); stays silent when
+    there is nothing wrong.
+    """
+    from tradehub_research.ops import data_freshness as df
+    from tradehub_research.ops.downstream_guard import sync_quarantine
+    from tradehub_research.validation.experiment_db import ExperimentDB
+
+    experiment_db = ExperimentDB(paths.experiment_db)
+    audit = df.audit_universe(settings=settings, paths=paths, experiment_db=experiment_db)
+
+    quarantined = sync_quarantine(
+        [s.__dict__ for s in audit.stale],
+        expected_session=audit.expected_session,
+        research_dir=paths.research_dir,
+    )
+
+    if not audit.stale:
+        if quarantined["cleared"]:
+            _alert(
+                "DATA FRESHNESS RECOVERED: "
+                f"{len(quarantined['cleared'])} securities returned to downstream signals"
+            )
+        return  # healthy: silent (quarantine reconciliation already happened)
+
+    summary = df.remediate(
+        settings=settings, paths=paths, experiment_db=experiment_db, audit=audit,
+        time_budget_seconds=HEALTH_WATCH_REMEDIATION_SECONDS,
+    )
+    verification = df.verify(settings=settings, paths=paths, run_key=summary["run_key"])
+    after = df.audit_universe(settings=settings, paths=paths, experiment_db=experiment_db)
+    residual = sync_quarantine(
+        [s.__dict__ for s in after.stale],
+        expected_session=after.expected_session,
+        research_dir=paths.research_dir,
+    )
+
+    oldest = min((s.last_bar for s in after.stale if s.last_bar), default=None)
+    _record_incident(
+        paths,
+        {
+            "incident_id": df.incident_id(audit.expected_session, [s.ticker for s in audit.stale]),
+            "expected_session": audit.expected_session,
+            "detected_at": audit.generated_at,
+            "universe": audit.universe,
+            "fresh": audit.fresh,
+            "initially_stale": audit.stale_count,
+            "root_causes": {k: len(v) for k, v in sorted(audit.groups.items())},
+            "remediation": {
+                "run_key": summary["run_key"],
+                "targeted": summary["targeted"],
+                "repaired": summary["repaired"],
+                "excluded": summary["excluded"],
+                "unresolved": summary["unresolved"],
+                "attempts": summary["attempts"],
+                "quota_blocked": summary["quota_blocked"],
+            },
+            "verification": {
+                "repaired_verified": verification["repaired_verified"],
+                "checkpoint_consistent": verification["checkpoint_consistent"],
+                "duplicate_symbols": verification["duplicate_symbols"],
+            },
+            "remaining_stale": after.stale_count,
+            "oldest_unresolved": oldest,
+            "downstream": {"quarantined_active": residual["active"]},
+            "disposition": "NEEDS_ATTENTION" if after.stale_count else "AUTO_RECOVERED",
+            "unresolved_examples": [
+                {
+                    "ticker": s.ticker,
+                    "last_bar": s.last_bar,
+                    "classification": s.classification,
+                    "attempted": bool(s.last_attempt_at),
+                }
+                for s in after.stale[:8]
+            ],
+        },
+    )
+    ALERTS.extend(render_freshness_report(audit, after, summary, residual))
 
 
 def check_forward_ledger(experiment_db, paths) -> None:

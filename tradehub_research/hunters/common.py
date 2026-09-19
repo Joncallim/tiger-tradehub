@@ -221,10 +221,32 @@ def instant_fact_at_or_before(
 # ---------------------------------------------------------------------------
 
 
+def data_stale(security_id: SecurityId) -> bool:
+    """True when the security is quarantined for stale required market data.
+
+    Downstream protection (2026-09-19): a name whose bars are behind the
+    expected session must not feed scans, rankings, momentum/valuation screens,
+    signals, recommendations or execution. Only the PRICE series is withheld --
+    fundamentals and corporate actions keep flowing so a strategy that does not
+    depend on a fresh price can still run.
+    """
+    from tradehub_research.ops.downstream_guard import is_data_stale
+
+    return is_data_stale(str(security_id))
+
+
 def eligible_bars(
     ctx: ScreenContext, security_id: SecurityId, as_of: datetime
 ) -> list[dict[str, Any]]:
-    """Raw session bars whose 20:15 ET boundary has passed, session-ordered."""
+    """Raw session bars whose 20:15 ET boundary has passed, session-ordered.
+
+    Returns [] for a DATA_STALE security. This is deliberately an empty series
+    rather than a substituted one: no forward-fill, no last-close carry, no
+    synthesised bar. Consumers see "insufficient data" and drop the name
+    honestly instead of ranking it on stale prices.
+    """
+    if data_stale(security_id):
+        return []
     bars = [
         bar
         for bar in ctx.price_bars.get(security_id, [])

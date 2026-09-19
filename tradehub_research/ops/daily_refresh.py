@@ -42,12 +42,50 @@ from tradehub_research.validation.experiment_db import ExperimentDB
 
 INCREMENTAL_LOOKBACK_SESSIONS = 10
 ACTIVE_SET_MAX_REQUESTS = 60
+#: Floor for the rotation. The EFFECTIVE budget is computed per run from the
+#: universe size and the rolling window (see `rotation_budget_for`) so the
+#: refresh cannot advertise a freshness contract it is arithmetically unable to
+#: deliver -- the 2026-09-19 incident: 40/day against 443 names inside a
+#: 6-session window (needs 74/day), leaving a 323-name cohort permanently past
+#: the contract.
 ROTATION_REQUESTS_PER_RUN = 40
+#: Hard ceiling so a runaway universe cannot turn the rotation into a hammer.
+#: The provider quota (45/hr, 900/day reserve) still gates every request.
+ROTATION_REQUESTS_MAX = 200
 REFRESH_STALENESS_DAYS = 7
 # A symbol whose fetch returns 0 bars despite a data gap this long is treated
 # as delisted/unresolvable (Tiingo returns 200-with-empty for delisted names).
 RETIRE_GAP_DAYS = 14
 RETIRED_FILE = Path("/var/lib/tradehub-research/autonomy/retired_securities.json")
+
+
+def rotation_budget_for(universe: int, *, window_sessions: int | None = None,
+                        as_of: date | None = None) -> int:
+    """Rotation requests needed per run to hold the freshness contract.
+
+    Converts the design's calendar-day window (REFRESH_STALENESS_DAYS) into the
+    sessions inside it -- the unit a market-data contract is actually measured
+    in -- then returns ceil(universe / window_sessions), clamped to
+    [ROTATION_REQUESTS_PER_RUN, ROTATION_REQUESTS_MAX].
+    """
+    from tradehub_research.ops.market_calendar import count_sessions, expected_latest_session
+
+    as_of = as_of or expected_latest_session()
+    if window_sessions is None:
+        window_sessions = max(
+            count_sessions(as_of - timedelta(days=REFRESH_STALENESS_DAYS), as_of), 1
+        )
+    required = -(-universe // window_sessions)
+    return max(ROTATION_REQUESTS_PER_RUN, min(required, ROTATION_REQUESTS_MAX))
+
+
+def _sessions_behind(last: str | None, as_of: date) -> int:
+    """Expected sessions strictly after ``last`` up to ``as_of`` (-1 = no bars)."""
+    from tradehub_research.ops.market_calendar import sessions_behind
+
+    if last is None:
+        return -1
+    return sessions_behind(date.fromisoformat(str(last)[:10]), as_of)
 
 
 def _load_retired() -> set[str]:
@@ -249,9 +287,21 @@ def run_daily_refresh(
                 continue
             _refresh_one(adapter, quota, research_db, experiment_db, store, ticker, as_of, summary)
             summary["active_refreshed"] += 1
-        # 2. Rotation: cohort symbols not refreshed within REFRESH_STALENESS_DAYS.
+        # 2. Rotation: cohort symbols not refreshed within the rolling window.
+        #    The window is measured in SESSIONS, not calendar days: weekends and
+        #    holidays must never count against a symbol, and the budget is sized to
+        #    the universe so the contract is achievable by construction.
         rotated = 0
         retired = _load_retired()
+        from tradehub_research.ops.market_calendar import count_sessions
+
+        window_sessions = max(
+            count_sessions(as_of - timedelta(days=REFRESH_STALENESS_DAYS), as_of), 1
+        )
+        if rotation_budget is None or rotation_budget == ROTATION_REQUESTS_PER_RUN:
+            rotation_budget = rotation_budget_for(len(by_ticker), window_sessions=window_sessions, as_of=as_of)
+        summary["rotation_budget"] = rotation_budget
+        summary["window_sessions"] = window_sessions
         for ticker in sorted(by_ticker):
             if rotated >= rotation_budget:
                 break
@@ -259,10 +309,7 @@ def run_daily_refresh(
                 continue  # delisted/unresolvable -- no longer fetched
             sid = by_ticker[ticker]
             last = _last_bar_date(research_db, sid)
-            if (
-                last is not None
-                and last >= (as_of - timedelta(days=REFRESH_STALENESS_DAYS)).isoformat()
-            ):
+            if last is not None and _sessions_behind(last, as_of) <= window_sessions:
                 summary["SKIPPED_FRESH"] += 1
                 continue
             if symbol_has_evidence(research_db, ticker) is False:
