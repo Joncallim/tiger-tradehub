@@ -56,7 +56,11 @@ def _last_weekday(year: int, month: int, weekday: int) -> date:
 
 
 def _easter_sunday(year: int) -> date:
-    """Anonymous Gregorian (Meeus/Jones/Butcher) Easter computation."""
+    """Anonymous Gregorian (Meeus/Jones/Butcher) Easter computation.
+
+    The canonical presentation uses the variable names a..m; `l` is renamed `ell`
+    because a single lowercase l is ambiguous (ruff E741).
+    """
     a = year % 19
     b, c = divmod(year, 100)
     d, e = divmod(b, 4)
@@ -64,9 +68,9 @@ def _easter_sunday(year: int) -> date:
     g = (b - f + 1) // 3
     h = (19 * a + b - d - g + 15) % 30
     i, k = divmod(c, 4)
-    l = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * l) // 451
-    month, day = divmod(h + l - 7 * m + 114, 31)
+    ell = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * ell) // 451
+    month, day = divmod(h + ell - 7 * m + 114, 31)
     return date(year, month, day + 1)
 
 

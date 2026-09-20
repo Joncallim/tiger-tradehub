@@ -116,15 +116,36 @@ def mark_data_stale(
     research_dir: Path | None = None,
     now: datetime | None = None,
 ) -> bool:
-    """Quarantine a security. Idempotent: an active record is left untouched.
+    """Quarantine a security.
 
-    Returns True when a new quarantine was written.
+    Returns True only when a NEW quarantine was created, so callers can report
+    newly-marked symbols idempotently. An existing active record is never
+    duplicated -- but its metadata IS refreshed when the classification or
+    expected session has changed, because a stale reason string makes the audit
+    trail contradict the audit (METRY kept reading FETCHED_NOT_STORED after it
+    had been correctly reclassified as an unpublished-session timing fault).
+    ``classified_at`` preserves when the security was FIRST quarantined;
+    ``reason_updated_at`` records the refresh.
     """
     path = quarantine_path(research_dir)
     items = _load(path)
     sid = str(security_id)
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
     for item in items:
         if str(item.get("security_id")) == sid and not item.get("cleared_at"):
+            changed = False
+            for field, value in (
+                ("ticker", ticker),
+                ("expected_session", expected_session),
+                ("reason", reason),
+            ):
+                if value is not None and item.get(field) != value:
+                    item[field] = value
+                    changed = True
+            if changed:
+                item["reason_updated_at"] = stamp
+                _write(path, items)
+                _invalidate()
             return False
     items.append(
         {
@@ -132,7 +153,8 @@ def mark_data_stale(
             "ticker": ticker,
             "expected_session": expected_session,
             "reason": reason,
-            "classified_at": (now or datetime.now(timezone.utc)).isoformat(),
+            "classified_at": stamp,
+            "reason_updated_at": None,
             "cleared_at": None,
         }
     )

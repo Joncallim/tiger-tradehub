@@ -35,8 +35,9 @@ What this module guarantees
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 #: Provider ceiling on distinct symbols per rolling month.
 DEFAULT_SYMBOL_LIMIT = 450
@@ -123,9 +124,7 @@ def plan_symbol_capacity(
     usage = quota.bootstrap_usage(now, limit) if hasattr(quota, "bootstrap_usage") else {}
     reserved = {str(row["symbol"]).upper() for row in usage.get("symbols", [])}
     used = int(usage.get("used", len(reserved)))
-    stamps = [
-        float(row.get("first_requested_at") or 0.0) for row in usage.get("symbols", [])
-    ]
+    stamps = [float(row.get("first_requested_at") or 0.0) for row in usage.get("symbols", [])]
     next_headroom_at = (min(stamps) + ROLLING_WINDOW_SECONDS) if stamps else None
 
     plan = CapacityPlan(limit=limit, used=used, next_headroom_at=next_headroom_at)

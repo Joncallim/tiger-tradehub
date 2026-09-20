@@ -60,8 +60,9 @@ RETIRE_GAP_DAYS = 14
 RETIRED_FILE = Path("/var/lib/tradehub-research/autonomy/retired_securities.json")
 
 
-def rotation_budget_for(universe: int, *, window_sessions: int | None = None,
-                        as_of: date | None = None) -> int:
+def rotation_budget_for(
+    universe: int, *, window_sessions: int | None = None, as_of: date | None = None
+) -> int:
     """Rotation requests needed per run to hold the freshness contract.
 
     Converts the design's calendar-day window (REFRESH_STALENESS_DAYS) into the
@@ -301,7 +302,9 @@ def run_daily_refresh(
             count_sessions(as_of - timedelta(days=REFRESH_STALENESS_DAYS), as_of), 1
         )
         if rotation_budget is None or rotation_budget == ROTATION_REQUESTS_PER_RUN:
-            rotation_budget = rotation_budget_for(len(by_ticker), window_sessions=window_sessions, as_of=as_of)
+            rotation_budget = rotation_budget_for(
+                len(by_ticker), window_sessions=window_sessions, as_of=as_of
+            )
         summary["rotation_budget"] = rotation_budget
         summary["window_sessions"] = window_sessions
 

@@ -44,7 +44,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from tradehub_research.ops.common import ResearchPaths, research_paths
-from tradehub_research.ops.market_calendar import count_sessions, expected_latest_session, sessions_behind
+from tradehub_research.ops.market_calendar import (
+    count_sessions,
+    expected_latest_session,
+    sessions_behind,
+)
 
 # --- retry budget -----------------------------------------------------------
 MAX_ATTEMPTS_PER_RUN = 3  # immediate retries for transient failures
@@ -174,14 +178,19 @@ class CheckpointStore:
             )
 
     def seed_symbol(
-        self, run_key: str, ticker: str, security_id: str | None, last_bar: str | None,
+        self,
+        run_key: str,
+        ticker: str,
+        security_id: str | None,
+        last_bar: str | None,
         classification: str,
     ) -> None:
         """Idempotent: an existing row keeps its attempts/outcome."""
         with self._connect() as db:
             db.execute(
                 "INSERT OR IGNORE INTO remediation_symbol"
-                "(run_key, ticker, security_id, last_bar_before, classification) VALUES (?,?,?,?,?)",
+                "(run_key, ticker, security_id, last_bar_before, classification)"
+                " VALUES (?,?,?,?,?)",
                 (run_key, ticker, security_id, last_bar, classification),
             )
 
@@ -203,7 +212,12 @@ class CheckpointStore:
             ).fetchall()
 
     def record_attempt(
-        self, run_key: str, ticker: str, *, error: str | None, next_attempt_at: str | None,
+        self,
+        run_key: str,
+        ticker: str,
+        *,
+        error: str | None,
+        next_attempt_at: str | None,
     ) -> int:
         with self._connect() as db:
             db.execute(
@@ -218,8 +232,14 @@ class CheckpointStore:
         return int(row["attempts"]) if row else 0
 
     def settle(
-        self, run_key: str, ticker: str, *, disposition: str, last_bar_after: str | None,
-        classification: str | None = None, verified: bool = True,
+        self,
+        run_key: str,
+        ticker: str,
+        *,
+        disposition: str,
+        last_bar_after: str | None,
+        classification: str | None = None,
+        verified: bool = True,
     ) -> None:
         with self._connect() as db:
             db.execute(
@@ -248,11 +268,89 @@ class CheckpointStore:
             status = db.execute(
                 "SELECT status FROM remediation_run WHERE run_key=?", (run_key,)
             ).fetchone()
-        return pending == 0 and status is not None and status["status"] in ("COMPLETED", "ESCALATED")
+        return (
+            pending == 0 and status is not None and status["status"] in ("COMPLETED", "ESCALATED")
+        )
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Exception boundary
+# ---------------------------------------------------------------------------
+# Two classes of failure must never be conflated:
+#
+#   * OPERATIONAL failures -- a provider error, a rate limit, a disk full while
+#     appending evidence. These are expected, they get classified, and they are
+#     recorded against the symbol or the incident.
+#   * PROGRAMMING faults -- NameError, AttributeError, TypeError, a missing
+#     dependency, malformed internal state. These mean the code is wrong. If they
+#     are classified as "NETWORK" or swallowed by a broad `except Exception`,
+#     a broken build reports healthy, and a real bug hides behind a plausible
+#     data-freshness story. They must propagate.
+PROGRAMMING_FAULTS = (
+    NameError,  # e.g. a name that was never imported -- the defect this guards
+    AttributeError,
+    TypeError,
+    KeyError,
+    NotImplementedError,
+    ImportError,  # missing dependency
+    AssertionError,
+)
+
+#: I/O failures when persisting authoritative remediation evidence.
+LEDGER_IO_FAILURES = (sqlite3.Error, OSError)
+
+
+class LedgerPersistenceError(RuntimeError):
+    """Authoritative remediation evidence could not be persisted.
+
+    Raised instead of proceeding: the post-remediation accounting is derived from
+    the audit, and the audit classifies from the append-only ledger. If a
+    delisting finding cannot be written there, the checkpoint and the ledger
+    disagree forever and the health report would claim a reconciliation it cannot
+    support. So this fails closed, loudly, rather than emitting a report.
+    """
+
+
+def _quota_hourly_remaining(adapter) -> int | None:
+    """Hourly provider budget left, or None when it cannot be read.
+
+    Boundary: an expected I/O failure (unreadable quota state file) yields None so
+    the caller proceeds and lets the request itself decide -- a wrong
+    "exhausted" verdict would silently skip the queue. A programming fault
+    propagates, because it means the quota object or this call is wrong.
+    """
+    try:
+        remaining = adapter.quota.remaining(datetime.now(timezone.utc).timestamp())
+    except LEDGER_IO_FAILURES:
+        return None
+    return remaining.get("hourly")
+
+
+def _ledger_write(experiment_db, *, ticker: str, error: str) -> None:
+    """Append the EMPTY/delisting finding to the authoritative ledger.
+
+    Fails closed on an expected I/O error; lets anything else (including a
+    programming fault such as a missing import) propagate untouched.
+    """
+    from tradehub_research.backfill.tiingo_driver import record_attempt
+
+    try:
+        record_attempt(
+            experiment_db,
+            ticker=ticker,
+            status="ERROR",
+            http_status=None,
+            bytes_count=None,
+            error=error,
+        )
+    except LEDGER_IO_FAILURES as exc:
+        raise LedgerPersistenceError(
+            f"could not persist remediation evidence for {ticker}: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def run_key_for(expected_session: date) -> str:
@@ -402,11 +500,17 @@ def _last_bar(research_db, security_id: str) -> str | None:
             "FROM evidence_event WHERE security_id=? AND source_id='tiingo_eod'",
             (security_id,),
         ).fetchone()
-    return (row["d"] if row and row["d"] else None)
+    return row["d"] if row and row["d"] else None
 
 
 def _last_attempt(experiment_db, ticker: str) -> dict | None:
-    """Most recent ingestion attempt for a symbol, from the append-only ledger."""
+    """Most recent ingestion attempt for a symbol, from the append-only ledger.
+
+    Only an expected ledger failure is tolerated (an older ledger schema must not
+    break the audit); a programming fault propagates.
+    """
+    import sqlite3
+
     try:
         with experiment_db.connect(read_only=True) as conn:
             row = conn.execute(
@@ -414,7 +518,7 @@ def _last_attempt(experiment_db, ticker: str) -> dict | None:
                 "WHERE upper(symbol_or_cik)=upper(?) ORDER BY requested_at DESC LIMIT 1",
                 (ticker,),
             ).fetchone()
-    except Exception:  # noqa: BLE001 -- an older ledger must not break the audit
+    except sqlite3.Error:  # ledger unavailable/older schema
         return None
     return dict(row) if row else None
 
@@ -439,7 +543,6 @@ def audit_universe(
     from tradehub_research.db import ResearchDB
     from tradehub_research.ops.daily_refresh import (
         REFRESH_STALENESS_DAYS,
-        RETIRE_GAP_DAYS,
         ROTATION_REQUESTS_PER_RUN,
         retired_tickers,
     )
@@ -457,7 +560,9 @@ def audit_universe(
     # holidays must never count against a symbol. Convert the design's calendar
     # window into the sessions that actually fall inside it, so both sides of
     # the contract speak the same unit.
-    window_sessions = max(count_sessions(expected - timedelta(days=REFRESH_STALENESS_DAYS), expected), 1)
+    window_sessions = max(
+        count_sessions(expected - timedelta(days=REFRESH_STALENESS_DAYS), expected), 1
+    )
 
     # Structural diagnosis: can the refresh budget hold the contract at all?
     required_daily = -(-len(canonical) // window_sessions)  # ceil
@@ -570,21 +675,25 @@ def remediate(
     provider quota object enforces the rate limits; this function never raises
     concurrency to work around throttling.
     """
+    from tradehub_research.adapters.tiingo import TiingoEodAdapter
     from tradehub_research.backfill.tiingo_driver import classify_error, fetch_one
     from tradehub_research.db import ResearchDB
     from tradehub_research.evidence import EvidenceStore
     from tradehub_research.ops.daily_refresh import INCREMENTAL_LOOKBACK_SESSIONS
-    from tradehub_research.adapters.tiingo import TiingoEodAdapter
 
     paths = paths or research_paths()
     now = now or datetime.now(timezone.utc)
     rng = rng or random.Random(0)
-    expected = date.fromisoformat((audit.expected_session if audit else (as_of or expected_latest_session(now)).isoformat()))
+    expected = date.fromisoformat(
+        audit.expected_session if audit else (as_of or expected_latest_session(now)).isoformat()
+    )
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
     store = store or CheckpointStore(paths.research_dir / "freshness_remediation.sqlite")
 
     if audit is None:
-        audit = audit_universe(settings=settings, paths=paths, experiment_db=experiment_db, as_of=expected)
+        audit = audit_universe(
+            settings=settings, paths=paths, experiment_db=experiment_db, as_of=expected
+        )
 
     run_key = run_key_for(expected)
     store.open_run(run_key, expected.isoformat(), audit.universe, audit.stale_count)
@@ -593,7 +702,10 @@ def remediate(
     for row in audit.exceptions:
         store.seed_symbol(run_key, row.ticker, row.security_id, row.last_bar, row.classification)
         store.settle(
-            run_key, row.ticker, disposition="EXCLUDED", last_bar_after=row.last_bar,
+            run_key,
+            row.ticker,
+            disposition="EXCLUDED",
+            last_bar_after=row.last_bar,
             classification=row.classification,
         )
 
@@ -635,16 +747,15 @@ def remediate(
             # inside the hourly quota window (up to 12h) for EVERY remaining
             # symbol, which is how a nightly watch becomes an all-night job.
             # Stopping here leaves the queue intact and reports immediately.
-            try:
-                remaining = adapter.quota.remaining(datetime.now(timezone.utc).timestamp())
-            except Exception:  # noqa: BLE001 -- never let introspection break the run
-                remaining = None
-            if remaining is not None and remaining.get("hourly", 1) <= 0:
+            hourly = _quota_hourly_remaining(adapter)
+            if hourly is not None and hourly <= 0:
                 summary["quota_blocked"] = True
                 break
         if attempts_so_far >= max_attempts_total:
             store.settle(
-                run_key, ticker, disposition="UNRESOLVED",
+                run_key,
+                ticker,
+                disposition="UNRESOLVED",
                 last_bar_after=_last_bar(research_db, row["security_id"] or ""),
                 classification=UNRESOLVED,
             )
@@ -653,7 +764,9 @@ def remediate(
         started = datetime.fromisoformat(str(row["last_attempt_at"] or now.isoformat()))
         if (now - started) > timedelta(hours=window_hours):
             store.settle(
-                run_key, ticker, disposition="UNRESOLVED",
+                run_key,
+                ticker,
+                disposition="UNRESOLVED",
                 last_bar_after=_last_bar(research_db, row["security_id"] or ""),
                 classification=UNRESOLVED,
             )
@@ -673,7 +786,9 @@ def remediate(
                         adapter,
                         adapter.quota,
                         ticker=ticker,
-                        start_date=(expected - timedelta(days=INCREMENTAL_LOOKBACK_SESSIONS * 2)).isoformat(),
+                        start_date=(
+                            expected - timedelta(days=INCREMENTAL_LOOKBACK_SESSIONS * 2)
+                        ).isoformat(),
                         end_date=expected.isoformat(),
                     )
                     records = adapter.parse(fetched.raw_bytes, fetched, ticker=ticker)
@@ -685,9 +800,20 @@ def remediate(
                     ingest_records(records, store_evidence)
                 outcome = "FETCHED"
                 break
+            except PROGRAMMING_FAULTS:
+                # A NameError/TypeError/etc. here means the code is wrong, not that
+                # the provider failed. Classifying it (it would become "NETWORK")
+                # would record a symbol failure and hide a broken build behind a
+                # plausible data-freshness story. Propagate loudly.
+                raise
             except Exception as exc:  # noqa: BLE001 -- classify, never crash the run
                 cls, detail, _http = classify_error(exc)
                 error = f"{cls}: {detail}"
+                if cls == "EMPTY":
+                    # No usable data for this symbol, however it surfaced: the
+                    # delisting/quarantine path below owns it.
+                    outcome = "EMPTY"
+                    break
                 if cls == "QUOTA":
                     # The provider refused the request before it was made; this
                     # is a budget limit, NOT a failure of this symbol. Recording
@@ -701,7 +827,9 @@ def remediate(
                 # "retry budget" is a limit on attempts actually spent, which is
                 # also what the provider quota sees.
                 attempts_total = store.record_attempt(
-                    run_key, ticker, error=error,
+                    run_key,
+                    ticker,
+                    error=error,
                     next_attempt_at=_next_attempt_at(attempts_so_far + 1, now, rng=rng),
                 )
                 if cls in ("AUTH", "UNKNOWN_SYMBOL", "DUPLICATE_CIK"):
@@ -719,12 +847,27 @@ def remediate(
         after = _last_bar(research_db, row["security_id"] or "")
         verified = bool(after) and date.fromisoformat(after) >= expected
         if outcome == "EMPTY":
+            # Record the finding in the APPEND-ONLY LEDGER, not just the checkpoint:
+            # the audit classifies from backfill_attempt, so without this row the
+            # symbol keeps reading as rotation-starved and the quarantine (driven by
+            # the audit) disagrees with the remediation. Fails closed if the write
+            # cannot land -- an unprovable reconciliation must not be reported.
+            _ledger_write(
+                experiment_db,
+                ticker=ticker,
+                error="EMPTY: 0 bars parsed (delisted/unresolvable)",
+            )
             store.record_attempt(
-                run_key, ticker, error="EMPTY: 0 bars parsed (delisted/unresolvable)",
+                run_key,
+                ticker,
+                error="EMPTY: 0 bars parsed (delisted/unresolvable)",
                 next_attempt_at=None,
             )
             store.settle(
-                run_key, ticker, disposition="EXCLUDED", last_bar_after=after,
+                run_key,
+                ticker,
+                disposition="EXCLUDED",
+                last_bar_after=after,
                 classification=DELISTED_EMPTY,
             )
             summary["excluded"] += 1
@@ -736,7 +879,8 @@ def remediate(
 
         if attempts_total < max_attempts_total:
             attempts_total = store.record_attempt(
-                run_key, ticker,
+                run_key,
+                ticker,
                 error=error or f"{VALIDATION_FAILURE}: bar missing after a successful fetch",
                 next_attempt_at=_next_attempt_at(attempts_total + 1, now, rng=rng),
             )
@@ -744,9 +888,7 @@ def remediate(
             store.settle(run_key, ticker, disposition="UNRESOLVED", last_bar_after=after)
             summary["unresolved"] += 1
 
-    remaining = [
-        r for r in store.all_symbols(run_key) if r["disposition"] == "PENDING"
-    ]
+    remaining = [r for r in store.all_symbols(run_key) if r["disposition"] == "PENDING"]
     summary["pending"] = len(remaining)
     summary["requires_intervention"] = summary["unresolved"] > 0 or bool(remaining)
     store.close_run(run_key, "ESCALATED" if summary["requires_intervention"] else "COMPLETED")
@@ -782,7 +924,9 @@ def verify(
         if after and date.fromisoformat(after) >= expected:
             repaired_ok += 1
         else:
-            still_stale.append({"ticker": row["ticker"], "last_bar": after, "reason": "regressed after repair"})
+            still_stale.append(
+                {"ticker": row["ticker"], "last_bar": after, "reason": "regressed after repair"}
+            )
         with research_db.connect(read_only=True) as conn:
             dupes = conn.execute(
                 "SELECT COUNT(*) FROM (SELECT source_record_id FROM evidence_event "
@@ -826,7 +970,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
     if mode == "verify":
-        print(json.dumps(verify(settings=settings, experiment_db=exp, paths=paths), indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                verify(settings=settings, experiment_db=exp, paths=paths), indent=2, sort_keys=True
+            )
+        )
         return 0
     print(f"usage: {argv0()} [audit|remediate|verify]", file=sys.stderr)
     return 2

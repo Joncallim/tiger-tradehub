@@ -109,23 +109,27 @@ def _incident_log(paths):
     return paths.research_dir / "freshness_incidents.jsonl"
 
 
-def _record_incident(paths, payload: dict) -> None:
-    """Append-only structured evidence. Idempotent per incident_id."""
-    import os as _os
+def _record_incident(paths, payload: dict) -> str | None:
+    """Append-only structured evidence. Idempotent per incident_id.
 
+    Returns None on success, or a human-readable reason when the log could not be
+    written. The caller puts that reason into the report: a failure to record
+    incident evidence must be visible, not silent. Only expected I/O failures are
+    caught -- a programming fault propagates.
+    """
     path = _incident_log(paths)
     incident = payload.get("incident_id")
     try:
         if path.exists() and incident:
             for line in path.read_text().splitlines():
                 if line.strip() and f'"incident_id": "{incident}"' in line:
-                    return  # already recorded; never double-log the same incident
+                    return None  # already recorded; never double-log the same incident
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
-    except OSError:
-        pass  # evidence must never break the watch
-    del _os
+        return None
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
 
 
 def _symbol_capacity_state(settings) -> dict:
@@ -133,44 +137,74 @@ def _symbol_capacity_state(settings) -> dict:
 
     Reported every run so the licence ceiling is visible long before it binds --
     the fleet sat at 444/450 unnoticed because nothing surfaced it.
-    """
-    try:
-        from tradehub_research.adapters.tiingo import TiingoQuota
-        from tradehub_research.ops.symbol_capacity import capacity_report
 
-        quota = TiingoQuota(state_path=settings.adapter_cache_dir / "tiingo-operational.sqlite")
+    Only expected I/O failures are tolerated here; a programming fault
+    propagates, because a silently empty capacity block would read as "no
+    constraint" exactly when the constraint matters.
+    """
+    import sqlite3
+
+    from tradehub_research.adapters.tiingo import TiingoQuota
+    from tradehub_research.ops.symbol_capacity import capacity_report
+
+    quota = TiingoQuota(state_path=settings.adapter_cache_dir / "tiingo-operational.sqlite")
+    try:
         return capacity_report(quota, now=time.time())
-    except Exception:  # noqa: BLE001 -- reporting must never break the watch
-        return {}
+    except (sqlite3.Error, OSError) as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def reconciliation(audit, after, summary) -> dict:
     """The reconciled fleet snapshot.
 
-    ONE meaning per field, and the counts close:
+    Both audits are the authority for what IS true (they read the persisted
+    database); the summary says what the run CLAIMS. Three transitions move a
+    security out of the stale set, and all three are needed or the arithmetic
+    drifts:
 
-      universe_total = eligible + excluded_exceptions
-      eligible       = fresh_before + stale_before
-      fresh_after    = fresh_before + repaired_this_run
-      stale_after    = stale_before - repaired_this_run - newly_classified_exceptions
+      * repaired            -- a fetch landed the expected session
+                               (observed as the rise in ``at_expected_session``)
+      * relieved_into_window-- a fetch advanced the symbol but it is still inside
+                               the documented rolling window, so it is no longer
+                               materially stale (observed as the rise in
+                               ``within_rolling_window``)
+      * newly_classified_exceptions -- the symbol turned out to be delisted or
+                               unfetchable (observed as the rise in exceptions)
 
-    ``fresh_*`` means "carries the expected session's data" -- never "repaired".
+    Every value below is OBSERVED from the two audits. The run summary's repair
+    count is cross-checked against the observed rise, so "the run said 44 but the
+    database shows 45" is reported instead of hidden.
     """
-    repaired = int(summary.get("repaired", 0) or 0)
-    newly_excluded = int(summary.get("excluded", 0) or 0)
+    at_expected_before = audit.fresh
+    at_expected_after = after.fresh
+    within_before = len(audit.lagging_within_window)
+    within_after = len(after.lagging_within_window)
+
+    repaired_observed = at_expected_after - at_expected_before
+    relieved_into_window = within_after - within_before
+    newly_exceptions = after.excluded_exceptions - audit.excluded_exceptions
+
     return {
         "universe_total": audit.universe_total,
         "excluded_exceptions": audit.excluded_exceptions,
         "eligible": audit.eligible,
         "fresh_before": audit.fresh_before,
-        "at_expected_session": audit.fresh,
-        "within_rolling_window": len(audit.lagging_within_window),
+        "at_expected_session": at_expected_before,
+        "within_rolling_window": within_before,
         "stale_before": audit.stale_before,
-        "repaired_this_run": repaired,
-        "newly_classified_exceptions": newly_excluded,
-        "fresh_after": audit.fresh_before + repaired,
-        "stale_after": audit.stale_before - repaired - newly_excluded,
+        # observed transitions
+        "repaired_this_run": repaired_observed,
+        "reported_repaired": int(summary.get("repaired", 0) or 0),
+        "relieved_into_window": relieved_into_window,
+        "newly_classified_exceptions": newly_exceptions,
+        # after-state
+        "fresh_after": after.fresh_before,
+        "at_expected_after": at_expected_after,
+        "within_rolling_window_after": within_after,
+        "stale_after": after.stale_before,
         "quarantined_after": after.stale_count,
+        "eligible_after": after.eligible,
+        "excluded_exceptions_after": after.excluded_exceptions,
         "quota_blocked": bool(summary.get("quota_blocked")),
         "time_budget_exhausted": bool(summary.get("time_budget_exhausted")),
     }
@@ -179,22 +213,47 @@ def reconciliation(audit, after, summary) -> dict:
 def _reconcile_problems(rec: dict) -> list[str]:
     """Invariants that must hold for a rendered report to be trustworthy."""
     problems: list[str] = []
+    # every audit must be internally consistent
     if rec["universe_total"] != rec["eligible"] + rec["excluded_exceptions"]:
         problems.append("universe_total != eligible + excluded_exceptions")
     if rec["eligible"] != rec["fresh_before"] + rec["stale_before"]:
         problems.append("eligible != fresh_before + stale_before")
-    if rec["fresh_after"] != rec["fresh_before"] + rec["repaired_this_run"]:
-        problems.append("fresh_after != fresh_before + repaired_this_run")
+    if rec["fresh_before"] != rec["at_expected_session"] + rec["within_rolling_window"]:
+        problems.append("fresh_before != at_expected + within_window")
+    if rec.get("eligible_after") is not None:
+        if rec["eligible_after"] != rec["fresh_after"] + rec["stale_after"]:
+            problems.append("eligible_after != fresh_after + stale_after")
+        if rec["eligible_after"] != (rec["eligible"] - rec["newly_classified_exceptions"]):
+            problems.append("eligible_after != eligible - newly_classified_exceptions")
+    if rec["fresh_after"] != (rec["at_expected_after"] + rec["within_rolling_window_after"]):
+        problems.append("fresh_after != at_expected_after + within_window_after")
+    # the run's claim must match what the database shows
+    if rec["reported_repaired"] != rec["repaired_this_run"]:
+        problems.append(
+            f"the run reported {rec['reported_repaired']} repairs but the database "
+            f"shows {rec['repaired_this_run']} (repairs did not land, or the "
+            f"re-audit disagrees)"
+        )
+    # the three transitions must fully account for the fall in the stale count
     if rec["stale_after"] != (
-        rec["stale_before"] - rec["repaired_this_run"] - rec["newly_classified_exceptions"]
+        rec["stale_before"]
+        - rec["repaired_this_run"]
+        - rec["relieved_into_window"]
+        - rec["newly_classified_exceptions"]
     ):
-        problems.append("stale_after != stale_before - repaired - newly_classified_exceptions")
+        problems.append(
+            "stale_after != stale_before - repaired - relieved_into_window "
+            "- newly_classified_exceptions (stale securities are unaccounted for)"
+        )
     if rec["stale_after"] < 0 or rec["fresh_after"] < 0:
         problems.append("a reconciled count went negative")
     if rec["quarantined_after"] != rec["stale_after"]:
         # The quarantine must mirror the stale set exactly: a stale name that is
         # not quarantined could feed downstream signals.
-        problems.append("quarantined_after != stale_after (quarantine would not match the stale set)")
+        problems.append(
+            f"quarantined_after({rec['quarantined_after']}) != "
+            f"stale_after({rec['stale_after']}) (quarantine would not match the stale set)"
+        )
     return problems
 
 
@@ -223,6 +282,8 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
             f"Eligible: {rec['eligible']:,}",
             f"Stale before remediation: {rec['stale_before']:,}",
             f"Repaired this run: {rec['repaired_this_run']:,}",
+            f"Advanced into the rolling window: {rec['relieved_into_window']:,}",
+            f"Newly classified exceptions: {rec['newly_classified_exceptions']:,}",
             f"Fresh after remediation: {rec['fresh_after']:,}",
             "Stale after remediation: 0",
             "Quarantined after remediation: 0",
@@ -248,6 +309,7 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
         "",
         "Automatic remediation:",
         f"- repaired this run: {rec['repaired_this_run']:,}",
+        f"- advanced into the rolling window: {rec['relieved_into_window']:,}",
         f"- newly classified exceptions: {rec['newly_classified_exceptions']:,}",
         "",
         f"Fresh after remediation: {rec['fresh_after']:,}",
@@ -328,7 +390,10 @@ def check_data_freshness(settings, paths) -> None:
         return  # healthy: silent (quarantine reconciliation already happened)
 
     summary = df.remediate(
-        settings=settings, paths=paths, experiment_db=experiment_db, audit=audit,
+        settings=settings,
+        paths=paths,
+        experiment_db=experiment_db,
+        audit=audit,
         time_budget_seconds=HEALTH_WATCH_REMEDIATION_SECONDS,
     )
     verification = df.verify(settings=settings, paths=paths, run_key=summary["run_key"])
@@ -340,7 +405,7 @@ def check_data_freshness(settings, paths) -> None:
     )
 
     oldest = min((s.last_bar for s in after.stale if s.last_bar), default=None)
-    _record_incident(
+    evidence_problem = _record_incident(
         paths,
         {
             "incident_id": df.incident_id(audit.expected_session, [s.ticker for s in audit.stale]),
@@ -381,6 +446,10 @@ def check_data_freshness(settings, paths) -> None:
         },
     )
     ALERTS.extend(render_freshness_report(audit, after, summary, residual, capacity))
+    if evidence_problem:
+        # Not silent: the report itself says the evidence record is missing.
+        ALERTS.append("")
+        ALERTS.append(f"WARNING: incident evidence not recorded ({evidence_problem})")
 
 
 def check_forward_ledger(experiment_db, paths) -> None:

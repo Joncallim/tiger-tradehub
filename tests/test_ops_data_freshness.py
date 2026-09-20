@@ -83,7 +83,9 @@ class TestMarketCalendar:
     def test_utc_day_skew_uses_exchange_local_date(self):
         """2: 02:00Z is still the previous ET day; a holiday must not leak in."""
         # Thanksgiving Thursday 21:00 ET == Friday 02:00Z.
-        assert expected_latest_session(datetime(2026, 11, 27, 2, 0, tzinfo=UTC)) == date(2026, 11, 25)
+        assert expected_latest_session(datetime(2026, 11, 27, 2, 0, tzinfo=UTC)) == date(
+            2026, 11, 25
+        )
 
     def test_missing_sessions_counts_market_days_only(self):
         """1: a weekend inside the gap does not inflate the count."""
@@ -107,7 +109,7 @@ class TestBackoffBudget:
         """6 + 7: bounded retry pressure, never exponential-to-infinity."""
         rng = random.Random(7)
         values = [df.backoff_seconds(n, rng=rng) for n in range(1, 9)]
-        for earlier, later in zip(values, values[1:]):
+        for earlier, later in zip(values, values[1:], strict=False):
             assert later >= earlier * 0.9  # monotone up to the cap
         assert values[0] >= df.BACKOFF_BASE_SECONDS
         assert all(v <= df.BACKOFF_CAP_SECONDS * (1 + df.BACKOFF_JITTER_FRACTION) for v in values)
@@ -203,28 +205,42 @@ def _paths(tmp_path):
     )
 
 
-def _audit(expected: str, stale: list[tuple[str, str, str | None]], exceptions=()) -> df.AuditResult:
-    result = df.AuditResult(expected_session=expected, universe=len(stale) + len(exceptions), fresh=0)
+def _audit(
+    expected: str, stale: list[tuple[str, str, str | None]], exceptions=()
+) -> df.AuditResult:
+    result = df.AuditResult(
+        expected_session=expected, universe=len(stale) + len(exceptions), fresh=0
+    )
     for ticker, sid, last in stale:
         result.stale.append(
             df.SecurityFreshness(
-                ticker=ticker, security_id=sid, last_bar=last,
-                missing_sessions=7, classification=df.ROTATION_STARVED,
+                ticker=ticker,
+                security_id=sid,
+                last_bar=last,
+                missing_sessions=7,
+                classification=df.ROTATION_STARVED,
             )
         )
     for ticker, sid, last in exceptions:
         result.exceptions.append(
             df.SecurityFreshness(
-                ticker=ticker, security_id=sid, last_bar=last,
-                missing_sessions=7, classification=df.DELISTED_EMPTY,
+                ticker=ticker,
+                security_id=sid,
+                last_bar=last,
+                missing_sessions=7,
+                classification=df.DELISTED_EMPTY,
             )
         )
     return result
 
 
 def _settings():
-    return SimpleNamespace(busy_timeout_ms=5000, tiingo_token=None,
-                           tiingo_license_confirmed=True, adapter_cache_dir=Path("/tmp"))
+    return SimpleNamespace(
+        busy_timeout_ms=5000,
+        tiingo_token=None,
+        tiingo_license_confirmed=True,
+        adapter_cache_dir=Path("/tmp"),
+    )
 
 
 class TestRemediation:
@@ -237,16 +253,22 @@ class TestRemediation:
             research.bars["1"] = "2026-09-18"
 
         summary = df.remediate(
-            settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
             audit=_audit("2026-09-18", [("AAA", "1", "2026-09-09")]),
-            store=df.CheckpointStore(tmp_path / "c.sqlite"), refresh_one=refresh_one,
+            store=df.CheckpointStore(tmp_path / "c.sqlite"),
+            refresh_one=refresh_one,
         )
         assert summary["targeted"] == 1
         assert summary["repaired"] == 1
         assert summary["requires_intervention"] is False
         verification = df.verify(
-            settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
-            run_key=summary["run_key"], store=df.CheckpointStore(tmp_path / "c.sqlite"),
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
+            run_key=summary["run_key"],
+            store=df.CheckpointStore(tmp_path / "c.sqlite"),
         )
         assert verification["repaired_verified"] == 1
         assert verification["checkpoint_consistent"] is True
@@ -264,24 +286,32 @@ class TestRemediation:
             research.bars[str(int(ticker[1:]))] = "2026-09-18"
 
         summary = df.remediate(
-            settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
             audit=_audit("2026-09-18", stale),
-            store=df.CheckpointStore(tmp_path / "c.sqlite"), refresh_one=refresh_one,
+            store=df.CheckpointStore(tmp_path / "c.sqlite"),
+            refresh_one=refresh_one,
         )
         assert summary["targeted"] == 300
         assert summary["repaired"] == 300
         assert len(seen) == 300  # targeted, not the whole universe
 
-    def test_missing_database_write_after_successful_fetch_is_not_trusted(self, tmp_path, monkeypatch):
+    def test_missing_database_write_after_successful_fetch_is_not_trusted(
+        self, tmp_path, monkeypatch
+    ):
         """12: the fetch succeeded but nothing was persisted -> not repaired."""
         research = _FakeResearch({"1": "2026-09-09"})
         _wire(monkeypatch, research)
         summary = df.remediate(
-            settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
             audit=_audit("2026-09-18", [("AAA", "1", "2026-09-09")]),
             store=df.CheckpointStore(tmp_path / "c.sqlite"),
             refresh_one=lambda ticker: None,  # "successful" but writes nothing
-            max_attempts_per_run=1, max_attempts_total=1,
+            max_attempts_per_run=1,
+            max_attempts_total=1,
         )
         assert summary["repaired"] == 0
         assert summary["unresolved"] == 1
@@ -299,9 +329,14 @@ class TestRemediation:
 
         store = df.CheckpointStore(tmp_path / "c.sqlite")
         summary = df.remediate(
-            settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
             audit=_audit("2026-09-18", [("AAA", "1", "2026-09-09")]),
-            store=store, refresh_one=always_fails, max_attempts_per_run=2, max_attempts_total=2,
+            store=store,
+            refresh_one=always_fails,
+            max_attempts_per_run=2,
+            max_attempts_total=2,
         )
         assert calls["n"] == 2  # bounded: no infinite loop
         assert summary["unresolved"] == 1
@@ -319,10 +354,22 @@ class TestRemediation:
 
         store = df.CheckpointStore(tmp_path / "c.sqlite")
         audit = _audit("2026-09-18", [("AAA", "1", "2026-09-09")])
-        first = df.remediate(settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
-                             audit=audit, store=store, refresh_one=refresh_one)
-        second = df.remediate(settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
-                              audit=audit, store=store, refresh_one=refresh_one)
+        first = df.remediate(
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
+            audit=audit,
+            store=store,
+            refresh_one=refresh_one,
+        )
+        second = df.remediate(
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
+            audit=audit,
+            store=store,
+            refresh_one=refresh_one,
+        )
         assert first["repaired"] == 1
         assert second["repaired"] == 0  # nothing left PENDING
         assert calls["n"] == 1  # the provider was not called again
@@ -339,9 +386,12 @@ class TestRemediation:
             calls.append(ticker)
 
         summary = df.remediate(
-            settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
             audit=_audit("2026-09-18", [("DEAD", "1", "2026-08-01")]),
-            store=df.CheckpointStore(tmp_path / "c.sqlite"), refresh_one=returns_empty,
+            store=df.CheckpointStore(tmp_path / "c.sqlite"),
+            refresh_one=returns_empty,
         )
         # refresh_one returns None (no exception) -> treated as a failed store.
         assert summary["targeted"] == 1
@@ -360,9 +410,14 @@ class TestRemediation:
 
         store = df.CheckpointStore(tmp_path / "c.sqlite")
         summary = df.remediate(
-            settings=_settings(), experiment_db=None, paths=_paths(tmp_path),
+            settings=_settings(),
+            experiment_db=None,
+            paths=_paths(tmp_path),
             audit=_audit("2026-09-18", [("AAA", "1", "2026-09-09"), ("BBB", "2", "2026-09-09")]),
-            store=store, refresh_one=quota_blocked, max_attempts_per_run=3, max_attempts_total=3,
+            store=store,
+            refresh_one=quota_blocked,
+            max_attempts_per_run=3,
+            max_attempts_total=3,
         )
         assert summary["quota_blocked"] is True
         assert calls == ["AAA"]  # the run stopped; it did not march the queue
@@ -375,7 +430,9 @@ class TestRemediation:
     def test_classification_maps_provider_failures_to_root_causes(self):
         """6 + 7: 429/5xx/auth map to distinct root causes for grouping."""
         assert df._classify_from_attempt("RATE_LIMITED: HTTP 429", "ERROR") == df.PROVIDER_THROTTLE
-        assert df._classify_from_attempt("PROVIDER_ERROR: HTTP 503", "ERROR") == df.PROVIDER_TRANSIENT
+        assert (
+            df._classify_from_attempt("PROVIDER_ERROR: HTTP 503", "ERROR") == df.PROVIDER_TRANSIENT
+        )
         assert df._classify_from_attempt("NETWORK: ConnectError", "ERROR") == df.PROVIDER_TRANSIENT
         assert df._classify_from_attempt("QUOTA: reserve", "ERROR") == df.QUOTA_EXHAUSTED
         assert df._classify_from_attempt("AUTH: HTTP 401", "ERROR") == df.AUTH_FAILURE
@@ -434,8 +491,12 @@ class TestHealthReportShape:
     @staticmethod
     def _summary(**over):
         base = {
-            "repaired": 0, "excluded": 0, "unresolved": 0, "attempts": 0,
-            "quota_blocked": False, "targeted": 0,
+            "repaired": 0,
+            "excluded": 0,
+            "unresolved": 0,
+            "attempts": 0,
+            "quota_blocked": False,
+            "targeted": 0,
         }
         base.update(over)
         return base
@@ -454,20 +515,29 @@ class TestHealthReportShape:
 
         audit = _audit(
             "2026-09-18",
-            [(f"T{i}", str(i), "2026-09-09") for i in range(3)],
+            [("T0", "0", "2026-09-09")],
             exceptions=[("X1", "e1", None), ("X2", "e2", None)],
         )
         audit.fresh = 5
-        audit.universe = 10  # = fresh_before 5 + stale_before 3 + exceptions 2
+        audit.universe = 8  # = fresh_before 5 + stale_before 1 + exceptions 2
+        after = _audit(
+            "2026-09-18",
+            [],
+            exceptions=[("X1", "e1", None), ("X2", "e2", None)],
+        )
+        after.fresh = 6  # 5 fresh before + 1 repaired
+        after.universe = 8  # 6 fresh + 2 exceptions
         text = "\n".join(
             render_freshness_report(
-                audit, _audit("2026-09-18", []),
-                self._summary(repaired=1, excluded=2, targeted=3), {"active": 0},
+                audit,
+                after,
+                self._summary(repaired=1, excluded=2, targeted=3),
+                {"active": 0},
             )
         )
         assert text.startswith("TRADEHUB WATCH — AUTO-RECOVERED")
         assert "Expected session: 2026-09-18" in text
-        assert "Stale before remediation: 3" in text
+        assert "Stale before remediation: 1" in text
         assert "Repaired this run: 1" in text
         assert "Excluded legitimate exceptions: 2" in text
         assert "Stale after remediation: 0" in text
@@ -486,9 +556,21 @@ class TestHealthReportShape:
         audit.fresh = 100
         audit.lagging_within_window = [f"W{i}" for i in range(35)]
         audit.universe = 143
-        audit.groups = {df.ROTATION_STARVED: [f"T{i:02d}" for i in range(7)],
-                        df.PROVIDER_THROTTLE: ["T07"]}
-        after = _audit("2026-09-18", [("T00", "0", "2026-09-09")])
+        audit.groups = {
+            df.ROTATION_STARVED: [f"T{i:02d}" for i in range(7)],
+            df.PROVIDER_THROTTLE: ["T07"],
+        }
+        # 5 repaired and 2 reclassified as exceptions leaves exactly 1 stale.
+        # after: at_expected 105 (100+5), within 35, stale 1, exceptions 2
+        #   -> universe 143 = 105+35+1+2 ; eligible_after 141 = 143-2
+        after = _audit(
+            "2026-09-18",
+            [("T00", "0", "2026-09-09")],
+            exceptions=[("X1", "e1", None), ("X2", "e2", None)],
+        )
+        after.fresh = 105
+        after.lagging_within_window = [f"W{i}" for i in range(35)]
+        after.universe = 143
         after.stale[0].last_attempt_at = "2026-09-19T01:00:00Z"
         text = "\n".join(
             render_freshness_report(
@@ -501,6 +583,7 @@ class TestHealthReportShape:
         assert "stale before remediation: 8" in text
         assert "- repaired this run: 5" in text
         assert "- newly classified exceptions: 2" in text
+        assert "Fresh after remediation: 140" in text
         assert "Stale after remediation: 1" in text
         assert "Root causes:" in text
         assert "- 7 rotation budget starved" in text
@@ -520,8 +603,10 @@ class TestHealthReportShape:
         audit.groups = {df.QUOTA_EXHAUSTED: ["AAA"]}
         text = "\n".join(
             render_freshness_report(
-                audit, _audit("2026-09-18", [("AAA", "1", "2026-09-09")]),
-                self._summary(quota_blocked=True), {"active": 1},
+                audit,
+                _audit("2026-09-18", [("AAA", "1", "2026-09-09")]),
+                self._summary(quota_blocked=True),
+                {"active": 1},
             )
         )
         assert "paused on the provider quota reserve" in text

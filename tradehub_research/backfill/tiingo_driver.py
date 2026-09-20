@@ -49,6 +49,7 @@ from tradehub_research.adapters.tiingo import TiingoEodAdapter, TiingoQuota
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
+from tradehub_research.ops.symbol_capacity import SymbolCapacityExceeded
 from tradehub_research.validation.experiment_db import (
     DEFAULT_EXPERIMENT_DB_PATH,
     ExperimentDB,
@@ -188,13 +189,8 @@ def classify_error(exc: BaseException) -> tuple[str, str, int | None]:
         # known licence constraint that capacity planning prevents us from
         # hitting, not a spent request budget. Reporting it as QUOTA would hide
         # a coverage problem behind "resumes next cycle".
-        try:
-            from tradehub_research.ops.symbol_capacity import SymbolCapacityExceeded
-
-            if isinstance(exc, SymbolCapacityExceeded):
-                return "CAPACITY", message[:200], None
-        except Exception:  # noqa: BLE001 - never mask the original cause
-            pass
+        if isinstance(exc, SymbolCapacityExceeded):
+            return "CAPACITY", message[:200], None
         if "quota reserve" in message:
             return "QUOTA", message[:200], None
         if "ceiling" in message:
