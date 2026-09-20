@@ -49,6 +49,7 @@ from tradehub_research.adapters.tiingo import TiingoEodAdapter, TiingoQuota
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
+from tradehub_research.ops.symbol_capacity import SymbolCapacityExceeded
 from tradehub_research.validation.experiment_db import (
     DEFAULT_EXPERIMENT_DB_PATH,
     ExperimentDB,
@@ -184,13 +185,27 @@ def classify_error(exc: BaseException) -> tuple[str, str, int | None]:
         pass
     if isinstance(exc, RuntimeError):
         message = str(exc)
+        # Distinct from QUOTA on purpose: the rolling-month symbol ceiling is a
+        # known licence constraint that capacity planning prevents us from
+        # hitting, not a spent request budget. Reporting it as QUOTA would hide
+        # a coverage problem behind "resumes next cycle".
+        if isinstance(exc, SymbolCapacityExceeded):
+            return "CAPACITY", message[:200], None
         if "quota reserve" in message:
             return "QUOTA", message[:200], None
         if "ceiling" in message:
-            return "QUOTA", message[:200], None
+            return "CAPACITY", message[:200], None
     if isinstance(exc, ValueError):
         if "unresolved" in str(exc):
             return "DUPLICATE_CIK", str(exc)[:200], None
+        if "cannot follow ingested_time" in str(exc):
+            # The provider returned a bar for a session whose publication time has
+            # not arrived yet (Tiingo's EOD PAT is session+1 00:15Z, identical to
+            # the repo's 20:15 ET bar-eligible boundary). That is a REQUEST-RANGE
+            # mistake -- asking for a session that cannot legally exist yet -- not
+            # a storage defect and not bad upstream data. Classifying it as PARSE
+            # made METRY look like a fetch that was stored wrongly.
+            return "NOT_YET_PUBLISHED", str(exc)[:200], None
         return "PARSE", str(exc)[:200], None
     return "NETWORK", f"{type(exc).__name__}: {str(exc)[:200]}", None
 
@@ -242,8 +257,17 @@ def run_smoke(*, settings: ResearchSettings, experiment_db: ExperimentDB) -> int
             "no bootstrapped securities in research.db -- run security_bootstrap first"
         )
     ticker = sorted(canonical.values())[0]
-    today = datetime.now(timezone.utc).date().isoformat()
-    week_ago = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+    # Only request sessions whose EOD publication time has arrived. Tiingo's EOD
+    # PAT is session+1 00:15Z, so `end_date=today` asks for a bar that cannot
+    # legally exist yet: the fetch returns it, the evidence layer rejects it
+    # (public_available_time cannot follow ingested_time), and the symbol is
+    # recorded as a data defect. That is what produced METRY's spurious
+    # FETCHED_NOT_STORED on 2026-09-10. Use the publication-aware session instead.
+    from tradehub_research.ops.market_calendar import expected_latest_session
+
+    last_published = expected_latest_session()
+    today = last_published.isoformat()
+    week_ago = (last_published - timedelta(days=7)).isoformat()
     try:
         adapter = TiingoEodAdapter(
             token=settings.tiingo_token,
