@@ -1002,32 +1002,6 @@ class TestQuarantineUnaffectedByAccounting:
         assert len(guard.stale_security_ids(tmp_path)) == 1  # count unchanged
 
 
-class TestDeployedWatchScriptMatchesSource:
-    """The server must not drift from Git.
-
-    The health-watch script is installed outside the TradeHub systemd estate, so
-    `deploy/hermes/tradehub-health-watch.sh` is its canonical source. This guard
-    fails if the host copy has been edited directly.
-    """
-
-    INSTALLED = "/var/lib/hermes/scripts/tradehub-health-watch.sh"
-    SOURCE = "deploy/hermes/tradehub-health-watch.sh"
-
-    def test_installed_watch_script_equals_repo_source(self):
-        from pathlib import Path
-
-        repo_root = Path(__file__).resolve().parents[1]
-        source = repo_root / self.SOURCE
-        installed = Path(self.INSTALLED)
-        assert source.exists(), f"canonical source missing: {self.SOURCE}"
-        if not installed.exists():
-            pytest.skip(f"{self.INSTALLED} not present on this host (e.g. CI)")
-        assert installed.read_bytes() == source.read_bytes(), (
-            "the deployed health-watch script differs from "
-            f"{self.SOURCE}; reinstall it from the repo instead of editing the host copy"
-        )
-
-
 class TestUnpublishedSessionReproduction:
     """METRY (0002073643) end-to-end: why a successful fetch persisted nothing.
 

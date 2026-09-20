@@ -19,3 +19,8 @@ data/
 build/
 .codex/
 .claude/settings.local.json
+# Host-local deployment provenance, written by deploy/deployment_cli.py.
+# The manifest is the authoritative deployment record; DEPLOYED_COMMIT is
+# retired (its value now lives in the manifest as previous_commit).
+/deployment.json
+/DEPLOYED_COMMIT
