@@ -80,12 +80,51 @@ def service_active(name: str) -> bool:
     return code == 0 and "active" in out
 
 
+def _cli(deploy_dir: Path, *args: str, timeout: int = 120) -> tuple[int, str]:
+    """Run the deployment provenance CLI as the checkout owner (``jon``).
+
+    Root cannot run git in ``/opt/tiger-tradehub`` (dubious ownership), so the
+    acceptance harness shells out exactly the way an operator would.
+    """
+    return sh(
+        [
+            "sudo",
+            "-u",
+            "jon",
+            str(deploy_dir / ".venv" / "bin" / "python"),
+            str(deploy_dir / "deploy" / "deployment_cli.py"),
+            "--repo",
+            str(deploy_dir),
+            *args,
+        ],
+        timeout=timeout,
+    )
+
+
 def main() -> int:
     deploy_dir = Path("/opt/tiger-tradehub")
     check("deploy dir exists", deploy_dir.is_dir())
     code, head = sh(["sudo", "-u", "jon", "git", "-C", str(deploy_dir), "rev-parse", "HEAD"])
     check("deployed commit recorded", code == 0 and len(head) == 40, f"HEAD={head[:12]}")
-    (deploy_dir / "DEPLOYED_COMMIT").write_text(head)
+
+    # Deployment provenance comes from a validated manifest, never a bare marker
+    # file. The marker this replaced (DEPLOYED_COMMIT) asserted "the commit
+    # currently deployed" while its only writer recorded HEAD at the *start* of
+    # this script -- so it went stale on any deploy that did not re-run FA-06,
+    # and nothing consumed it to notice.
+    rcode, plan_out = _cli(deploy_dir, "plan", "--json")
+    rollback_target = None
+    try:
+        rollback_target = json.loads(plan_out).get("to_commit")
+    except ValueError:
+        rollback_target = None
+    check(
+        "rollback target recorded and resolvable",
+        rcode == 0 and len(str(rollback_target)) == 40,
+        f"target={str(rollback_target)[:12]}"
+        if rollback_target
+        else "no recorded rollback target; record one before running FA-06",
+    )
 
     # 1. Services start.
     for unit in ("tradehub-execution", "tradehub-research"):
@@ -263,23 +302,36 @@ def main() -> int:
         "" if not secret_leaks else str(secret_leaks),
     )
 
-    # 9. Upgrade procedure: checkout a newer commit (the #39 head, if merged)
-    #    and restart -- recorded as the upgrade path. (Rollback is #10.)
-    # 10. ROLLBACK procedure: checkout the previous deployed commit and restart.
-    code, out = sh(
-        [
-            "sudo",
-            "-u",
-            "jon",
-            "git",
-            "-C",
-            str(deploy_dir),
-            "checkout",
-            "--quiet",
-            "2b11c811baa9a600e04e5408afbab85fd36e04c3",
-        ]
-    )
-    check("rollback: checkout previous commit", code == 0)
+    # 9./10. ROLLBACK procedure: check out the RECORDED rollback target and
+    #    restart. The target comes from the deployment manifest, so the exercise
+    #    proves the operator's documented rollback path -- not a hardcoded SHA
+    #    that may have nothing to do with what is deployed.
+    if rollback_target:
+        code, out = sh(
+            [
+                "sudo",
+                "-u",
+                "jon",
+                "git",
+                "-C",
+                str(deploy_dir),
+                "checkout",
+                "--quiet",
+                "--detach",
+                rollback_target,
+            ]
+        )
+        check(
+            "rollback: checkout the recorded rollback target",
+            code == 0,
+            f"{str(rollback_target)[:12]}",
+        )
+    else:
+        check(
+            "rollback: checkout the recorded rollback target",
+            False,
+            "no rollback target recorded; cannot exercise the documented rollback path",
+        )
     code, _ = sh(["systemctl", "restart", "tradehub-execution.service"])
     code2, _ = sh(["systemctl", "restart", "tradehub-research.service"])
     check("rollback: services restart on old commit", code == 0 and code2 == 0)
@@ -287,7 +339,9 @@ def main() -> int:
     # 10b. RESTORE the deployed HEAD after the rollback test -- acceptance
     # must never leave production pinned to the old commit (P1 from the
     # independent review).
-    code, _ = sh(["sudo", "-u", "jon", "git", "-C", str(deploy_dir), "checkout", "--quiet", head])
+    code, _ = sh(
+        ["sudo", "-u", "jon", "git", "-C", str(deploy_dir), "checkout", "--quiet", "--detach", head]
+    )
     code2, _ = sh(["systemctl", "restart", "tradehub-execution.service"])
     code3, _ = sh(["systemctl", "restart", "tradehub-research.service"])
     restored = code == 0 and code2 == 0 and code3 == 0
@@ -297,6 +351,33 @@ def main() -> int:
             "CRITICAL: rollback restore failed -- /opt/tiger-tradehub may be "
             f"pinned to {head[:12]}. Fix immediately."
         )
+
+    # 11. Deployment provenance: record the revision that is actually deployed
+    #     and prove the record verifies clean. This replaces the old
+    #     DEPLOYED_COMMIT marker write.
+    rcode, out = _cli(deploy_dir, "record", "--source-branch", "main")
+    check("deployment manifest recorded", rcode == 0, out.splitlines()[-1] if out else "")
+    rcode, out = _cli(deploy_dir, "verify", "--json")
+    verified = False
+    payload: dict = {}
+    try:
+        payload = json.loads(out)
+        verified = rcode == 0 and bool(payload.get("ok"))
+    except ValueError:
+        verified = False
+    check(
+        "deployment provenance verifies clean",
+        verified,
+        f"head_matches={payload.get('deployed_commit_matches_head')} "
+        f"tree_matches={payload.get('tree_matches_manifest')} "
+        f"config_present={all(e.get('present') for e in payload.get('host_local_config', []))}",
+    )
+    rcode, out = _cli(deploy_dir, "status")
+    check(
+        "operator can name the running revision",
+        rcode == 0 and head[:12] in out,
+        out.strip()[:80],
+    )
 
     failed = [name for name, ok, _ in RESULTS if not ok]
     print(f"\nFA-06: {len(RESULTS) - len(failed)}/{len(RESULTS)} passed")

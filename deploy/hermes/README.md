@@ -25,10 +25,12 @@ install -m 0755 -o root -g root \
 
 ### Anti-drift
 
-`tests/test_ops_data_freshness.py::TestDeployedWatchScriptMatchesSource` compares
-the installed copy byte-for-byte against this source and **fails** on a
+`tests/test_deployment_provenance.py::TestInstalledHostScriptsHaveCommittedSources`
+compares the installed copy byte-for-byte against this source and **fails** on a
 difference. It skips when the installed path is absent (e.g. CI), so it guards
-the host without breaking the pipeline.
+the host without breaking the pipeline. The same module also proves the source
+file is tracked by git, so the script cannot exist on the host with no committed
+origin.
 
 If the guard fails, the server has been edited directly: reinstall from this
 source rather than hand-patching the host copy.

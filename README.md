@@ -77,12 +77,17 @@ of truth; no shadow brokerage ledger.
 
 ## Deployment
 
-- `/opt/tiger-tradehub` — deployed code (pinned commit in `DEPLOYED_COMMIT`)
-- `/var/lib/tradehub` — execution state · `/var/lib/tradehub-research` — research state
+- `/opt/tiger-tradehub` — deployed code, checked out **detached at an immutable
+  commit** (never a branch); `/var/lib/tradehub` — execution state ·
+  `/var/lib/tradehub-research` — research state
+- `deployment.json` (host-local, gitignored) is the authoritative deployment
+  record: revision, tree, timestamp, rollback target, drift state. Ask what is
+  running with `python deploy/deployment_cli.py status`, and prove it — revision,
+  tree, drift, rollback target — with `... verify`. Full model: `deploy/README.md`.
 - Services: `tradehub-execution.service`, `tradehub-research.service`
-  (committee API on `127.0.0.1:8091`), plus the four timer units above.
-- Acceptance: `deploy/fa06_acceptance.py` (start/restart/persistence/
-  rollback/secrets — 19/19 on the live host).
+  (committee API on `127.0.0.1:8091`), plus the timer units above.
+- Acceptance: `deploy/fa06_acceptance.py` (start/restart/persistence/rollback/
+  secrets/provenance) — run on the live host.
 
 ## Operator / reporting
 
