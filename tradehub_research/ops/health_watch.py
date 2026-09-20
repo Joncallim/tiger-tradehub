@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -127,53 +128,158 @@ def _record_incident(paths, payload: dict) -> None:
     del _os
 
 
-def render_freshness_report(audit, after, summary, residual) -> list[str]:
+def _symbol_capacity_state(settings) -> dict:
+    """Rolling-month distinct-symbol capacity, read-only.
+
+    Reported every run so the licence ceiling is visible long before it binds --
+    the fleet sat at 444/450 unnoticed because nothing surfaced it.
+    """
+    try:
+        from tradehub_research.adapters.tiingo import TiingoQuota
+        from tradehub_research.ops.symbol_capacity import capacity_report
+
+        quota = TiingoQuota(state_path=settings.adapter_cache_dir / "tiingo-operational.sqlite")
+        return capacity_report(quota, now=time.time())
+    except Exception:  # noqa: BLE001 -- reporting must never break the watch
+        return {}
+
+
+def reconciliation(audit, after, summary) -> dict:
+    """The reconciled fleet snapshot.
+
+    ONE meaning per field, and the counts close:
+
+      universe_total = eligible + excluded_exceptions
+      eligible       = fresh_before + stale_before
+      fresh_after    = fresh_before + repaired_this_run
+      stale_after    = stale_before - repaired_this_run - newly_classified_exceptions
+
+    ``fresh_*`` means "carries the expected session's data" -- never "repaired".
+    """
+    repaired = int(summary.get("repaired", 0) or 0)
+    newly_excluded = int(summary.get("excluded", 0) or 0)
+    return {
+        "universe_total": audit.universe_total,
+        "excluded_exceptions": audit.excluded_exceptions,
+        "eligible": audit.eligible,
+        "fresh_before": audit.fresh_before,
+        "at_expected_session": audit.fresh,
+        "within_rolling_window": len(audit.lagging_within_window),
+        "stale_before": audit.stale_before,
+        "repaired_this_run": repaired,
+        "newly_classified_exceptions": newly_excluded,
+        "fresh_after": audit.fresh_before + repaired,
+        "stale_after": audit.stale_before - repaired - newly_excluded,
+        "quarantined_after": after.stale_count,
+        "quota_blocked": bool(summary.get("quota_blocked")),
+        "time_budget_exhausted": bool(summary.get("time_budget_exhausted")),
+    }
+
+
+def _reconcile_problems(rec: dict) -> list[str]:
+    """Invariants that must hold for a rendered report to be trustworthy."""
+    problems: list[str] = []
+    if rec["universe_total"] != rec["eligible"] + rec["excluded_exceptions"]:
+        problems.append("universe_total != eligible + excluded_exceptions")
+    if rec["eligible"] != rec["fresh_before"] + rec["stale_before"]:
+        problems.append("eligible != fresh_before + stale_before")
+    if rec["fresh_after"] != rec["fresh_before"] + rec["repaired_this_run"]:
+        problems.append("fresh_after != fresh_before + repaired_this_run")
+    if rec["stale_after"] != (
+        rec["stale_before"] - rec["repaired_this_run"] - rec["newly_classified_exceptions"]
+    ):
+        problems.append("stale_after != stale_before - repaired - newly_classified_exceptions")
+    if rec["stale_after"] < 0 or rec["fresh_after"] < 0:
+        problems.append("a reconciled count went negative")
+    if rec["quarantined_after"] != rec["stale_after"]:
+        # The quarantine must mirror the stale set exactly: a stale name that is
+        # not quarantined could feed downstream signals.
+        problems.append("quarantined_after != stale_after (quarantine would not match the stale set)")
+    return problems
+
+
+def render_freshness_report(audit, after, summary, residual, capacity=None) -> list[str]:
     """The operator-facing report. Pure: no I/O, so its shape is testable.
 
-    Two forms:
-      * AUTO-RECOVERED -- everything repaired inside the normal cycle. This is a
-        *quiet success report*, not an alert, and carries no examples because
-        there is nothing for a human to do.
-      * DATA FRESHNESS DEGRADED -- actionable: root causes grouped, oldest
-        unresolved datum, downstream protection, and per-symbol examples.
+    Every count is named for exactly one thing and the arithmetic reconciles, so
+    the report reads as a fleet snapshot rather than a set of unrelated numbers.
+    If the counts do not reconcile -- or the quarantine does not match the stale
+    set -- the report says so loudly instead of rendering a plausible-looking
+    summary.
     """
-    lines: list[str] = []
     if not audit.stale:
-        return lines  # no incident at all: the watch stays silent
+        return []  # no incident at all: the watch stays silent
+
+    rec = reconciliation(audit, after, summary)
+    rec["quarantined_after"] = residual.get("active", after.stale_count)
+    problems = _reconcile_problems(rec) + list(audit.invariant_errors())
+
     if not after.stale:
-        lines.append("TRADEHUB WATCH — AUTO-RECOVERED")
-        lines.append(f"Expected session: {audit.expected_session}")
-        lines.append(f"Initially stale: {audit.stale_count}")
-        lines.append(f"Repaired: {summary['repaired']}")
-        lines.append(f"Excluded legitimate exceptions: {summary['excluded']}")
-        lines.append("Remaining stale: 0")
-        lines.append("Downstream signals: healthy")
+        lines = [
+            "TRADEHUB WATCH — AUTO-RECOVERED",
+            f"Expected session: {audit.expected_session}",
+            f"Universe total: {rec['universe_total']:,}",
+            f"Excluded legitimate exceptions: {rec['excluded_exceptions']:,}",
+            f"Eligible: {rec['eligible']:,}",
+            f"Stale before remediation: {rec['stale_before']:,}",
+            f"Repaired this run: {rec['repaired_this_run']:,}",
+            f"Fresh after remediation: {rec['fresh_after']:,}",
+            "Stale after remediation: 0",
+            "Quarantined after remediation: 0",
+            "Downstream signals: healthy",
+        ]
+        if problems:
+            lines.append("")
+            lines.append("REPORT INTEGRITY ERROR (counts do not reconcile):")
+            lines.extend(f"- {p}" for p in problems)
         return lines
 
-    oldest = min((s.last_bar for s in after.stale if s.last_bar), default=None)
-    lines.append("TRADEHUB WATCH — DATA FRESHNESS DEGRADED")
-    lines.append(f"Expected session: {audit.expected_session}")
-    lines.append(f"Universe: {audit.universe:,}")
-    lines.append(f"Fresh: {audit.fresh:,}")
-    lines.append(f"Initially stale: {audit.stale_count:,}")
-    lines.append("")
-    lines.append("Automatic remediation:")
-    lines.append(f"- {summary['repaired']:,} repaired successfully")
-    lines.append(f"- {summary['excluded']:,} excluded as valid non-trading/delisted exceptions")
-    lines.append(f"- {after.stale_count:,} remain unresolved")
-    lines.append("")
-    lines.append("Root causes:")
+    lines = [
+        "TRADEHUB WATCH — DATA FRESHNESS DEGRADED",
+        f"Expected session: {audit.expected_session}",
+        "",
+        f"Universe total: {rec['universe_total']:,}",
+        f"Excluded legitimate exceptions: {rec['excluded_exceptions']:,}",
+        f"Eligible: {rec['eligible']:,}",
+        f"  fresh before remediation: {rec['fresh_before']:,}"
+        f"  (at expected session {rec['at_expected_session']:,},"
+        f" within rolling window {rec['within_rolling_window']:,})",
+        f"  stale before remediation: {rec['stale_before']:,}",
+        "",
+        "Automatic remediation:",
+        f"- repaired this run: {rec['repaired_this_run']:,}",
+        f"- newly classified exceptions: {rec['newly_classified_exceptions']:,}",
+        "",
+        f"Fresh after remediation: {rec['fresh_after']:,}",
+        f"Stale after remediation: {rec['stale_after']:,}",
+        f"Quarantined after remediation: {rec['quarantined_after']:,}",
+        "",
+        "Root causes:",
+    ]
     for cause, members in sorted(audit.groups.items(), key=lambda kv: -len(kv[1])):
         lines.append(f"- {len(members):,} {cause.replace('_', ' ').lower()}")
+    oldest = min((s.last_bar for s in after.stale if s.last_bar), default=None)
     if oldest:
-        lines.append("")
         lines.append(f"Oldest unresolved data: {oldest}")
     lines.append("")
     lines.append("Downstream protection:")
-    lines.append(f"- {residual['active']:,} securities marked DATA_STALE")
+    lines.append(f"- {rec['quarantined_after']:,} securities marked DATA_STALE")
     lines.append("- excluded from affected signals")
-    if summary.get("quota_blocked"):
+    if rec["quota_blocked"]:
         lines.append("- remediation paused on the provider quota reserve (resumes next cycle)")
+    if rec["time_budget_exhausted"]:
+        lines.append("- remediation hit its time budget (resumes next cycle)")
+    if capacity:
+        lines.append("")
+        lines.append("Rolling-month symbol capacity:")
+        lines.append(
+            f"- {capacity.get('used', 0):,}/{capacity.get('limit', 0):,} distinct symbols reserved"
+            f"  (headroom {capacity.get('headroom', 0):,})"
+        )
+        if capacity.get("at_capacity"):
+            lines.append("- AT CAPACITY: only already-reserved symbols can be refreshed")
+        if capacity.get("deferred"):
+            lines.append(f"- {capacity['deferred']:,} new symbols could not be admitted")
     lines.append("")
     lines.append("Status: NEEDS ATTENTION")
     examples = after.stale[:8]
@@ -185,6 +291,10 @@ def render_freshness_report(audit, after, summary, residual) -> list[str]:
                 f"{s.ticker} — {s.last_bar or 'no bars'} — {s.classification} — "
                 f"{s.last_attempt_at or 'not attempted'}"
             )
+    if problems:
+        lines.append("")
+        lines.append("REPORT INTEGRITY ERROR (counts do not reconcile):")
+        lines.extend(f"- {p}" for p in problems)
     return lines
 
 
@@ -201,6 +311,7 @@ def check_data_freshness(settings, paths) -> None:
 
     experiment_db = ExperimentDB(paths.experiment_db)
     audit = df.audit_universe(settings=settings, paths=paths, experiment_db=experiment_db)
+    capacity = _symbol_capacity_state(settings)
 
     quarantined = sync_quarantine(
         [s.__dict__ for s in audit.stale],
@@ -256,6 +367,7 @@ def check_data_freshness(settings, paths) -> None:
             "remaining_stale": after.stale_count,
             "oldest_unresolved": oldest,
             "downstream": {"quarantined_active": residual["active"]},
+            "symbol_capacity": capacity,
             "disposition": "NEEDS_ATTENTION" if after.stale_count else "AUTO_RECOVERED",
             "unresolved_examples": [
                 {
@@ -268,7 +380,7 @@ def check_data_freshness(settings, paths) -> None:
             ],
         },
     )
-    ALERTS.extend(render_freshness_report(audit, after, summary, residual))
+    ALERTS.extend(render_freshness_report(audit, after, summary, residual, capacity))
 
 
 def check_forward_ledger(experiment_db, paths) -> None:

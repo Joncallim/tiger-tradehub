@@ -452,50 +452,65 @@ class TestHealthReportShape:
         """17: everything repaired -> the AUTO-RECOVERED summary, not an alert."""
         from tradehub_research.ops.health_watch import render_freshness_report
 
-        audit = _audit("2026-09-18", [("AAA", "1", "2026-09-09")])
+        audit = _audit(
+            "2026-09-18",
+            [(f"T{i}", str(i), "2026-09-09") for i in range(3)],
+            exceptions=[("X1", "e1", None), ("X2", "e2", None)],
+        )
+        audit.fresh = 5
+        audit.universe = 10  # = fresh_before 5 + stale_before 3 + exceptions 2
         text = "\n".join(
             render_freshness_report(
                 audit, _audit("2026-09-18", []),
-                self._summary(repaired=1, excluded=2, targeted=1), {"active": 0},
+                self._summary(repaired=1, excluded=2, targeted=3), {"active": 0},
             )
         )
         assert text.startswith("TRADEHUB WATCH — AUTO-RECOVERED")
         assert "Expected session: 2026-09-18" in text
-        assert "Initially stale: 1" in text
-        assert "Repaired: 1" in text
+        assert "Stale before remediation: 3" in text
+        assert "Repaired this run: 1" in text
         assert "Excluded legitimate exceptions: 2" in text
-        assert "Remaining stale: 0" in text
+        assert "Stale after remediation: 0" in text
+        assert "Quarantined after remediation: 0" in text
         assert "Downstream signals: healthy" in text
         assert "NEEDS ATTENTION" not in text
         assert "Unresolved examples" not in text
+        assert "REPORT INTEGRITY ERROR" not in text
 
     def test_unresolved_report_is_actionable(self):
         """18: unresolved names get grouped causes, examples and a status."""
         from tradehub_research.ops.health_watch import render_freshness_report
 
-        audit = _audit("2026-09-18", [("AAA", "1", "2026-09-09")])
-        audit.groups = {df.ROTATION_STARVED: ["AAA"], df.PROVIDER_THROTTLE: ["BBB"]}
-        audit.universe, audit.fresh = 443, 0
-        after = _audit("2026-09-18", [("AAA", "1", "2026-09-09")])
+        # A consistent fleet: universe 143 = fresh_before(135) + stale_before(8).
+        audit = _audit("2026-09-18", [(f"T{i:02d}", str(i), "2026-09-09") for i in range(8)])
+        audit.fresh = 100
+        audit.lagging_within_window = [f"W{i}" for i in range(35)]
+        audit.universe = 143
+        audit.groups = {df.ROTATION_STARVED: [f"T{i:02d}" for i in range(7)],
+                        df.PROVIDER_THROTTLE: ["T07"]}
+        after = _audit("2026-09-18", [("T00", "0", "2026-09-09")])
         after.stale[0].last_attempt_at = "2026-09-19T01:00:00Z"
         text = "\n".join(
             render_freshness_report(
-                audit, after, self._summary(repaired=5, excluded=3, unresolved=1), {"active": 1}
+                audit, after, self._summary(repaired=5, excluded=2, unresolved=1), {"active": 1}
             )
         )
         assert text.startswith("TRADEHUB WATCH — DATA FRESHNESS DEGRADED")
-        assert "Universe: 443" in text
-        assert "Initially stale: 1" in text
-        assert "- 5 repaired successfully" in text
-        assert "- 3 excluded as valid non-trading/delisted exceptions" in text
+        assert "Universe total: 143" in text
+        assert "Eligible: 143" in text
+        assert "stale before remediation: 8" in text
+        assert "- repaired this run: 5" in text
+        assert "- newly classified exceptions: 2" in text
+        assert "Stale after remediation: 1" in text
         assert "Root causes:" in text
-        assert "- 1 rotation budget starved" in text
+        assert "- 7 rotation budget starved" in text
         assert "- 1 provider throttling" in text
         assert "Oldest unresolved data: 2026-09-09" in text
         assert "Downstream protection:" in text
         assert "- 1 securities marked DATA_STALE" in text
         assert "Status: NEEDS ATTENTION" in text
-        assert "AAA — 2026-09-09 — ROTATION_BUDGET_STARVED — 2026-09-19T01:00:00Z" in text
+        assert "T00 — 2026-09-09 — ROTATION_BUDGET_STARVED — 2026-09-19T01:00:00Z" in text
+        assert "REPORT INTEGRITY ERROR" not in text
 
     def test_quota_pause_is_reported_when_it_happens(self):
         """6: a run paused on the provider quota says so instead of looking stuck."""

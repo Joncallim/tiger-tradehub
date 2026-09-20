@@ -66,6 +66,10 @@ INVALID_SYMBOL = "INVALID_SYMBOL"
 VALIDATION_FAILURE = "FETCHED_NOT_STORED"
 NO_TRADE_ON_SESSION = "NO_TRADE_ON_EXPECTED_SESSION"
 CHECKPOINT_LOST = "CHECKPOINT_LOST_RESUME_GAP"
+#: The request range included a session whose publication time has not arrived
+#: (Tiingo EOD PAT = session+1 00:15Z). A request-range defect at the caller, not
+#: a storage failure and not bad upstream data; the next cycle fixes it.
+NOT_YET_PUBLISHED = "UPSTREAM_SESSION_NOT_YET_PUBLISHED"
 UNRESOLVED = "UNRESOLVED"
 
 #: Causes that are genuine data defects and therefore remediable.
@@ -79,6 +83,7 @@ REMEDIABLE = frozenset(
         AUTH_FAILURE,
         VALIDATION_FAILURE,
         CHECKPOINT_LOST,
+        NOT_YET_PUBLISHED,
         UNRESOLVED,
     }
 )
@@ -95,6 +100,7 @@ _DEFAULT_CLASS_BY_ERROR = {
     "UNKNOWN_SYMBOL": INVALID_SYMBOL,
     "DUPLICATE_CIK": INVALID_SYMBOL,
     "PARSE": VALIDATION_FAILURE,
+    "NOT_YET_PUBLISHED": NOT_YET_PUBLISHED,
     "EMPTY": DELISTED_EMPTY,
 }
 
@@ -291,25 +297,100 @@ class AuditResult:
     def stale_count(self) -> int:
         return len(self.stale)
 
+    # --- reconciled fleet accounting -------------------------------------
+    # Every count below has exactly one meaning, and the report renders them so
+    # that the arithmetic can be checked by eye:
+    #
+    #   universe_total = eligible + excluded_exceptions
+    #   eligible       = fresh_before + stale_before
+    #   fresh_after    = fresh_before + repaired_this_run
+    #   stale_after    = stale_before - repaired_this_run - newly_classified_exceptions
+    #
+    # "Fresh" means "has the expected session's data". It never means "repaired".
+
+    @property
+    def universe_total(self) -> int:
+        """Every security in the canonical universe, before any exclusion."""
+        return self.universe
+
+    @property
+    def excluded_exceptions(self) -> int:
+        """Legitimately unfetchable: delisted, invalid symbol, no-trade."""
+        return len(self.exceptions)
+
+    @property
+    def eligible(self) -> int:
+        """Securities for which data is expected to exist at all."""
+        return self.universe - self.excluded_exceptions
+
+    @property
+    def fresh_before(self) -> int:
+        """Eligible securities already carrying the expected session, or inside
+        the rolling-coverage window (refreshed on schedule by design)."""
+        return self.fresh + len(self.lagging_within_window)
+
+    @property
+    def stale_before(self) -> int:
+        """Eligible securities past the freshness contract at detection time."""
+        return len(self.stale)
+
+    def invariant_errors(self) -> list[str]:
+        """Empty when the audit reconciles. A non-empty list is a defect in the
+        accounting, not in the market data, and must be surfaced rather than
+        rendered as a plausible-looking report."""
+        problems: list[str] = []
+        if self.universe_total != self.eligible + self.excluded_exceptions:
+            problems.append(
+                f"universe_total({self.universe_total}) != eligible({self.eligible}) "
+                f"+ excluded_exceptions({self.excluded_exceptions})"
+            )
+        if self.eligible != self.fresh_before + self.stale_before:
+            problems.append(
+                f"eligible({self.eligible}) != fresh_before({self.fresh_before}) "
+                f"+ stale_before({self.stale_before})"
+            )
+        if self.fresh + len(self.lagging_within_window) != self.fresh_before:
+            problems.append("fresh_before does not equal at_expected + within_window")
+        if not all(s.missing_sessions > 0 or s.last_bar is None for s in self.stale):
+            problems.append("a security classified stale is not actually behind")
+        return problems
+
     def as_dict(self) -> dict:
         return {
             "expected_session": self.expected_session,
-            "universe": self.universe,
-            "fresh": self.fresh,
-            "within_window": len(self.lagging_within_window),
+            "universe_total": self.universe_total,
+            "eligible": self.eligible,
+            "excluded_exceptions": self.excluded_exceptions,
+            "fresh_before": self.fresh_before,
+            "at_expected_session": self.fresh,
+            "within_rolling_window": len(self.lagging_within_window),
+            "stale_before": self.stale_before,
             "stale_count": self.stale_count,
+            "lagging_within_window": len(self.lagging_within_window),
             "exception_count": len(self.exceptions),
             "groups": {k: len(v) for k, v in sorted(self.groups.items())},
+            "invariant_errors": self.invariant_errors(),
             "stale": [asdict(s) for s in self.stale],
             "generated_at": self.generated_at,
         }
 
 
 def _classify_from_attempt(error: str | None, status: str | None) -> str | None:
+    """Classify a recorded ingestion attempt.
+
+    ``backfill_attempt`` is append-only, so a historical row keeps whatever
+    prefix the code wrote at the time (METRY's 2026-09-10 row says ``PARSE:``
+    even though the cause was an unpublished session). Classification therefore
+    has to be derivable from the stored TEXT, not only from a prefix written by
+    a newer version of the classifier.
+    """
     if not error:
         if status == "SKIPPED_QUOTA":
             return QUOTA_EXHAUSTED
         return None
+    lowered = error.lower()
+    if "cannot follow ingested_time" in lowered:
+        return NOT_YET_PUBLISHED  # timing, not a storage defect
     head = error.split(":", 1)[0].strip()
     return _DEFAULT_CLASS_BY_ERROR.get(head)
 

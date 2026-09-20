@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -294,6 +295,7 @@ def run_daily_refresh(
         rotated = 0
         retired = _load_retired()
         from tradehub_research.ops.market_calendar import count_sessions
+        from tradehub_research.ops.symbol_capacity import plan_symbol_capacity
 
         window_sessions = max(
             count_sessions(as_of - timedelta(days=REFRESH_STALENESS_DAYS), as_of), 1
@@ -302,9 +304,11 @@ def run_daily_refresh(
             rotation_budget = rotation_budget_for(len(by_ticker), window_sessions=window_sessions, as_of=as_of)
         summary["rotation_budget"] = rotation_budget
         summary["window_sessions"] = window_sessions
+
+        # Which symbols actually need a refresh? Decided before any request so
+        # the capacity plan below sees the true demand.
+        candidates: list[str] = []
         for ticker in sorted(by_ticker):
-            if rotated >= rotation_budget:
-                break
             if ticker.upper() in retired:
                 continue  # delisted/unresolvable -- no longer fetched
             sid = by_ticker[ticker]
@@ -314,6 +318,25 @@ def run_daily_refresh(
                 continue
             if symbol_has_evidence(research_db, ticker) is False:
                 continue  # never resolvable (UNKNOWN_SYMBOL) -- leave for the ledger
+            candidates.append(ticker)
+
+        # Rolling-month symbol capacity, planned BEFORE spending. A symbol already
+        # inside the window consumes no new capacity, so a set at 450/450 still
+        # refreshes everything the fleet already owns; only genuinely new symbols
+        # can be deferred, and they are reported instead of being silently
+        # dropped. This is what stops the ceiling being discovered by hitting it.
+        plan = plan_symbol_capacity(quota, candidates, now=time.time(), active=sorted(active))
+        summary["symbol_capacity"] = plan.as_dict()
+        if plan.deferred:
+            summary["symbol_capacity_deferred"] = plan.deferred[:50]
+            summary["symbol_capacity_deferred_count"] = len(plan.deferred)
+        admitted = set(plan.already_reserved) | set(plan.admissible_new)
+
+        for ticker in candidates:
+            if rotated >= rotation_budget:
+                break
+            if ticker.upper() not in admitted:
+                continue  # deferred by capacity; reported in the summary
             _refresh_one(adapter, quota, research_db, experiment_db, store, ticker, as_of, summary)
             summary["rotation_refreshed"] += 1
             rotated += 1
