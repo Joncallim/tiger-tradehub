@@ -7,10 +7,12 @@ system report a cause that was not the real one:
    refresh built its candidate list with ``sorted(by_ticker)`` and stopped the
    moment the budget was spent, so the budget always went to whatever sorts
    first. Live: 144 candidates against a 74-request budget -- the run refreshed
-   ``NPHC..SNROF`` and the 70 names *after* SNROF were never fetched, run after
-   run. They are stale to this day (last bar 2026-09-09). The fix orders
-   candidates by sessions-behind descending, so a shortfall can only ever be a
-   lag, never a permanent blind spot at the end of the alphabet.
+   ``NPHC..SNROF`` and the 70 names *after* SNROF were not fetched. Those names
+   are still stale (last bar 2026-09-09) after ten days of nightly refreshes,
+   because every run restarted the walk at the head of the alphabet. The fix
+   orders candidates by sessions-behind descending, so the budget is spent on
+   the worst data and service rotates through the backlog instead of always
+   beginning at the same place.
 
 2. **The audit judged the budget against the floor constant.** ``audit_universe``
    defaulted ``budget`` to ``ROTATION_REQUESTS_PER_RUN`` (40) while the deployed
@@ -93,6 +95,24 @@ class TestRotationPriority:
             window_sessions=WINDOW_SESSIONS,
         )
         assert ordered == ["A", "B", "C"]
+
+    def test_a_symbol_with_no_bars_is_served_before_merely_stale_ones(self, monkeypatch):
+        """CHECKPOINT_LOST is the worst data state, not the least urgent.
+
+        ``_sessions_behind`` reports "no bars" as the sentinel ``-1``. Ranking on
+        that raw value would put the symbol with no data at all behind every
+        symbol that merely holds an old bar -- and, whenever the positive-stale
+        backlog is at least the budget, behind them forever.
+        """
+        bars = {"S-OLD": "2026-06-08"}  # S-NEW holds no bars at all
+        self._wire(monkeypatch, bars)
+        ordered, _skipped = dr.rotation_candidates(
+            None,
+            {"OLD": "S-OLD", "NEW": "S-NEW"},
+            as_of=AS_OF,
+            window_sessions=WINDOW_SESSIONS,
+        )
+        assert ordered == ["NEW", "OLD"]
 
     def test_retired_and_unresolvable_names_never_consume_a_request(self, monkeypatch):
         bars = {"S-DEAD": "2026-08-01", "S-UNKNOWN": "2026-08-01", "S-LIVE": "2026-08-01"}

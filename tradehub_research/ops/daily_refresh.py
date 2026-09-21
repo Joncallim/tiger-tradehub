@@ -54,6 +54,11 @@ ROTATION_REQUESTS_PER_RUN = 40
 #: The provider quota (45/hr, 900/day reserve) still gates every request.
 ROTATION_REQUESTS_MAX = 200
 REFRESH_STALENESS_DAYS = 7
+#: Rotation priority for a symbol that holds no bars at all. Larger than any
+#: reachable sessions-behind value, so "no data" is served ahead of "old data"
+#: rather than behind it -- `_sessions_behind(None, ...)` returns -1, and using
+#: that raw sentinel as a rank is what would push it to the back of the queue.
+NEVER_INGESTED_RANK = 1 << 30
 # A symbol whose fetch returns 0 bars despite a data gap this long is treated
 # as delisted/unresolvable (Tiingo returns 200-with-empty for delisted names).
 RETIRE_GAP_DAYS = 14
@@ -263,9 +268,19 @@ def rotation_candidates(
     after run while shorter-stale names kept being served.
 
     Ranking by sessions-behind descending means the budget is always spent on the
-    worst data, so a shortfall can only ever be a lag -- a name waits longer than
-    the window, it does not become a permanent blind spot. Ticker is the
-    tie-break, so the walk stays deterministic and re-runs pick the same names.
+    worst data first. That is the difference between a bias and a bug: an
+    alphabetical walk serves the same head-of-alphabet names first on every run,
+    so while demand exceeds the budget the tail is deferred again and again --
+    which is exactly the 2026-09-09 cohort, still stale after ten days of nightly
+    refreshes. Worst-first rotates through the backlog instead, so a shortfall
+    shows up as a lag that grows no faster than the budget dictates, rather than
+    as a fixed set of names that is never served. Ticker is the tie-break, so the
+    walk stays deterministic and re-runs pick the same names.
+
+    A symbol with no bars at all sorts *first*, not last: `_sessions_behind`
+    reports "no bars" as the sentinel `-1`, and ranking on that raw value would
+    turn the sentinel into a permanent queue-priority penalty for precisely the
+    worst data state there is.
     """
     retired = retired or set()
     stale: list[tuple[int, str]] = []
@@ -280,7 +295,9 @@ def rotation_candidates(
             continue
         if symbol_has_evidence(research_db, ticker) is False:
             continue  # never resolvable (UNKNOWN_SYMBOL) -- leave for the ledger
-        stale.append((behind, ticker))
+        # No bars at all (CHECKPOINT_LOST) is the worst data state there is, so
+        # it ranks above every symbol that merely holds an old bar.
+        stale.append((NEVER_INGESTED_RANK if last is None else behind, ticker))
     stale.sort(key=lambda entry: (-entry[0], entry[1]))
     return [ticker for _behind, ticker in stale], skipped_fresh
 
