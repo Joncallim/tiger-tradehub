@@ -38,6 +38,7 @@ from tradehub_research.backfill.tiingo_driver import (
 )
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.evidence import EvidenceStore
+from tradehub_research.ops import refresh_runs
 from tradehub_research.ops.common import ResearchPaths, last_completed_us_session, research_paths
 from tradehub_research.validation.experiment_db import ExperimentDB
 
@@ -59,6 +60,15 @@ REFRESH_STALENESS_DAYS = 7
 #: rather than behind it -- `_sessions_behind(None, ...)` returns -1, and using
 #: that raw sentinel as a rank is what would push it to the back of the queue.
 NEVER_INGESTED_RANK = 1 << 30
+#: At most this fraction of a run's rotation budget may be spent on symbols
+#: whose most recent attempt failed. Without a ceiling, a cohort of persistently
+#: failing symbols as large as the budget consumes the whole rotation every run
+#: (a failure never advances a bar, so it returns at the front, forever) and
+#: healthy stale names behind it are never attempted.
+COOLING_BUDGET_DIVISOR = 4
+#: How far back the ledger is read to decide whether a symbol is still failing.
+#: Older failures have decayed: the symbol is treated as healthy again.
+FAILURE_LOOKBACK_DAYS = 30
 # A symbol whose fetch returns 0 bars despite a data gap this long is treated
 # as delisted/unresolvable (Tiingo returns 200-with-empty for delisted names).
 RETIRE_GAP_DAYS = 14
@@ -302,6 +312,169 @@ def rotation_candidates(
     return [ticker for _behind, ticker in stale], skipped_fresh
 
 
+def _is_quota_block(row) -> bool:
+    """Is this ledger row a provider *budget* refusal, not a symbol fault?
+
+    A quota block says nothing about the symbol, so it must never be counted as
+    one of its failures -- that is how a budget limit turns into a false
+    "this symbol is broken" story.
+    """
+    if str(row["status"] or "").upper() == "SKIPPED_QUOTA":
+        return True
+    return str(row["error"] or "").upper().startswith("QUOTA")
+
+
+def attempt_failure_state(experiment_db, tickers) -> dict[str, dict]:
+    """Durable per-symbol failure state, read from the append-only ledger.
+
+    Returns ``{TICKER: {"streak": int, "last_attempt_at": str | None}}``. ``streak``
+    is the number of consecutive most-recent attempts that failed; a landing
+    fetch resets it to zero, and quota blocks are transparent (neither a failure
+    nor a reset). Only the last ``FAILURE_LOOKBACK_DAYS`` are considered, so an
+    old failure decays instead of damning a symbol forever.
+
+    The ledger is the authority the diagnosis already classifies from, so the
+    rotation and the audit cannot disagree about what happened to a symbol: this
+    reads existing retry state rather than standing up a second retry system.
+    """
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    wanted = {str(t).upper() for t in tickers}
+    state: dict[str, dict] = {ticker: {"streak": 0, "last_attempt_at": None} for ticker in wanted}
+    if not state or experiment_db is None:
+        return state
+    since = (datetime.now(timezone.utc) - timedelta(days=FAILURE_LOOKBACK_DAYS)).isoformat()
+    try:
+        with experiment_db.connect(read_only=True) as conn:
+            rows = conn.execute(
+                "SELECT symbol_or_cik, status, error, requested_at FROM backfill_attempt "
+                "WHERE requested_at >= ? ORDER BY requested_at DESC",
+                (since,),
+            ).fetchall()
+    except sqlite3.Error:  # ledger unavailable / older schema: treat all as healthy
+        return state
+
+    settled: set[str] = set()
+    for row in rows:
+        ticker = str(row["symbol_or_cik"]).upper()
+        if ticker not in state or ticker in settled:
+            continue
+        entry = state[ticker]
+        if entry["last_attempt_at"] is None:
+            # Newest attempt of ANY kind: the fairness slice needs recency, and a
+            # quota block still tells us the symbol was attempted most recently.
+            entry["last_attempt_at"] = row["requested_at"]
+        if _is_quota_block(row):
+            continue
+        if str(row["status"]).upper() == "SUCCESS":
+            settled.add(ticker)  # the streak ends here
+            continue
+        entry["streak"] += 1
+    return state
+
+
+def allocate_rotation(
+    order: list[str], *, budget: int, failures: dict[str, dict] | None = None
+) -> tuple[list[str], dict[str, str]]:
+    """Split an ordered candidate list into ``(to_attempt, deferrals)``.
+
+    ``order`` is worst-stale-first (see :func:`rotation_candidates`). Symbols
+    whose recent attempts failed are held back into a **cooling** pool:
+
+    * ready candidates claim the budget first, so a failing symbol can never take
+      a slot from one that might actually heal;
+    * cooling candidates then claim at most ``budget // COOLING_BUDGET_DIVISOR``
+      of whatever budget is left, least-recently-attempted first, so failures are
+      still retried (transient ones recover) and rotate instead of monopolising;
+    * the bounded slice means a run never spends its whole budget re-fetching
+      symbols already known to be failing.
+
+    Deferrals carry a reason -- ``BUDGET_EXHAUSTED`` (ready, budget ran out) or
+    ``COOLING_SLICE`` (withheld by fairness) -- so the diagnosis and the operator
+    can tell deliberate scheduling from an interruption.
+    """
+    budget = max(0, int(budget))
+    state = {str(k).upper(): (v or {}) for k, v in (failures or {}).items()}
+
+    def streak_of(ticker: str) -> int:
+        return int(state.get(ticker.upper(), {}).get("streak", 0) or 0)
+
+    cooling = {ticker for ticker in order if streak_of(ticker) > 0}
+    ready = [ticker for ticker in order if ticker not in cooling]
+    cooling_order = sorted(
+        cooling,
+        key=lambda t: (str(state.get(t.upper(), {}).get("last_attempt_at") or ""), t),
+    )
+
+    allowance = max(1, budget // COOLING_BUDGET_DIVISOR) if budget else 0
+    chosen: set[str] = set(ready[:budget])
+    cooling_used = 0
+    for ticker in cooling_order:
+        if len(chosen) >= budget or cooling_used >= allowance:
+            break
+        chosen.add(ticker)
+        cooling_used += 1
+
+    to_attempt = [ticker for ticker in order if ticker in chosen]
+    deferrals = {
+        ticker: (
+            refresh_runs.DEFERRED_COOLING if ticker in cooling else refresh_runs.DEFERRED_BUDGET
+        )
+        for ticker in order
+        if ticker not in chosen
+    }
+    return to_attempt, deferrals
+
+
+def _open_refresh_run(paths, run_key: str, *, universe: int, summary: dict):
+    """Start the durable run record.
+
+    Best-effort on purpose: when the record cannot be written the audit sees no
+    completed run and falls back to the *conservative* "interrupted"
+    classification, which keeps the symbols actionable. A failed write therefore
+    degrades to more remediation, never to a bogus claim of deliberate deferral.
+    """
+    try:
+        store = refresh_runs.store_for(paths)
+        store.open_run(
+            run_key,
+            run_key,
+            universe=universe,
+            window_sessions=summary.get("window_sessions"),
+            rotation_budget=summary.get("rotation_budget"),
+            candidates=summary.get("rotation_candidates"),
+        )
+        return store
+    except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
+        summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
+        return None
+
+
+def _close_refresh_run(store, run_key: str, outcomes: dict[str, str], summary: dict) -> None:
+    """Close the run record, or leave it OPEN so it reads as interrupted.
+
+    Only ``OK`` and ``QUOTA_EXHAUSTED`` are closed. A run that died mid-flight
+    stays ``RUNNING``; that is what stops a crashed refresh from being read as a
+    deliberate deferral.
+    """
+    status = {
+        "OK": refresh_runs.COMPLETED,
+        "QUOTA_EXHAUSTED": refresh_runs.QUOTA_EXHAUSTED,
+    }.get(summary.get("status"))
+    if store is None or status is None:
+        return
+    try:
+        store.finish(run_key, status, outcomes)
+    except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
+        summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
+        return
+    summary["refresh_run_status"] = status
+    summary["refresh_run_deferred"] = sum(
+        1 for disposition in outcomes.values() if disposition in refresh_runs.DEFERRED
+    )
+
+
 def run_daily_refresh(
     *,
     settings,
@@ -339,6 +512,10 @@ def run_daily_refresh(
         "active_refreshed": 0,
         "rotation_refreshed": 0,
     }
+    # Declared before the try so every exit path can close the run record.
+    run_key = as_of.isoformat()
+    outcomes: dict[str, str] = {}
+    roster = None
     try:
         # 1. Active set first: securities with recent production screens.
         active = _active_securities(research_db) & set(by_ticker)
@@ -398,20 +575,46 @@ def run_daily_refresh(
             summary["symbol_capacity_deferred_count"] = len(plan.deferred)
         admitted = set(plan.already_reserved) | set(plan.admissible_new)
 
+        # Fairness before spending: a symbol whose recent attempts keep failing
+        # must not be able to consume the budget that names behind it need. See
+        # `allocate_rotation`.
+        failures = attempt_failure_state(experiment_db, candidates)
+        summary["rotation_cooling"] = sum(
+            1
+            for ticker in candidates
+            if int((failures.get(ticker.upper()) or {}).get("streak", 0) or 0) > 0
+        )
+        to_attempt, deferrals = allocate_rotation(
+            candidates, budget=rotation_budget, failures=failures
+        )
+
         for ticker in candidates:
-            if rotated >= rotation_budget:
-                break
             if ticker.upper() not in admitted:
-                continue  # deferred by capacity; reported in the summary
+                outcomes[ticker] = refresh_runs.DEFERRED_CAPACITY
+            elif ticker in deferrals:
+                outcomes[ticker] = deferrals[ticker]
+        roster = _open_refresh_run(paths, run_key, universe=len(by_ticker), summary=summary)
+
+        for ticker in to_attempt:
+            if ticker.upper() not in admitted:
+                continue  # capacity-deferred; already recorded
+            before_success = summary["SUCCESS"]
             _refresh_one(adapter, quota, research_db, experiment_db, store, ticker, as_of, summary)
+            outcomes[ticker] = (
+                refresh_runs.REFRESHED
+                if summary["SUCCESS"] > before_success
+                else refresh_runs.FAILED
+            )
             summary["rotation_refreshed"] += 1
             rotated += 1
     except RuntimeError as exc:
         if "quota" in str(exc):
             summary["status"] = "QUOTA_EXHAUSTED"
+            _close_refresh_run(roster, run_key, outcomes, summary)
             return summary
-        raise
+        raise  # an unexpected fault leaves the run OPEN: reads as interrupted
     summary["status"] = "OK"
+    _close_refresh_run(roster, run_key, outcomes, summary)
     return summary
 
 

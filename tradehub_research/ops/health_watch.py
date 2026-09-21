@@ -320,6 +320,20 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
     ]
     for cause, members in sorted(audit.groups.items(), key=lambda kv: -len(kv[1])):
         lines.append(f"- {len(members):,} {cause.replace('_', ' ').lower()}")
+    if audit.scheduled_count:
+        run = audit.refresh_run or {}
+        lines.append("")
+        lines.append("Scheduled deferral (bounded by design, not an interruption):")
+        lines.append(
+            f"- {audit.scheduled_count:,} securities deferred by the COMPLETED "
+            f"{audit.expected_session} refresh"
+        )
+        lines.append(
+            f"- that run served {run.get('refreshed') or 0:,} of "
+            f"{run.get('candidates') or 0:,} candidates against a "
+            f"{run.get('rotation_budget') or 0:,}-request budget"
+        )
+        lines.append("- the rotation drains them on later runs; not remediated here")
     oldest = min((s.last_bar for s in after.stale if s.last_bar), default=None)
     if oldest:
         lines.append(f"Oldest unresolved data: {oldest}")
@@ -414,10 +428,13 @@ def check_data_freshness(settings, paths) -> None:
             "universe": audit.universe,
             "fresh": audit.fresh,
             "initially_stale": audit.stale_count,
+            "scheduled_deferrals": audit.scheduled_count,
+            "refresh_run": audit.refresh_run,
             "root_causes": {k: len(v) for k, v in sorted(audit.groups.items())},
             "remediation": {
                 "run_key": summary["run_key"],
                 "targeted": summary["targeted"],
+                "scheduled_deferrals": summary.get("scheduled_deferrals", 0),
                 "repaired": summary["repaired"],
                 "excluded": summary["excluded"],
                 "unresolved": summary["unresolved"],

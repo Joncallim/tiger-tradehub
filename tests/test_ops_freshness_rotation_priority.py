@@ -135,7 +135,11 @@ class TestRotationPriority:
         """
         research_db = ResearchDB(tmp_path / "research.db", 5000)
         research_db.migrate()
-        paths = SimpleNamespace(research_db=tmp_path / "research.db")
+        from tradehub_research.validation.experiment_db import ExperimentDB
+
+        experiment_db = ExperimentDB(tmp_path / "experiment.db")
+        experiment_db.migrate()
+        paths = SimpleNamespace(research_db=tmp_path / "research.db", research_dir=tmp_path)
         settings = SimpleNamespace(
             busy_timeout_ms=5000,
             tiingo_token=None,
@@ -165,7 +169,7 @@ class TestRotationPriority:
 
         summary = dr.run_daily_refresh(
             settings=settings,
-            experiment_db=None,
+            experiment_db=experiment_db,
             paths=paths,
             as_of=AS_OF,
             rotation_budget=1,
@@ -174,6 +178,10 @@ class TestRotationPriority:
         assert summary["rotation_refreshed"] == 1
         assert refreshed == ["ZED"], "the single request must land on the worst data"
         assert summary["rotation_candidates"] == 2  # MID + ZED
+        # The run's own record is durable, so the diagnosis can later tell a
+        # deliberate deferral from an interruption.
+        assert summary["refresh_run_status"] == dr.refresh_runs.COMPLETED
+        assert summary["refresh_run_deferred"] == 1  # MID, budget exhausted
 
 
 # ---------------------------------------------------------------------------

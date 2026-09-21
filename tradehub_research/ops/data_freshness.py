@@ -43,6 +43,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from tradehub_research.ops import refresh_runs
 from tradehub_research.ops.common import ResearchPaths, research_paths
 from tradehub_research.ops.market_calendar import (
     count_sessions,
@@ -75,6 +76,13 @@ CHECKPOINT_LOST = "CHECKPOINT_LOST_RESUME_GAP"
 #: a storage failure and not bad upstream data; the next cycle fixes it.
 NOT_YET_PUBLISHED = "UPSTREAM_SESSION_NOT_YET_PUBLISHED"
 UNRESOLVED = "UNRESOLVED"
+#: The refresh COMPLETED and deliberately left this symbol for a later run: it was
+#: a rotation candidate and the budget (or the fairness slice) did not reach it.
+#: Distinct from INTERRUPTED_INGESTION_BATCH, which means the run did not finish
+#: the work it had taken on. Telling those two apart matters twice over: an
+#: interruption is a defect to chase, a scheduled deferral is the bounded design
+#: working, and only the interruption should spend remediation quota.
+SCHEDULED_DEFERRAL = "SCHEDULED_DEFERRAL"
 
 #: Causes that are genuine data defects and therefore remediable.
 REMEDIABLE = frozenset(
@@ -94,6 +102,11 @@ REMEDIABLE = frozenset(
 
 #: Causes that are legitimate exceptions: nothing to fetch, nothing to fix.
 LEGITIMATE_EXCEPTIONS = frozenset({DELISTED_EMPTY, INVALID_SYMBOL, NO_TRADE_ON_SESSION})
+
+#: Stale, visible, reported -- but NOT remediation work. A completed run already
+#: scheduled these; re-fetching them spends provider quota to duplicate the
+#: rotation's own plan.
+SCHEDULED_ONLY = frozenset({SCHEDULED_DEFERRAL})
 
 _DEFAULT_CLASS_BY_ERROR = {
     "RATE_LIMITED": PROVIDER_THROTTLE,
@@ -389,11 +402,21 @@ class AuditResult:
     exceptions: list[SecurityFreshness] = field(default_factory=list)
     lagging_within_window: list[str] = field(default_factory=list)
     groups: dict[str, list[str]] = field(default_factory=dict)
+    #: Ticker -> reason, for symbols the last COMPLETED refresh deliberately left
+    #: for a later run. Empty when no completed run exists for this session.
+    scheduled_deferrals: dict[str, str] = field(default_factory=dict)
+    #: The completed run's own record (budget, demand, served), for the report.
+    refresh_run: dict | None = None
     generated_at: str = field(default_factory=_utc_now)
 
     @property
     def stale_count(self) -> int:
         return len(self.stale)
+
+    @property
+    def scheduled_count(self) -> int:
+        """Stale because a completed run scheduled them for later -- not a defect."""
+        return len(self.scheduled_deferrals)
 
     # --- reconciled fleet accounting -------------------------------------
     # Every count below has exactly one meaning, and the report renders them so
@@ -465,6 +488,8 @@ class AuditResult:
             "stale_before": self.stale_before,
             "stale_count": self.stale_count,
             "lagging_within_window": len(self.lagging_within_window),
+            "scheduled_deferrals": self.scheduled_count,
+            "refresh_run": self.refresh_run,
             "exception_count": len(self.exceptions),
             "groups": {k: len(v) for k, v in sorted(self.groups.items())},
             "invariant_errors": self.invariant_errors(),
@@ -491,6 +516,28 @@ def _classify_from_attempt(error: str | None, status: str | None) -> str | None:
         return NOT_YET_PUBLISHED  # timing, not a storage defect
     head = error.split(":", 1)[0].strip()
     return _DEFAULT_CLASS_BY_ERROR.get(head)
+
+
+def _completed_deferrals(paths, expected: date) -> tuple[dict[str, str], dict | None]:
+    """What the last **COMPLETED** refresh deliberately left for a later run.
+
+    Returns ``({TICKER: reason}, run_record)``. Empty when there is no completed
+    run for this session -- including when the roster cannot be read. That
+    direction is deliberate: an unreadable record must degrade to the
+    conservative "interrupted" classification, because claiming a deliberate
+    deferral would suppress remediation on evidence we do not have.
+    """
+    from tradehub_research.ops import refresh_runs
+
+    try:
+        store = refresh_runs.store_for(paths)
+        record = store.completed_run(expected.isoformat())
+        if not record:
+            return {}, None
+        deferrals = store.completed_deferrals(expected.isoformat())
+    except Exception:  # noqa: BLE001 -- the diagnosis must not crash on its own evidence
+        return {}, None
+    return {ticker.upper(): reason for ticker, reason in deferrals.items()}, record
 
 
 def _last_bar(research_db, security_id: str) -> str | None:
@@ -552,6 +599,8 @@ def audit_universe(
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
     canonical = canonical_tickers_by_cik(research_db)
     retired = retired_tickers()
+    # Deliberate deferral vs interruption: only a COMPLETED run may claim one.
+    deferred, refresh_run = _completed_deferrals(paths, expected)
 
     # The refresh design states its window in CALENDAR days
     # (REFRESH_STALENESS_DAYS = 7, "the whole cohort rolls over every few
@@ -581,7 +630,12 @@ def audit_universe(
     required_daily = -(-len(canonical) // window_sessions)  # ceil
     budget_starved = budget < required_daily
 
-    result = AuditResult(expected_session=expected.isoformat(), universe=len(canonical), fresh=0)
+    result = AuditResult(
+        expected_session=expected.isoformat(),
+        universe=len(canonical),
+        fresh=0,
+        refresh_run=refresh_run,
+    )
     for security_id, ticker in sorted(canonical.items(), key=lambda kv: kv[1]):
         last = _last_bar(research_db, security_id)
         behind = sessions_behind(date.fromisoformat(last) if last else None, expected)
@@ -623,12 +677,28 @@ def audit_universe(
                 ):
                     classification = VALIDATION_FAILURE
             if classification is None:
-                classification = ROTATION_STARVED if budget_starved else INTERRUPTED_BATCH
+                if budget_starved:
+                    # Structural: the budget cannot hold the contract at all, so a
+                    # deferral is a symptom of that, not the cause to report.
+                    classification = ROTATION_STARVED
+                elif ticker.upper() in deferred:
+                    classification = SCHEDULED_DEFERRAL
+                else:
+                    classification = INTERRUPTED_BATCH
 
         if classification == ROTATION_STARVED and notes is None:
             notes = (
                 f"refresh budget {budget}/day cannot cover {len(canonical)} symbols "
                 f"within the {REFRESH_STALENESS_DAYS}-day window (needs {required_daily}/day)"
+            )
+        elif classification == SCHEDULED_DEFERRAL:
+            reason = deferred.get(ticker.upper(), "")
+            planned = (refresh_run or {}).get("candidates")
+            notes = (
+                f"deferred by the completed {expected.isoformat()} refresh "
+                f"({refresh_runs.deferral_reason_text(reason)}); "
+                f"{len(deferred)} of {planned} candidates deferred against a "
+                f"{budget}-request budget"
             )
 
         row = SecurityFreshness(
@@ -643,6 +713,8 @@ def audit_universe(
             last_attempt_error=(attempt or {}).get("error"),
             notes=notes,
         )
+        if classification == SCHEDULED_DEFERRAL:
+            result.scheduled_deferrals[ticker] = deferred[ticker.upper()]
         if classification in LEGITIMATE_EXCEPTIONS:
             result.exceptions.append(row)
         else:
@@ -712,6 +784,18 @@ def remediate(
     store.open_run(run_key, expected.isoformat(), audit.universe, audit.stale_count)
     for row in audit.stale:
         store.seed_symbol(run_key, row.ticker, row.security_id, row.last_bar, row.classification)
+        if row.classification in SCHEDULED_ONLY:
+            # A completed refresh already scheduled this symbol for a later run.
+            # It stays visible in the checkpoint and in the report, but it is not
+            # work: re-fetching it would duplicate the rotation's own plan and
+            # spend provider quota that the genuinely broken symbols need.
+            store.settle(
+                run_key,
+                row.ticker,
+                disposition="DEFERRED",
+                last_bar_after=row.last_bar,
+                classification=row.classification,
+            )
     for row in audit.exceptions:
         store.seed_symbol(run_key, row.ticker, row.security_id, row.last_bar, row.classification)
         store.settle(
@@ -732,10 +816,14 @@ def remediate(
         )
     store_evidence = EvidenceStore(research_db)
 
+    scheduled = sum(1 for row in audit.stale if row.classification in SCHEDULED_ONLY)
     summary = {
         "run_key": run_key,
         "expected_session": expected.isoformat(),
-        "targeted": len(audit.stale),
+        # Work remediation will actually attempt: a completed refresh's scheduled
+        # deferrals are already planned, so they are not counted as targets.
+        "targeted": len(audit.stale) - scheduled,
+        "scheduled_deferrals": scheduled,
         "repaired": 0,
         "excluded": len(audit.exceptions),
         "unresolved": 0,
