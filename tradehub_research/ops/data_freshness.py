@@ -664,8 +664,25 @@ def audit_universe(
             continue
         else:
             # Materially stale: past the contract the refresh itself claims.
+            # Precedence matters here:
+            #   1. a structural shortfall is the root cause, so it is named;
+            #   2. then a deliberate deferral by a COMPLETED run, which owns that
+            #      symbol's scheduling. This must outrank the ledger-derived
+            #      class: a DEFERRED_COOLING symbol *by definition* has a recent
+            #      failed attempt, so classifying from the attempt first would
+            #      hand every deliberately cooled symbol back to remediation --
+            #      bypassing the fairness slice and spending the quota it exists
+            #      to protect. A FAILED outcome is not a deferral (it is absent
+            #      from ``deferred``), so a symbol the run actually tried and lost
+            #      keeps its failure classification;
+            #   3. then the symbol's own recorded outcome;
+            #   4. else the batch simply did not finish.
             classification = None
-            if attempt:
+            if budget_starved:
+                classification = ROTATION_STARVED
+            elif ticker.upper() in deferred:
+                classification = SCHEDULED_DEFERRAL
+            elif attempt:
                 classification = _classify_from_attempt(attempt.get("error"), attempt.get("status"))
                 # "Fetched but not stored" needs the attempt to have run AFTER
                 # the expected session's publication boundary -- otherwise the
@@ -677,14 +694,7 @@ def audit_universe(
                 ):
                     classification = VALIDATION_FAILURE
             if classification is None:
-                if budget_starved:
-                    # Structural: the budget cannot hold the contract at all, so a
-                    # deferral is a symptom of that, not the cause to report.
-                    classification = ROTATION_STARVED
-                elif ticker.upper() in deferred:
-                    classification = SCHEDULED_DEFERRAL
-                else:
-                    classification = INTERRUPTED_BATCH
+                classification = INTERRUPTED_BATCH
 
         if classification == ROTATION_STARVED and notes is None:
             notes = (

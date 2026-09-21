@@ -559,9 +559,9 @@ def run_daily_refresh(
         summary["SKIPPED_FRESH"] += skipped_fresh
         # Disclose the shortfall instead of letting it show up as a silent
         # staleness report days later: candidates > budget is the whole reason
-        # the 2026-09-21 backlog existed.
+        # the 2026-09-21 backlog existed. The served/deferred split is computed
+        # below, over the candidates the symbol ceiling actually admitted.
         summary["rotation_candidates"] = len(candidates)
-        summary["rotation_deferred_to_next_run"] = max(0, len(candidates) - rotation_budget)
 
         # Rolling-month symbol capacity, planned BEFORE spending. A symbol already
         # inside the window consumes no new capacity, so a set at 450/450 still
@@ -578,14 +578,24 @@ def run_daily_refresh(
         # Fairness before spending: a symbol whose recent attempts keep failing
         # must not be able to consume the budget that names behind it need. See
         # `allocate_rotation`.
-        failures = attempt_failure_state(experiment_db, candidates)
+        #
+        # Allocate over the ADMITTED candidates only. A candidate the rolling-month
+        # ceiling refused cannot be fetched, so letting it hold a budget slot would
+        # waste a request the run is allowed to spend and leave later admitted
+        # names marked deferred -- a completed run spending less than its budget
+        # while refreshable stale names wait.
+        admitted_candidates = [ticker for ticker in candidates if ticker.upper() in admitted]
+        failures = attempt_failure_state(experiment_db, admitted_candidates)
         summary["rotation_cooling"] = sum(
             1
-            for ticker in candidates
+            for ticker in admitted_candidates
             if int((failures.get(ticker.upper()) or {}).get("streak", 0) or 0) > 0
         )
         to_attempt, deferrals = allocate_rotation(
-            candidates, budget=rotation_budget, failures=failures
+            admitted_candidates, budget=rotation_budget, failures=failures
+        )
+        summary["rotation_deferred_to_next_run"] = max(
+            0, len(admitted_candidates) - rotation_budget
         )
 
         for ticker in candidates:
@@ -596,8 +606,6 @@ def run_daily_refresh(
         roster = _open_refresh_run(paths, run_key, universe=len(by_ticker), summary=summary)
 
         for ticker in to_attempt:
-            if ticker.upper() not in admitted:
-                continue  # capacity-deferred; already recorded
             before_success = summary["SUCCESS"]
             _refresh_one(adapter, quota, research_db, experiment_db, store, ticker, as_of, summary)
             outcomes[ticker] = (
