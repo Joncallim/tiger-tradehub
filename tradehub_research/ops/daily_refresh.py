@@ -242,6 +242,49 @@ def _refresh_one(
             raise
 
 
+def rotation_candidates(
+    research_db: ResearchDB,
+    by_ticker: dict[str, str],
+    *,
+    as_of: date,
+    window_sessions: int,
+    retired: set[str] | None = None,
+) -> tuple[list[str], int]:
+    """Symbols that need a refresh this run, MOST STALE FIRST.
+
+    Returns ``(ordered_tickers, skipped_fresh)``.
+
+    The ordering is part of the contract, not a nicety. The rotation has a hard
+    budget and stops the moment it is spent, so a purely alphabetical walk spends
+    the whole budget on whatever sorts first and starves the end of the alphabet
+    permanently -- the 2026-09-21 state: 144 candidates against a 74-request
+    budget, the run refreshed NPHC..SNROF, and the 70 symbols sorting *after*
+    SNROF were never fetched. They had last-bar 2026-09-09 and stayed there run
+    after run while shorter-stale names kept being served.
+
+    Ranking by sessions-behind descending means the budget is always spent on the
+    worst data, so a shortfall can only ever be a lag -- a name waits longer than
+    the window, it does not become a permanent blind spot. Ticker is the
+    tie-break, so the walk stays deterministic and re-runs pick the same names.
+    """
+    retired = retired or set()
+    stale: list[tuple[int, str]] = []
+    skipped_fresh = 0
+    for ticker in sorted(by_ticker):
+        if ticker.upper() in retired:
+            continue  # delisted/unresolvable -- no longer fetched
+        last = _last_bar_date(research_db, by_ticker[ticker])
+        behind = _sessions_behind(last, as_of)
+        if last is not None and behind <= window_sessions:
+            skipped_fresh += 1
+            continue
+        if symbol_has_evidence(research_db, ticker) is False:
+            continue  # never resolvable (UNKNOWN_SYMBOL) -- leave for the ledger
+        stale.append((behind, ticker))
+    stale.sort(key=lambda entry: (-entry[0], entry[1]))
+    return [ticker for _behind, ticker in stale], skipped_fresh
+
+
 def run_daily_refresh(
     *,
     settings,
@@ -309,19 +352,22 @@ def run_daily_refresh(
         summary["window_sessions"] = window_sessions
 
         # Which symbols actually need a refresh? Decided before any request so
-        # the capacity plan below sees the true demand.
-        candidates: list[str] = []
-        for ticker in sorted(by_ticker):
-            if ticker.upper() in retired:
-                continue  # delisted/unresolvable -- no longer fetched
-            sid = by_ticker[ticker]
-            last = _last_bar_date(research_db, sid)
-            if last is not None and _sessions_behind(last, as_of) <= window_sessions:
-                summary["SKIPPED_FRESH"] += 1
-                continue
-            if symbol_has_evidence(research_db, ticker) is False:
-                continue  # never resolvable (UNKNOWN_SYMBOL) -- leave for the ledger
-            candidates.append(ticker)
+        # the capacity plan below sees the true demand, and ordered worst-first
+        # so that when the demand exceeds the budget the requests go to the most
+        # stale names rather than to the start of the alphabet.
+        candidates, skipped_fresh = rotation_candidates(
+            research_db,
+            by_ticker,
+            as_of=as_of,
+            window_sessions=window_sessions,
+            retired=retired,
+        )
+        summary["SKIPPED_FRESH"] += skipped_fresh
+        # Disclose the shortfall instead of letting it show up as a silent
+        # staleness report days later: candidates > budget is the whole reason
+        # the 2026-09-21 backlog existed.
+        summary["rotation_candidates"] = len(candidates)
+        summary["rotation_deferred_to_next_run"] = max(0, len(candidates) - rotation_budget)
 
         # Rolling-month symbol capacity, planned BEFORE spending. A symbol already
         # inside the window consumes no new capacity, so a set at 450/450 still

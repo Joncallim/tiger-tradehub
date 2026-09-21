@@ -543,8 +543,8 @@ def audit_universe(
     from tradehub_research.db import ResearchDB
     from tradehub_research.ops.daily_refresh import (
         REFRESH_STALENESS_DAYS,
-        ROTATION_REQUESTS_PER_RUN,
         retired_tickers,
+        rotation_budget_for,
     )
 
     paths = paths or research_paths()
@@ -552,7 +552,6 @@ def audit_universe(
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
     canonical = canonical_tickers_by_cik(research_db)
     retired = retired_tickers()
-    budget = rotation_budget if rotation_budget is not None else ROTATION_REQUESTS_PER_RUN
 
     # The refresh design states its window in CALENDAR days
     # (REFRESH_STALENESS_DAYS = 7, "the whole cohort rolls over every few
@@ -562,6 +561,20 @@ def audit_universe(
     # the contract speak the same unit.
     window_sessions = max(
         count_sessions(expected - timedelta(days=REFRESH_STALENESS_DAYS), expected), 1
+    )
+
+    # Judge against the EFFECTIVE budget the refresh actually runs with, not the
+    # floor constant. `rotation_budget_for` sizes the rotation to the universe
+    # precisely so the contract is achievable by construction, so the floor (40)
+    # is not what production spends. Defaulting to it made every backlog read as a
+    # structural shortfall and told the operator "refresh budget 40/day cannot
+    # cover 443 symbols ... (needs 74/day)" on a deployment whose refresh was
+    # already running at 74/day (2026-09-22) -- a false root cause covering the
+    # real one (candidates exceeding the budget, see `rotation_candidates`).
+    budget = (
+        rotation_budget
+        if rotation_budget is not None
+        else rotation_budget_for(len(canonical), window_sessions=window_sessions, as_of=expected)
     )
 
     # Structural diagnosis: can the refresh budget hold the contract at all?
