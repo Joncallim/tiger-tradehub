@@ -383,11 +383,17 @@ def allocate_rotation(
     whose recent attempts failed are held back into a **cooling** pool:
 
     * ready candidates claim the budget first, so a failing symbol can never take
-      a slot from one that might actually heal;
-    * cooling candidates then claim at most ``budget // COOLING_BUDGET_DIVISOR``
-      of whatever budget is left, least-recently-attempted first, so failures are
-      still retried (transient ones recover) and rotate instead of monopolising;
-    * the bounded slice means a run never spends its whole budget re-fetching
+      a slot from one that might actually heal -- but a bounded share is *reserved*
+      for cooling retries, because with ready demand permanently at capacity the
+      cooling pool would otherwise never be reached at all, and a symbol that
+      merely failed once would stay deferred (and, since scheduled work is not
+      remediated, quarantined) forever. The reservation never takes the last slot
+      from ready work: with a one-request budget the healthy candidate still goes
+      first;
+    * cooling candidates use the reserved share, least-recently-attempted first, so
+      failures are still retried (transient ones recover) and rotate instead of
+      monopolising;
+    * the share is bounded, so a run never spends its whole budget re-fetching
       symbols already known to be failing.
 
     Deferrals carry a reason -- ``BUDGET_EXHAUSTED`` (ready, budget ran out) or
@@ -408,10 +414,21 @@ def allocate_rotation(
     )
 
     allowance = max(1, budget // COOLING_BUDGET_DIVISOR) if budget else 0
-    chosen: set[str] = set(ready[:budget])
+    # Reserve cooling's retry share. The reservation is skipped entirely when
+    # nothing is cooling (the budget belongs to real work), and it never takes the
+    # last slot from ready candidates -- with a one-request budget the healthy
+    # candidate still goes first. With no ready candidates, cooling may use its
+    # whole allowance: there is nothing else worth spending on.
+    if not cooling_order:
+        reserved = 0
+    elif ready:
+        reserved = min(allowance, max(0, budget - 1))
+    else:
+        reserved = allowance
+    chosen: set[str] = set(ready[: budget - reserved])
     cooling_used = 0
     for ticker in cooling_order:
-        if len(chosen) >= budget or cooling_used >= allowance:
+        if len(chosen) >= budget or cooling_used >= reserved:
             break
         chosen.add(ticker)
         cooling_used += 1
@@ -501,6 +518,12 @@ def _close_refresh_run(
         for ticker, disposition in outcomes.items()
         if ticker not in active_attempted
     }
+    # SUCCESSES, not attempts: `summary["rotation_refreshed"]` counts requests the
+    # rotation spent (a failed or empty fetch still spends one), while the report's
+    # "served" figure must mean the candidate actually advanced.
+    rotation_refreshed = sum(
+        1 for disposition in rotation.values() if disposition == refresh_runs.REFRESHED
+    )
     rotation_deferred = sum(
         1 for disposition in rotation.values() if disposition in refresh_runs.DEFERRED
     )
@@ -510,7 +533,7 @@ def _close_refresh_run(
             status,
             outcomes,
             candidates=summary.get("rotation_candidates", len(rotation)),
-            refreshed=summary.get("rotation_refreshed", 0),
+            refreshed=rotation_refreshed,
             deferred=rotation_deferred,
         )
     except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
@@ -623,11 +646,9 @@ def run_daily_refresh(
             retired=retired,
         )
         summary["SKIPPED_FRESH"] += skipped_fresh
-        # Disclose the shortfall instead of letting it show up as a silent
-        # staleness report days later: candidates > budget is the whole reason
-        # the 2026-09-21 backlog existed. The served/deferred split is computed
-        # below, over the candidates the symbol ceiling actually admitted.
-        summary["rotation_candidates"] = len(candidates)
+        # The served/deferred split, and the demand the budget is measured against,
+        # are computed below -- over the candidates the symbol ceiling admitted and
+        # the active phase did not already attempt.
 
         # Rolling-month symbol capacity, planned BEFORE spending. A symbol already
         # inside the window consumes no new capacity, so a set at 450/450 still
@@ -651,10 +672,13 @@ def run_daily_refresh(
         # names marked deferred -- a completed run spending less than its budget
         # while refreshable stale names wait.
         # Symbols the active phase already attempted are not fetched again in the
-        # same run: one attempt each, and their outcome is already recorded.
-        admitted_candidates = [
-            ticker for ticker in candidates if ticker.upper() in admitted and ticker not in outcomes
-        ]
+        # same run: one attempt each, and their outcome is already recorded. They
+        # are also not rotation DEMAND -- the rotation never had them to serve, and
+        # an active FAILURE stays stale, so counting it here would overstate the
+        # demand the budget was measured against.
+        rotation_demand = [ticker for ticker in candidates if ticker not in active_attempted]
+        summary["rotation_candidates"] = len(rotation_demand)
+        admitted_candidates = [ticker for ticker in rotation_demand if ticker.upper() in admitted]
         failures = attempt_failure_state(experiment_db, admitted_candidates)
         summary["rotation_cooling"] = sum(
             1
@@ -680,7 +704,7 @@ def run_daily_refresh(
             run_key,
             window_sessions=window_sessions,
             rotation_budget=rotation_budget,
-            candidates=len(candidates),
+            candidates=summary["rotation_candidates"],
             summary=summary,
         )
 

@@ -133,14 +133,21 @@ class TestBudgetAllocation:
         assert deferrals == {"ZFAIL": dr.refresh_runs.DEFERRED_COOLING}
 
     def test_a_budget_sized_cohort_of_failures_cannot_starve_the_remainder(self):
-        """The review's exact scenario: as many failures as the whole budget."""
+        """The review's exact scenario: as many failures as the whole budget.
+
+        Ready work keeps the majority of the budget; the cooling cohort gets its
+        bounded retry share; and nothing is left permanently unserved.
+        """
         failures = {f"F{i}": _failed(3) for i in range(3)}
         to_attempt, deferrals = dr.allocate_rotation(
             ["F0", "F1", "F2", "H1", "H2", "H3"], budget=3, failures=failures
         )
-        assert to_attempt == ["H1", "H2", "H3"], "healthy names must never be crowded out"
-        assert set(deferrals) == set(failures)
-        assert set(deferrals.values()) == {dr.refresh_runs.DEFERRED_COOLING}
+        ready_served = sorted(t for t in to_attempt if t.startswith("H"))
+        cooling_served = [t for t in to_attempt if t.startswith("F")]
+        assert ready_served == ["H1", "H2"], "healthy names must keep the budget's majority"
+        assert len(cooling_served) == 1, "and cooling gets exactly its reserved retry slot"
+        assert len(deferrals) == 3, "nobody is silently dropped"
+        assert deferrals["H3"] == dr.refresh_runs.DEFERRED_BUDGET
 
     def test_transient_failures_remain_retryable(self):
         """Once the ready pool leaves room, a cooling symbol is attempted again."""
