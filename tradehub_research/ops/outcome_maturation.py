@@ -18,6 +18,19 @@ and then take the LATEST bar at or before that target as the exit, which could
 Now the exit is exactly the horizon-th session after entry, and a shortfall of
 realized sessions is never reported as an observation.
 
+ENTRY SESSION (fixed 2026-09-22, before the first production cohort matured)
+
+The entry session is the first VALID MARKET SESSION strictly after the
+prediction's ``as_of``, taken from the market calendar -- not "whichever bar comes
+first". A price bar dated on a weekend or a market holiday is not a session and
+is dropped outright: it may never establish an entry, an exit, a session count or
+a due/maturity date. Live example: ``METRY`` (METRO INC./ADR) carries
+calendar-daily Tiingo bars (194 of its 621 bars fall on weekends/holidays), which
+previously made a Saturday bar the "entry session". If the expected entry
+session's bar is missing, the prediction is honestly not yet evaluable
+(``AWAITING_ENTRY_BAR``) and is retried -- the entry is NEVER shifted to a later
+session, because that would silently price a different prediction.
+
 HONEST STATES
 
 The outcome table is append-only with ``UNIQUE(prediction_id)``: ONE outcome per
@@ -46,11 +59,13 @@ from datetime import date
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.ops.common import ResearchPaths, research_paths
-from tradehub_research.ops.market_calendar import count_sessions
+from tradehub_research.ops.market_calendar import count_sessions, is_session_day
+from tradehub_research.portfolio import prices
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.forward_collector import append_outcome
 from tradehub_research.validation.horizons import (
     HORIZON_SESSIONS,
+    entry_session_for,
     required_exit_session,
     select_exit_bar,
 )
@@ -65,38 +80,66 @@ DATA_GRACE_SESSIONS = 5
 TERMINAL_STATUSES = ("OBSERVED", "DELISTING_OUTCOME_UNKNOWN", "CENSORED_INSUFFICIENT_HORIZON")
 
 #: Pending (no row appended) reasons. Pending is retryable by design.
-AWAITING_ENTRY = "AWAITING_ENTRY"
+AWAITING_ENTRY_BAR = "AWAITING_ENTRY_BAR"
 AWAITING_HORIZON = "AWAITING_HORIZON"
+PENDING_REASONS = (AWAITING_ENTRY_BAR, AWAITING_HORIZON)
 
 
-def _session_bars(
-    research_db: ResearchDB, security_id: str, as_of: str
+def _canonical_session_bars(
+    research_db: ResearchDB,
+    security_id: str,
+    as_of: str,
+    collection_date: date,
 ) -> list[tuple[str, float | None]]:
-    """Canonical session bars strictly after ``as_of``: [(session_date, close)].
+    """Canonical SESSION bars strictly after ``as_of``: [(session_date, close)].
 
-    One entry per session, oldest first. Sessions -- not bars -- are the unit:
-    duplicate rows for a session collapse, and a session with no bar simply is
-    not a completed session yet.
+    Three filters, in order:
+
+    1. the existing canonical rule (``portfolio.prices._bar_records``): identical
+       duplicate bars for one session collapse, CONFLICTING bars for one session
+       make that session UNKNOWN, and a bar whose session date is after the
+       collection date is never consumed;
+    2. the market calendar: a bar dated on a weekend or a market holiday IS NOT A
+       SESSION and is dropped entirely -- it may never establish an entry, an
+       exit, a session count or a due/maturity date. Live example: ``METRY``
+       (METRO INC./ADR) carries calendar-daily Tiingo bars, 194 of 621 on
+       weekends/holidays;
+    3. sessions only: one row per completed trading session, oldest first.
+
+    Nothing is ever shifted: dropping a non-session bar does not move the entry.
     """
     with research_db.connect(read_only=True) as conn:
         rows = conn.execute(
-            "SELECT json_extract(structured_fields, '$.session_date') AS d, "
-            "json_extract(structured_fields, '$.close') AS c "
+            "SELECT evidence_id, source_id, security_id, event_time, structured_fields "
             "FROM evidence_event WHERE security_id=? AND source_id='tiingo_eod' "
             "AND json_extract(structured_fields, '$.record_type')='price_bar' "
             "AND json_extract(structured_fields, '$.session_date') > ? "
-            "ORDER BY d",
+            "ORDER BY json_extract(structured_fields, '$.session_date'), evidence_id",
             (security_id, as_of[:10]),
         ).fetchall()
+    records = [
+        {
+            "evidence_id": row["evidence_id"],
+            "source_id": row["source_id"],
+            "security_id": row["security_id"],
+            "event_time": row["event_time"],
+            "structured_fields": json.loads(row["structured_fields"] or "{}"),
+        }
+        for row in rows
+    ]
     bars: list[tuple[str, float | None]] = []
-    for row in rows:
-        session = row["d"]
+    for record in prices._bar_records(records, collection_date.isoformat()):
+        fields = record["structured_fields"]
+        session = str(fields.get("session_date") or "")[:10]
         if not session:
             continue
-        session = str(session)[:10]
-        if bars and bars[-1][0] == session:
-            continue  # one canonical bar per session
-        close = row["c"]
+        try:
+            day = date.fromisoformat(session)
+        except ValueError:
+            continue
+        if not is_session_day(day):
+            continue  # a weekend/holiday bar is not a session
+        close = fields.get("close")
         try:
             close = float(close) if close is not None else None
         except (TypeError, ValueError):
@@ -137,20 +180,26 @@ def _evaluate(
     "exit_session_date": str | None, "detail": str}``.
     """
     exists, delisted_at = _security_state(research_db, security_id)
-    bars = _session_bars(research_db, security_id, as_of)
-    if not bars:
-        # No entry session at all. Terminal only when the name cannot resolve.
-        if not exists or delisted_at is not None:
-            return {
-                "status": "DELISTING_OUTCOME_UNKNOWN",
-                "pending": None,
-                "detail": "no entry session; security delisted or unknown",
-            }
-        return {
-            "status": None,
-            "pending": AWAITING_ENTRY,
-            "detail": "no session after as_of yet",
-        }
+    bars = _canonical_session_bars(research_db, security_id, as_of, collection_date)
+
+    # The entry session is decided by the MARKET CALENDAR, never by whichever bar
+    # happens to be first: the first valid session strictly after the prediction's
+    # as_of. A weekend/holiday bar can therefore never become "the entry".
+    expected_entry = entry_session_for(as_of)
+    if not bars or bars[0][0] != expected_entry:
+        first = bars[0][0] if bars else None
+        detail = (
+            f"expected entry session {expected_entry} has no usable bar"
+            if first is None
+            else f"expected entry session {expected_entry} has no usable bar "
+            f"(first usable bar is {first})"
+        )
+        # Terminal only when the horizon of the name is genuinely unresolvable.
+        if not exists or (delisted_at is not None and delisted_at <= expected_entry):
+            return {"status": "DELISTING_OUTCOME_UNKNOWN", "pending": None, "detail": detail}
+        # Never shift the entry to a later session -- that would silently price a
+        # different prediction. Not yet evaluable, retryable, and visible.
+        return {"status": None, "pending": AWAITING_ENTRY_BAR, "detail": detail}
 
     entry_session, entry_close = bars[0]
     # The horizon counts sessions AFTER the entry session -- the same bars the
@@ -165,6 +214,7 @@ def _evaluate(
         return {
             "status": "DELISTING_OUTCOME_UNKNOWN",
             "pending": None,
+            "entry_session_date": entry_session,
             "detail": f"delisted {delisted_at} at/before the exit session {exit_session}",
         }
 
@@ -176,21 +226,24 @@ def _evaluate(
                 "pending": AWAITING_HORIZON,
                 "detail": f"exit session {exit_session} has not arrived",
             }
-        lag = count_sessions(date.fromisoformat(bars[-1][0]), date.fromisoformat(exit_session))
+        lag = count_sessions(
+            date.fromisoformat(post_entry[-1][0]), date.fromisoformat(exit_session)
+        )
         if lag <= DATA_GRACE_SESSIONS:
             return {
                 "status": None,
                 "pending": AWAITING_HORIZON,
                 "detail": (
-                    f"{len(bars)}/{horizon_sessions} sessions; data {lag} session(s) "
+                    f"{len(post_entry)}/{horizon_sessions} sessions; data {lag} session(s) "
                     "behind the exit session"
                 ),
             }
         return {
             "status": "CENSORED_INSUFFICIENT_HORIZON",
             "pending": None,
+            "entry_session_date": entry_session,
             "detail": (
-                f"{len(bars)}/{horizon_sessions} sessions, exit session {exit_session} "
+                f"{len(post_entry)}/{horizon_sessions} sessions, exit session {exit_session} "
                 f"is {lag} sessions past and the data did not arrive"
             ),
         }
@@ -200,6 +253,7 @@ def _evaluate(
         return {
             "status": "CENSORED_INSUFFICIENT_HORIZON",
             "pending": None,
+            "entry_session_date": entry_session,
             "detail": "a realized bar carries no usable close",
         }
     return {
@@ -239,17 +293,13 @@ def mature_due_outcomes(
             (due.isoformat(),),
         ).fetchall()
 
-    counts = {
-        **{status: 0 for status in TERMINAL_STATUSES},
-        AWAITING_ENTRY: 0,
-        AWAITING_HORIZON: 0,
-    }
+    counts = {status: 0 for status in TERMINAL_STATUSES}
+    awaiting = {reason: 0 for reason in PENDING_REASONS}
     materialized = 0
     for row in pending:
         horizon = int(row["horizon_sessions"])
         if horizon not in HORIZON_SESSIONS:
-            counts.setdefault("UNKNOWN_HORIZON", 0)
-            counts["UNKNOWN_HORIZON"] += 1
+            awaiting["UNKNOWN_HORIZON"] = awaiting.get("UNKNOWN_HORIZON", 0) + 1
             continue
         result = _evaluate(
             research_db,
@@ -259,7 +309,7 @@ def mature_due_outcomes(
             collection_date=due,
         )
         if result["status"] is None:
-            counts[result["pending"]] = counts.get(result["pending"], 0) + 1
+            awaiting[result["pending"]] = awaiting.get(result["pending"], 0) + 1
             continue
         append_outcome(
             experiment_db,
@@ -277,7 +327,10 @@ def mature_due_outcomes(
         "collection_date": due.isoformat(),
         "due": len(pending),
         "materialized": materialized,
-        "matured": counts,
+        # Rows appended by THIS run, keyed by the status written.
+        "matured": {status: n for status, n in counts.items() if n},
+        # Due but honestly not evaluable yet (retryable): no row was appended.
+        "awaiting": {reason: n for reason, n in awaiting.items() if n},
         "created_at": utc_now(),
     }
 

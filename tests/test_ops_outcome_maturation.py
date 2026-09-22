@@ -200,8 +200,7 @@ def test_twenty_sessions_cannot_be_observed(tmp_path):
 
     assert summary["due"] == 1
     assert _outcomes(exp) == [], "an immature horizon must not be materialized"
-    assert summary["matured"]["OBSERVED"] == 0
-    assert summary["matured"]["AWAITING_HORIZON"] == 1
+    assert summary["awaiting"]["AWAITING_HORIZON"] == 1
 
 
 def test_the_same_prediction_becomes_observed_once_the_horizon_completes(tmp_path):
@@ -331,7 +330,7 @@ def test_no_entry_session_is_pending_not_a_bogus_status(tmp_path):
     )
 
     assert _outcomes(exp) == []
-    assert summary["matured"]["AWAITING_ENTRY"] == 1
+    assert summary["awaiting"]["AWAITING_ENTRY_BAR"] == 1
 
 
 def test_every_appended_status_is_in_the_schema_enum(tmp_path):
