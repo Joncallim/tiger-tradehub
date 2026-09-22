@@ -451,6 +451,29 @@ def _open_refresh_run(paths, run_key: str, *, universe: int, summary: dict):
         return None
 
 
+def _update_refresh_run(
+    store,
+    run_key: str,
+    *,
+    window_sessions: int | None,
+    rotation_budget: int | None,
+    candidates: int | None,
+    summary: dict,
+) -> None:
+    """Record the facts that are only known after the universe has been read."""
+    if store is None:
+        return
+    try:
+        store.update_metadata(
+            run_key,
+            window_sessions=window_sessions,
+            rotation_budget=rotation_budget,
+            candidates=candidates,
+        )
+    except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
+        summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
+
+
 def _close_refresh_run(store, run_key: str, outcomes: dict[str, str], summary: dict) -> None:
     """Close the run record, or leave it OPEN so it reads as interrupted.
 
@@ -515,7 +538,12 @@ def run_daily_refresh(
     # Declared before the try so every exit path can close the run record.
     run_key = as_of.isoformat()
     outcomes: dict[str, str] = {}
-    roster = None
+    # Open (or reset) the session record BEFORE the first fallible request. A
+    # same-session re-run must invalidate the previous COMPLETED record straight
+    # away: if this run then exhausts quota or dies, the old run's deferral list
+    # must not survive as authoritative, or the diagnosis would suppress
+    # remediation for a session whose latest attempt was interrupted.
+    roster = _open_refresh_run(paths, run_key, universe=len(by_ticker), summary=summary)
     try:
         # 1. Active set first: securities with recent production screens.
         active = _active_securities(research_db) & set(by_ticker)
@@ -524,8 +552,20 @@ def run_daily_refresh(
             if not _needs_fresh(research_db, sid, as_of.isoformat()):
                 summary["SKIPPED_FRESH"] += 1
                 continue
+            before_success = summary["SUCCESS"]
             _refresh_one(adapter, quota, research_db, experiment_db, store, ticker, as_of, summary)
             summary["active_refreshed"] += 1
+            # These symbols were genuinely attempted; record the outcome as such
+            # rather than letting them read as "deliberately skipped" later. A
+            # symbol the active phase failed is cooling in the rotation, so
+            # without this it would be recorded DEFERRED_COOLING -- and the
+            # diagnosis gives a deferral precedence over the failure, silencing
+            # remediation for a real error.
+            outcomes[ticker] = (
+                refresh_runs.REFRESHED
+                if summary["SUCCESS"] > before_success
+                else refresh_runs.FAILED
+            )
         # 2. Rotation: cohort symbols not refreshed within the rolling window.
         #    The window is measured in SESSIONS, not calendar days: weekends and
         #    holidays must never count against a symbol, and the budget is sized to
@@ -584,7 +624,11 @@ def run_daily_refresh(
         # waste a request the run is allowed to spend and leave later admitted
         # names marked deferred -- a completed run spending less than its budget
         # while refreshable stale names wait.
-        admitted_candidates = [ticker for ticker in candidates if ticker.upper() in admitted]
+        # Symbols the active phase already attempted are not fetched again in the
+        # same run: one attempt each, and their outcome is already recorded.
+        admitted_candidates = [
+            ticker for ticker in candidates if ticker.upper() in admitted and ticker not in outcomes
+        ]
         failures = attempt_failure_state(experiment_db, admitted_candidates)
         summary["rotation_cooling"] = sum(
             1
@@ -599,11 +643,20 @@ def run_daily_refresh(
         )
 
         for ticker in candidates:
+            if ticker in outcomes:
+                continue  # attempted in the active phase; that outcome stands
             if ticker.upper() not in admitted:
                 outcomes[ticker] = refresh_runs.DEFERRED_CAPACITY
             elif ticker in deferrals:
                 outcomes[ticker] = deferrals[ticker]
-        roster = _open_refresh_run(paths, run_key, universe=len(by_ticker), summary=summary)
+        _update_refresh_run(
+            roster,
+            run_key,
+            window_sessions=window_sessions,
+            rotation_budget=rotation_budget,
+            candidates=len(candidates),
+            summary=summary,
+        )
 
         for ticker in to_attempt:
             before_success = summary["SUCCESS"]

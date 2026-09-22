@@ -244,6 +244,23 @@ class CheckpointStore:
             ).fetchone()
         return int(row["attempts"]) if row else 0
 
+    def reopen_deferred(self, run_key: str, ticker: str, classification: str) -> None:
+        """Return a scheduled-deferral row to the work queue when it becomes work.
+
+        ``seed_symbol`` is INSERT OR IGNORE, so a terminal ``DEFERRED`` row would
+        otherwise never be reset: a symbol the refresh later attempted and failed
+        becomes actionable again, yet stays invisible to ``pending()`` and is
+        reported as targeted while never being fetched. Only rows settled as a
+        deliberate deferral are reopened -- a REPAIRED/EXCLUDED/UNRESOLVED verdict
+        must not be undone by a later pass.
+        """
+        with self._connect() as db:
+            db.execute(
+                "UPDATE remediation_symbol SET disposition='PENDING', classification=? "
+                "WHERE run_key=? AND ticker=? AND disposition='DEFERRED'",
+                (classification, run_key, ticker),
+            )
+
     def settle(
         self,
         run_key: str,
@@ -343,11 +360,18 @@ def _quota_hourly_remaining(adapter) -> int | None:
     return remaining.get("hourly")
 
 
-def _ledger_write(experiment_db, *, ticker: str, error: str) -> None:
-    """Append the EMPTY/delisting finding to the authoritative ledger.
+def _ledger_write(
+    experiment_db, *, ticker: str, error: str | None = None, status: str = "ERROR"
+) -> None:
+    """Append an attempt outcome to the authoritative ledger.
 
     Fails closed on an expected I/O error; lets anything else (including a
     programming fault such as a missing import) propagate untouched.
+
+    A *successful* remediation must be recorded too: the rotation derives each
+    symbol's failure streak from this ledger, so leaving a repair unrecorded
+    leaves the last row an old error and the symbol reads as failing long after
+    it was fixed.
     """
     from tradehub_research.backfill.tiingo_driver import record_attempt
 
@@ -355,7 +379,7 @@ def _ledger_write(experiment_db, *, ticker: str, error: str) -> None:
         record_attempt(
             experiment_db,
             ticker=ticker,
-            status="ERROR",
+            status=status,
             http_status=None,
             bytes_count=None,
             error=error,
@@ -538,6 +562,28 @@ def _completed_deferrals(paths, expected: date) -> tuple[dict[str, str], dict | 
     except Exception:  # noqa: BLE001 -- the diagnosis must not crash on its own evidence
         return {}, None
     return {ticker.upper(): reason for ticker, reason in deferrals.items()}, record
+
+
+def _ledger_write_optional(
+    experiment_db, *, ticker: str, status: str, error: str | None, summary: dict
+) -> bool:
+    """Best-effort ledger evidence for a repair: never fatal, never silent.
+
+    A landed bar is already observable in ``research.db``, so an unwritable
+    ledger must not throw away a repair that genuinely happened -- unlike the
+    EMPTY/delisting finding, which fails closed because the audit and the
+    quarantine read it from this ledger. The shortfall is counted in the summary
+    instead of disappearing.
+    """
+    if experiment_db is None:
+        summary["repair_ledger_unrecorded"] = summary.get("repair_ledger_unrecorded", 0) + 1
+        return False
+    try:
+        _ledger_write(experiment_db, ticker=ticker, status=status, error=error)
+        return True
+    except LEDGER_IO_FAILURES:
+        summary["repair_ledger_unrecorded"] = summary.get("repair_ledger_unrecorded", 0) + 1
+        return False
 
 
 def _last_bar(research_db, security_id: str) -> str | None:
@@ -806,6 +852,11 @@ def remediate(
                 last_bar_after=row.last_bar,
                 classification=row.classification,
             )
+        else:
+            # It became actionable again (the refresh attempted it and failed, or
+            # the run that deferred it is no longer the latest word). Undo the
+            # previous pass's DEFERRED verdict or `pending()` will never return it.
+            store.reopen_deferred(run_key, row.ticker, row.classification)
     for row in audit.exceptions:
         store.seed_symbol(run_key, row.ticker, row.security_id, row.last_bar, row.classification)
         store.settle(
@@ -839,6 +890,9 @@ def remediate(
         "unresolved": 0,
         "attempts": 0,
         "quota_blocked": False,
+        # Repairs whose evidence could not be appended to the ledger (disclosed,
+        # because the rotation's failure streaks read from that ledger).
+        "repair_ledger_unrecorded": 0,
     }
 
     for row in store.pending(run_key, now=now):
@@ -984,6 +1038,13 @@ def remediate(
             summary["excluded"] += 1
             continue
         if verified:
+            # Record the repair in the ledger as well as the checkpoint: the
+            # rotation derives failure streaks from the ledger, so an unrecorded
+            # success leaves the previous error as the newest row and the symbol
+            # reads as failing long after it was fixed.
+            _ledger_write_optional(
+                experiment_db, ticker=ticker, status="SUCCESS", error=None, summary=summary
+            )
             store.settle(run_key, ticker, disposition="REPAIRED", last_bar_after=after)
             summary["repaired"] += 1
             continue

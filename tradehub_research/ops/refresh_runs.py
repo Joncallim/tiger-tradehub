@@ -147,6 +147,28 @@ class RefreshRunStore:
                 ),
             )
 
+    def update_metadata(
+        self,
+        run_key: str,
+        *,
+        window_sessions: int | None = None,
+        rotation_budget: int | None = None,
+        candidates: int | None = None,
+    ) -> None:
+        """Fill in facts discovered after the run was opened.
+
+        Kept separate from :meth:`open_run` because the run must be marked
+        ``RUNNING`` *before* the first fallible request, while the window, budget
+        and demand are only known once the universe has been read.
+        """
+        with self._connect() as db:
+            db.execute(
+                "UPDATE refresh_run SET window_sessions=COALESCE(?, window_sessions), "
+                "rotation_budget=COALESCE(?, rotation_budget), "
+                "candidates=COALESCE(?, candidates) WHERE run_key=?",
+                (window_sessions, rotation_budget, candidates, run_key),
+            )
+
     def finish(self, run_key: str, status: str, outcomes: dict[str, str]) -> None:
         """Close the run and record what happened to every candidate.
 
