@@ -705,6 +705,12 @@ def audit_universe(
         if last is None:
             if symbol_has_evidence(research_db, ticker) is False:
                 classification = INVALID_SYMBOL  # never resolvable; nothing to fetch
+            elif ticker.upper() in deferred:
+                # A completed run owns this symbol's scheduling even when it holds
+                # no usable bars: re-fetching it would bypass the bounded rotation
+                # schedule -- and, for a CAPACITY_DEFERRED symbol, the rolling-month
+                # ceiling that refused it in the first place.
+                classification = SCHEDULED_DEFERRAL
             else:
                 classification = CHECKPOINT_LOST
         elif ticker.upper() in retired:

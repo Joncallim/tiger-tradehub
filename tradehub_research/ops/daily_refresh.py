@@ -422,7 +422,10 @@ def allocate_rotation(
     if not cooling_order:
         reserved = 0
     elif ready:
-        reserved = min(allowance, max(0, budget - 1))
+        # Capped by the retries that actually exist: reserving more than there are
+        # cooling symbols would idle budget while stale ready names wait (budget 74
+        # with one cooling symbol must not cost 17 ready fetches).
+        reserved = min(allowance, len(cooling_order), max(0, budget - 1))
     else:
         reserved = allowance
     chosen: set[str] = set(ready[: budget - reserved])
