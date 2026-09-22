@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -137,7 +138,13 @@ class RefreshRunStore:
         conditioned on the token this call mints.
         """
         token = uuid.uuid4().hex
-        with self._connect() as db:
+        db = self._connect()
+        try:
+            # One transaction: the status reset and the invalidation of the
+            # previous invocation's outcomes land together or not at all. A reader
+            # must never see the session reset to RUNNING while still being able to
+            # load the superseded invocation's deferrals.
+            db.execute("BEGIN")
             db.execute(
                 "INSERT INTO refresh_run(run_key, expected_session, invocation_id, started_at, "
                 "status, universe, window_sessions, rotation_budget, candidates) "
@@ -158,6 +165,18 @@ class RefreshRunStore:
                     candidates,
                 ),
             )
+            # The previous invocation's outcomes are no longer authoritative: this
+            # run owns the session now. Leaving them behind is what let a reader
+            # combine "COMPLETED" with a stale deferral list.
+            db.execute("DELETE FROM refresh_symbol WHERE run_key=?", (run_key,))
+            db.execute("UPDATE refresh_run SET refreshed=0, deferred=0 WHERE run_key=?", (run_key,))
+            db.execute("COMMIT")
+        except Exception:
+            with suppress(sqlite3.Error):
+                db.execute("ROLLBACK")
+            raise
+        finally:
+            db.close()
         return token
 
     def update_metadata(
@@ -253,38 +272,73 @@ class RefreshRunStore:
         return True
 
     # --- reader ----------------------------------------------------------
-    def run(self, run_key: str) -> dict[str, Any] | None:
-        """The session's run record, whatever its state (None if never started)."""
-        with self._connect() as db:
-            row = db.execute("SELECT * FROM refresh_run WHERE run_key=?", (run_key,)).fetchone()
-        return dict(row) if row else None
+    def snapshot(self, run_key: str) -> dict[str, Any]:
+        """Run status, invocation and outcomes from ONE consistent read.
 
-    def outcomes(self, run_key: str) -> dict[str, str]:
-        with self._connect() as db:
-            rows = db.execute(
+        This is the only authoritative read. Taking the status and the symbol rows
+        on separate connections leaves a window in which a same-session re-run can
+        claim the row: the reader sees ``COMPLETED`` from invocation N and then
+        loads outcomes that are no longer authoritative, because N+1 owns the
+        session. Those stale deferrals would then suppress remediation for a run
+        that is actually incomplete.
+
+        SQLite in WAL mode gives one read transaction a single snapshot of the
+        database, so both reads are taken inside one transaction here and every
+        consumer derives from this method -- including ``deferrals``, which is only
+        populated for a ``COMPLETED`` run (nothing else may claim a deliberate
+        deferral).
+
+        Returns ``{"run", "outcomes", "deferrals", "completed"}``.
+        """
+        db = self._connect()
+        try:
+            db.execute("BEGIN")  # read snapshot: status and outcomes together
+            run = db.execute("SELECT * FROM refresh_run WHERE run_key=?", (run_key,)).fetchone()
+            symbols = db.execute(
                 "SELECT ticker, disposition FROM refresh_symbol WHERE run_key=?", (run_key,)
             ).fetchall()
-        return {str(r["ticker"]): str(r["disposition"]) for r in rows}
+            db.execute("COMMIT")
+        finally:
+            db.close()
+        record = dict(run) if run else None
+        outcomes = {str(row["ticker"]): str(row["disposition"]) for row in symbols}
+        completed = bool(record) and record.get("status") == COMPLETED
+        return {
+            "run": record,
+            "outcomes": outcomes,
+            "deferrals": (
+                {
+                    ticker: disposition
+                    for ticker, disposition in outcomes.items()
+                    if disposition in DEFERRED
+                }
+                if completed
+                else {}
+            ),
+            "completed": completed,
+        }
+
+    def run(self, run_key: str) -> dict[str, Any] | None:
+        """The session's run record, whatever its state (None if never started)."""
+        return self.snapshot(run_key)["run"]
+
+    def outcomes(self, run_key: str) -> dict[str, str]:
+        return self.snapshot(run_key)["outcomes"]
 
     def completed_deferrals(self, run_key: str) -> dict[str, str]:
         """Deliberately deferred tickers of a **COMPLETED** run: {ticker: reason}.
 
-        Empty when the run never started, never finished, or stopped on quota --
-        i.e. whenever "deferred on purpose" would be an unfounded claim.
+        Empty when the run never started, never finished, stopped on quota, or was
+        superseded by a newer invocation -- i.e. whenever "deferred on purpose"
+        would be an unfounded claim. Read from the same snapshot as the status, so
+        the two can never disagree.
         """
-        record = self.run(run_key)
-        if not record or record.get("status") != COMPLETED:
-            return {}
-        return {
-            ticker: disposition
-            for ticker, disposition in self.outcomes(run_key).items()
-            if disposition in DEFERRED
-        }
+        return self.snapshot(run_key)["deferrals"]
 
     def completed_run(self, run_key: str) -> dict[str, Any] | None:
         """The run record only when it COMPLETED (the deliberate-deferral basis)."""
-        record = self.run(run_key)
-        return record if record and record.get("status") == COMPLETED else None
+        snapshot = self.snapshot(run_key)
+        return snapshot["run"] if snapshot["completed"] else None
 
 
 def store_for(paths) -> RefreshRunStore:

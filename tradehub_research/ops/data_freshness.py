@@ -551,23 +551,26 @@ def _classify_from_attempt(error: str | None, status: str | None) -> str | None:
 def _completed_deferrals(paths, expected: date) -> tuple[dict[str, str], dict | None]:
     """What the last **COMPLETED** refresh deliberately left for a later run.
 
-    Returns ``({TICKER: reason}, run_record)``. Empty when there is no completed
-    run for this session -- including when the roster cannot be read. That
-    direction is deliberate: an unreadable record must degrade to the
-    conservative "interrupted" classification, because claiming a deliberate
-    deferral would suppress remediation on evidence we do not have.
+    Returns ``({TICKER: reason}, run_record)`` and ``({}, None)`` when there is no
+    such record -- including when the roster cannot be read, so an unreadable
+    record degrades to the conservative "interrupted" classification rather than
+    claiming a deliberate deferral.
+
+    Status and dispositions come from ONE ``snapshot()`` read: two separate reads
+    let a same-session re-run claim the row in between, which would return a
+    superseded invocation's deferrals as if the session had completed them.
     """
     from tradehub_research.ops import refresh_runs
 
     try:
-        store = refresh_runs.store_for(paths)
-        record = store.completed_run(expected.isoformat())
-        if not record:
-            return {}, None
-        deferrals = store.completed_deferrals(expected.isoformat())
+        snapshot = refresh_runs.store_for(paths).snapshot(expected.isoformat())
     except Exception:  # noqa: BLE001 -- the diagnosis must not crash on its own evidence
         return {}, None
-    return {ticker.upper(): reason for ticker, reason in deferrals.items()}, record
+    if not snapshot["completed"]:
+        return {}, None
+    return {ticker.upper(): reason for ticker, reason in snapshot["deferrals"].items()}, snapshot[
+        "run"
+    ]
 
 
 def _ledger_write_optional(
