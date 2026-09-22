@@ -726,8 +726,13 @@ def audit_universe(
         else:
             # Materially stale: past the contract the refresh itself claims.
             # Precedence matters here:
-            #   1. a structural shortfall is the root cause, so it is named;
-            #   2. then a deliberate deferral by a COMPLETED run, which owns that
+            #   1. a CAPACITY deferral outranks everything below: it records that
+            #      the rolling-month symbol ceiling refused the symbol, which is a
+            #      hard constraint rather than a scheduling choice, so re-fetching
+            #      it would defy the capacity decision -- and it is not a symptom of
+            #      the request budget, so a structural shortfall must not claim it;
+            #   2. then a structural shortfall is the root cause, so it is named;
+            #   3. then a deliberate deferral by a COMPLETED run, which owns that
             #      symbol's scheduling. This must outrank the ledger-derived
             #      class: a DEFERRED_COOLING symbol *by definition* has a recent
             #      failed attempt, so classifying from the attempt first would
@@ -736,12 +741,15 @@ def audit_universe(
             #      to protect. A FAILED outcome is not a deferral (it is absent
             #      from ``deferred``), so a symbol the run actually tried and lost
             #      keeps its failure classification;
-            #   3. then the symbol's own recorded outcome;
-            #   4. else the batch simply did not finish.
+            #   4. then the symbol's own recorded outcome;
+            #   5. else the batch simply did not finish.
             classification = None
-            if budget_starved:
+            deferral_reason = deferred.get(ticker.upper())
+            if deferral_reason == refresh_runs.DEFERRED_CAPACITY:
+                classification = SCHEDULED_DEFERRAL
+            elif budget_starved:
                 classification = ROTATION_STARVED
-            elif ticker.upper() in deferred:
+            elif deferral_reason:
                 classification = SCHEDULED_DEFERRAL
             elif attempt:
                 classification = _classify_from_attempt(attempt.get("error"), attempt.get("status"))

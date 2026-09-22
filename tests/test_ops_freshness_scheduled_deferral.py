@@ -86,11 +86,13 @@ def _stale_tickers(bars) -> list[str]:
 def _record_run(tmp_path, status: str, stale: list[str]) -> None:
     """Write the run record the refresh would have written."""
     store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-    store.open_run(EXPECTED, EXPECTED, universe=443, window_sessions=6, rotation_budget=BUDGET)
+    store_token = store.open_run(
+        EXPECTED, EXPECTED, universe=443, window_sessions=6, rotation_budget=BUDGET
+    )
     served = [f"R{i:03d}" for i in range(BUDGET)]
     outcomes = {ticker: refresh_runs.REFRESHED for ticker in served}
     outcomes.update({ticker: refresh_runs.DEFERRED_BUDGET for ticker in stale})
-    store.finish(EXPECTED, status, outcomes)
+    store.finish(EXPECTED, status, outcomes, token=store_token)
 
 
 def _audit(monkeypatch, tmp_path):
@@ -238,8 +240,8 @@ class TestRefreshRunStore:
     )
     def test_completed_is_the_only_deliberate_status(self, tmp_path, status, expected):
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
-        store.finish("k", status, {"AAA": refresh_runs.DEFERRED_BUDGET})
+        store_token = store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
+        store.finish("k", status, {"AAA": refresh_runs.DEFERRED_BUDGET}, token=store_token)
         assert bool(store.completed_deferrals("k")) is expected
         assert bool(store.completed_run("k")) is expected
 
@@ -251,17 +253,19 @@ class TestRefreshRunStore:
     def test_re_running_a_session_resets_the_previous_decision(self, tmp_path):
         """A restarted run must not keep the dead attempt's deferral list."""
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
-        store.finish("k", refresh_runs.COMPLETED, {"AAA": refresh_runs.DEFERRED_BUDGET})
+        store_token = store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
+        store.finish(
+            "k", refresh_runs.COMPLETED, {"AAA": refresh_runs.DEFERRED_BUDGET}, token=store_token
+        )
         assert store.completed_deferrals("k") == {"AAA": refresh_runs.DEFERRED_BUDGET}
 
-        store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
+        store_token = store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
         assert store.completed_run("k") is None, "an open run is not evidence"
         assert store.completed_deferrals("k") == {}
 
     def test_served_and_failed_symbols_are_captured_but_not_deferrals(self, tmp_path):
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
+        store_token = store.open_run("k", "k", universe=10, window_sessions=6, rotation_budget=2)
         store.finish(
             "k",
             refresh_runs.COMPLETED,
@@ -272,6 +276,7 @@ class TestRefreshRunStore:
                 "SLICE": refresh_runs.DEFERRED_COOLING,
                 "CAP": refresh_runs.DEFERRED_CAPACITY,
             },
+            token=store_token,
         )
         assert store.outcomes("k") == {
             "OK": refresh_runs.REFRESHED,

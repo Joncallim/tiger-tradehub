@@ -154,8 +154,15 @@ class TestActiveSetFailuresAreRecordedAsFailed:
 class TestRerunInvalidatesThePreviousRecord:
     def _prior_completed_record(self, tmp_path):
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run(EXPECTED, EXPECTED, universe=3, window_sessions=6, rotation_budget=1)
-        store.finish(EXPECTED, refresh_runs.COMPLETED, {"DEF000": refresh_runs.DEFERRED_BUDGET})
+        store_token = store.open_run(
+            EXPECTED, EXPECTED, universe=3, window_sessions=6, rotation_budget=1
+        )
+        store.finish(
+            EXPECTED,
+            refresh_runs.COMPLETED,
+            {"DEF000": refresh_runs.DEFERRED_BUDGET},
+            token=store_token,
+        )
         return store
 
     def _wire(self, tmp_path, monkeypatch, fail_mode: str):
@@ -257,8 +264,15 @@ class TestDeferredCheckpointsAreReopened:
 
         # pass 1: the completed run deferred it -- scheduled, not work.
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run(EXPECTED, EXPECTED, universe=2, window_sessions=6, rotation_budget=1)
-        store.finish(EXPECTED, refresh_runs.COMPLETED, {"DEF000": refresh_runs.DEFERRED_BUDGET})
+        store_token = store.open_run(
+            EXPECTED, EXPECTED, universe=2, window_sessions=6, rotation_budget=1
+        )
+        store.finish(
+            EXPECTED,
+            refresh_runs.COMPLETED,
+            {"DEF000": refresh_runs.DEFERRED_BUDGET},
+            token=store_token,
+        )
 
         fetched: list[str] = []
         first = df.remediate(
@@ -280,8 +294,12 @@ class TestDeferredCheckpointsAreReopened:
         # pass 2: the run that deferred it is no longer the latest word -- the
         # symbol has its own recorded failure and is actionable again.
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run(EXPECTED, EXPECTED, universe=2, window_sessions=6, rotation_budget=1)
-        store.finish(EXPECTED, refresh_runs.COMPLETED, {"DEF000": refresh_runs.FAILED})
+        store_token = store.open_run(
+            EXPECTED, EXPECTED, universe=2, window_sessions=6, rotation_budget=1
+        )
+        store.finish(
+            EXPECTED, refresh_runs.COMPLETED, {"DEF000": refresh_runs.FAILED}, token=store_token
+        )
         attempts = {"DEF000": {"status": "ERROR", "error": "PROVIDER_ERROR: 503 x"}}
         settings = _wire_audit(monkeypatch, bars, attempts)
 

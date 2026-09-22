@@ -24,6 +24,7 @@ remediation, and a completed one must never be dressed up as an interruption.
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,7 @@ class RefreshRunStore:
                 CREATE TABLE IF NOT EXISTS refresh_run(
                     run_key TEXT PRIMARY KEY,
                     expected_session TEXT NOT NULL,
+                    invocation_id TEXT,
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     status TEXT NOT NULL DEFAULT 'RUNNING',
@@ -120,25 +122,35 @@ class RefreshRunStore:
         window_sessions: int | None = None,
         rotation_budget: int | None = None,
         candidates: int | None = None,
-    ) -> None:
-        """Mark the session's run as started.
+    ) -> str:
+        """Claim the session for this invocation; returns its token.
 
         A re-run of the same session resets it to ``RUNNING``: the deferral list
         from an earlier partial attempt must not survive as if it were the
         finished run's decision.
+
+        The returned token must be passed to :meth:`update_metadata` and
+        :meth:`finish`. Two same-session invocations can overlap, and without the
+        token the earlier one's ``finish()`` could close the row the later one had
+        just reset -- marking an interrupted session ``COMPLETED`` and letting its
+        obsolete deferrals suppress remediation. Every later write is therefore
+        conditioned on the token this call mints.
         """
+        token = uuid.uuid4().hex
         with self._connect() as db:
             db.execute(
-                "INSERT INTO refresh_run(run_key, expected_session, started_at, status, "
-                "universe, window_sessions, rotation_budget, candidates) "
-                "VALUES (?,?,?,'RUNNING',?,?,?,?) "
-                "ON CONFLICT(run_key) DO UPDATE SET started_at=excluded.started_at, "
+                "INSERT INTO refresh_run(run_key, expected_session, invocation_id, started_at, "
+                "status, universe, window_sessions, rotation_budget, candidates) "
+                "VALUES (?,?,?,?,'RUNNING',?,?,?,?) "
+                "ON CONFLICT(run_key) DO UPDATE SET invocation_id=excluded.invocation_id, "
+                "started_at=excluded.started_at, "
                 "finished_at=NULL, status='RUNNING', universe=excluded.universe, "
                 "window_sessions=excluded.window_sessions, "
                 "rotation_budget=excluded.rotation_budget, candidates=excluded.candidates",
                 (
                     run_key,
                     expected_session,
+                    token,
                     _utc_now(),
                     universe,
                     window_sessions,
@@ -146,28 +158,32 @@ class RefreshRunStore:
                     candidates,
                 ),
             )
+        return token
 
     def update_metadata(
         self,
         run_key: str,
         *,
+        token: str,
         window_sessions: int | None = None,
         rotation_budget: int | None = None,
         candidates: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Fill in facts discovered after the run was opened.
 
         Kept separate from :meth:`open_run` because the run must be marked
         ``RUNNING`` *before* the first fallible request, while the window, budget
-        and demand are only known once the universe has been read.
+        and demand are only known once the universe has been read. Refuses and
+        returns ``False`` when this invocation no longer owns the row.
         """
         with self._connect() as db:
-            db.execute(
+            cursor = db.execute(
                 "UPDATE refresh_run SET window_sessions=COALESCE(?, window_sessions), "
                 "rotation_budget=COALESCE(?, rotation_budget), "
-                "candidates=COALESCE(?, candidates) WHERE run_key=?",
-                (window_sessions, rotation_budget, candidates, run_key),
+                "candidates=COALESCE(?, candidates) WHERE run_key=? AND invocation_id=?",
+                (window_sessions, rotation_budget, candidates, run_key, token),
             )
+            return cursor.rowcount > 0
 
     def finish(
         self,
@@ -175,10 +191,11 @@ class RefreshRunStore:
         status: str,
         outcomes: dict[str, str],
         *,
+        token: str,
         candidates: int | None = None,
         refreshed: int | None = None,
         deferred: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Close the run and record what happened to every candidate.
 
         ``outcomes`` covers every symbol the run touched -- the active phase
@@ -192,6 +209,10 @@ class RefreshRunStore:
         Omitted values fall back to ``outcomes`` (correct when the run had no
         active phase). Written atomically with the status: a reader must never see
         a closed run with a half-written work list.
+
+        Returns ``False`` without writing anything when ``token`` is no longer the
+        row's invocation -- a newer same-session run has taken ownership, and this
+        run's outcome must not become the last word for the session.
         """
         now = _utc_now()
         refreshed = (
@@ -206,6 +227,12 @@ class RefreshRunStore:
         db = self._connect()
         try:
             db.execute("BEGIN")
+            row = db.execute(
+                "SELECT invocation_id FROM refresh_run WHERE run_key=?", (run_key,)
+            ).fetchone()
+            if row is None or row["invocation_id"] != token:
+                db.execute("ROLLBACK")
+                return False
             db.execute("DELETE FROM refresh_symbol WHERE run_key=?", (run_key,))
             db.executemany(
                 "INSERT INTO refresh_symbol(run_key, ticker, disposition, recorded_at) "
@@ -223,6 +250,7 @@ class RefreshRunStore:
             raise
         finally:
             db.close()
+        return True
 
     # --- reader ----------------------------------------------------------
     def run(self, run_key: str) -> dict[str, Any] | None:

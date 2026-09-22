@@ -142,8 +142,15 @@ class TestBestEffortLedgerWriteToleratesTheWrapper:
 class TestRunAbortsWhenTheRecordCannotBeOpened:
     def _prior_completed(self, tmp_path):
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run(EXPECTED, EXPECTED, universe=2, window_sessions=6, rotation_budget=1)
-        store.finish(EXPECTED, refresh_runs.COMPLETED, {"DEF000": refresh_runs.DEFERRED_BUDGET})
+        store_token = store.open_run(
+            EXPECTED, EXPECTED, universe=2, window_sessions=6, rotation_budget=1
+        )
+        store.finish(
+            EXPECTED,
+            refresh_runs.COMPLETED,
+            {"DEF000": refresh_runs.DEFERRED_BUDGET},
+            token=store_token,
+        )
         return store
 
     def test_refresh_does_not_proceed_without_invalidating_the_prior_run(

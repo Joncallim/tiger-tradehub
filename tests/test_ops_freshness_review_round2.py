@@ -70,8 +70,10 @@ def _paths(tmp_path):
 
 def _record(tmp_path, outcomes: dict[str, str]) -> None:
     store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-    store.open_run(EXPECTED, EXPECTED, universe=4, window_sessions=6, rotation_budget=1)
-    store.finish(EXPECTED, refresh_runs.COMPLETED, outcomes)
+    store_token = store.open_run(
+        EXPECTED, EXPECTED, universe=4, window_sessions=6, rotation_budget=1
+    )
+    store.finish(EXPECTED, refresh_runs.COMPLETED, outcomes, token=store_token)
 
 
 def _audit(monkeypatch, tmp_path):

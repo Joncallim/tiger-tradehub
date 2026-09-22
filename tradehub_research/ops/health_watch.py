@@ -289,6 +289,14 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
             "Quarantined after remediation: 0",
             "Downstream signals: healthy",
         ]
+        if summary.get("repair_ledger_unrecorded"):
+            # Disclosed even on the happy path: the recovery is real but its
+            # evidence is not, and the failure-streak reader trusts that ledger.
+            lines.append(
+                f"{summary['repair_ledger_unrecorded']:,} repair(s) could not be recorded in the "
+                "attempt ledger; the failure-streak reader trusts that ledger, so those symbols "
+                "may keep reading as failing until it is writable"
+            )
         if problems:
             lines.append("")
             lines.append("REPORT INTEGRITY ERROR (counts do not reconcile):")
@@ -343,6 +351,12 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
     lines.append("- excluded from affected signals")
     if rec["quota_blocked"]:
         lines.append("- remediation paused on the provider quota reserve (resumes next cycle)")
+    if summary.get("repair_ledger_unrecorded"):
+        lines.append(
+            f"- {summary['repair_ledger_unrecorded']:,} repair(s) could not be recorded in the "
+            "attempt ledger; the failure-streak reader trusts that ledger, so those symbols may "
+            "keep reading as failing until it is writable"
+        )
     if rec["time_budget_exhausted"]:
         lines.append("- remediation hit its time budget (resumes next cycle)")
     if capacity:
@@ -435,6 +449,10 @@ def check_data_freshness(settings, paths) -> None:
                 "run_key": summary["run_key"],
                 "targeted": summary["targeted"],
                 "scheduled_deferrals": summary.get("scheduled_deferrals", 0),
+                # A repair whose ledger evidence could not be written: disclosed,
+                # because the failure-streak reader trusts that ledger and would
+                # otherwise put the symbol back into cooling with no explanation.
+                "repair_ledger_unrecorded": summary.get("repair_ledger_unrecorded", 0),
                 "repaired": summary["repaired"],
                 "excluded": summary["excluded"],
                 "unresolved": summary["unresolved"],

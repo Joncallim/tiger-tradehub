@@ -450,19 +450,19 @@ def allocate_rotation(
 def _open_refresh_run(paths, run_key: str, *, universe: int, summary: dict):
     """Start (or reset) the durable run record. FAILS CLOSED.
 
+    Returns ``(store, token)``: the token is what ties every later write to *this*
+    invocation, so an overlapping same-session run cannot have its reset undone by
+    an earlier run's finish.
+
     The record is what lets the diagnosis tell a deliberate deferral from an
     interruption. Proceeding without it on a same-session re-run would leave a
     previous COMPLETED record and its deferral list in place, and those obsolete
     deferrals would suppress remediation for a session whose latest attempt
     actually failed. So an unwritable record aborts the run *before* any provider
     work rather than fetching under a stale decision.
-
-    (A run that never opens a record at all -- a first run whose store cannot be
-    created -- raises here too, for the same reason: its scheduling decisions
-    could not be recorded, and the diagnosis must not be left reading old state.)
     """
     store = refresh_runs.store_for(paths)
-    store.open_run(
+    token = store.open_run(
         run_key,
         run_key,
         universe=universe,
@@ -470,12 +470,13 @@ def _open_refresh_run(paths, run_key: str, *, universe: int, summary: dict):
         rotation_budget=summary.get("rotation_budget"),
         candidates=summary.get("rotation_candidates"),
     )
-    return store
+    return store, token
 
 
 def _update_refresh_run(
     store,
     run_key: str,
+    token: str | None,
     *,
     window_sessions: int | None,
     rotation_budget: int | None,
@@ -483,21 +484,28 @@ def _update_refresh_run(
     summary: dict,
 ) -> None:
     """Record the facts that are only known after the universe has been read."""
-    if store is None:
+    if store is None or token is None:
         return
     try:
-        store.update_metadata(
+        if not store.update_metadata(
             run_key,
+            token=token,
             window_sessions=window_sessions,
             rotation_budget=rotation_budget,
             candidates=candidates,
-        )
+        ):
+            summary["refresh_run_superseded"] = True
     except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
         summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def _close_refresh_run(
-    store, run_key: str, outcomes: dict[str, str], summary: dict, active_attempted: set[str]
+    store,
+    run_key: str,
+    token: str | None,
+    outcomes: dict[str, str],
+    summary: dict,
+    active_attempted: set[str],
 ) -> None:
     """Close the run record, or leave it OPEN so it reads as interrupted.
 
@@ -514,7 +522,7 @@ def _close_refresh_run(
         "OK": refresh_runs.COMPLETED,
         "QUOTA_EXHAUSTED": refresh_runs.QUOTA_EXHAUSTED,
     }.get(summary.get("status"))
-    if store is None or status is None:
+    if store is None or token is None or status is None:
         return
     rotation = {
         ticker: disposition
@@ -531,14 +539,19 @@ def _close_refresh_run(
         1 for disposition in rotation.values() if disposition in refresh_runs.DEFERRED
     )
     try:
-        store.finish(
+        if not store.finish(
             run_key,
             status,
             outcomes,
+            token=token,
             candidates=summary.get("rotation_candidates", len(rotation)),
             refreshed=rotation_refreshed,
             deferred=rotation_deferred,
-        )
+        ):
+            # A newer same-session invocation owns the row now; this run's
+            # outcome must not become the session's last word.
+            summary["refresh_run_superseded"] = True
+            return
     except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
         summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
         return
@@ -594,7 +607,9 @@ def run_daily_refresh(
     # away: if this run then exhausts quota or dies, the old run's deferral list
     # must not survive as authoritative, or the diagnosis would suppress
     # remediation for a session whose latest attempt was interrupted.
-    roster = _open_refresh_run(paths, run_key, universe=len(by_ticker), summary=summary)
+    roster, roster_token = _open_refresh_run(
+        paths, run_key, universe=len(by_ticker), summary=summary
+    )
     try:
         # 1. Active set first: securities with recent production screens.
         active = _active_securities(research_db) & set(by_ticker)
@@ -705,6 +720,7 @@ def run_daily_refresh(
         _update_refresh_run(
             roster,
             run_key,
+            roster_token,
             window_sessions=window_sessions,
             rotation_budget=rotation_budget,
             candidates=summary["rotation_candidates"],
@@ -724,11 +740,11 @@ def run_daily_refresh(
     except RuntimeError as exc:
         if "quota" in str(exc):
             summary["status"] = "QUOTA_EXHAUSTED"
-            _close_refresh_run(roster, run_key, outcomes, summary, active_attempted)
+            _close_refresh_run(roster, run_key, roster_token, outcomes, summary, active_attempted)
             return summary
         raise  # an unexpected fault leaves the run OPEN: reads as interrupted
     summary["status"] = "OK"
-    _close_refresh_run(roster, run_key, outcomes, summary, active_attempted)
+    _close_refresh_run(roster, run_key, roster_token, outcomes, summary, active_attempted)
     return summary
 
 

@@ -91,8 +91,10 @@ def _wire(monkeypatch, bars, evidence):
 def _audit(monkeypatch, tmp_path, bars, evidence, deferrals):
     if deferrals:
         store = refresh_runs.RefreshRunStore(tmp_path / refresh_runs.REFRESH_RUNS_DB)
-        store.open_run(EXPECTED, EXPECTED, universe=len(bars), window_sessions=6, rotation_budget=1)
-        store.finish(EXPECTED, refresh_runs.COMPLETED, deferrals)
+        store_token = store.open_run(
+            EXPECTED, EXPECTED, universe=len(bars), window_sessions=6, rotation_budget=1
+        )
+        store.finish(EXPECTED, refresh_runs.COMPLETED, deferrals, token=store_token)
     settings = _wire(monkeypatch, bars, evidence)
     paths = SimpleNamespace(research_db=tmp_path / "research.db", research_dir=tmp_path)
     return (
