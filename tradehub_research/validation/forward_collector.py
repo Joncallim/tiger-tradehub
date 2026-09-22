@@ -18,14 +18,13 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
 from tradehub_research.db import utc_now
+from tradehub_research.validation import horizons
 from tradehub_research.validation.experiment_db import ExperimentDB
-
-HORIZON_SESSIONS = (21, 63, 126, 252)
-_SESSIONS_PER_DAY = 252 / 365.25
+from tradehub_research.validation.horizons import HORIZON_SESSIONS
 
 
 def record_prediction(
@@ -232,6 +231,13 @@ def append_outcome(
 
 
 def _outcome_due_date(as_of: str, horizon_sessions: int) -> str:
-    day = date.fromisoformat(as_of[:10])
-    days = round(horizon_sessions / _SESSIONS_PER_DAY)
-    return (day + timedelta(days=days)).isoformat()
+    """When this prediction's horizon completes (one authoritative definition).
+
+    The date is the exit SESSION of the horizon on the market calendar, so the
+    stored field and the outcome evaluator cannot disagree about the horizon:
+    see ``validation/horizons.py``. Rows written before that change keep their
+    (legacy, calendar-approximated) due date -- they are immutable -- and stay
+    usable because the evaluator verifies realized sessions rather than trusting
+    the date.
+    """
+    return horizons.session_horizon_due_date(as_of, horizon_sessions)

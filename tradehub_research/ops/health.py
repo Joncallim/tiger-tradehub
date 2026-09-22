@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
@@ -16,15 +16,41 @@ from tradehub_research.ops.common import ResearchPaths, last_completed_us_sessio
 from tradehub_research.validation.experiment_db import ExperimentDB
 
 
+def _local_day_utc_bounds(day: date) -> tuple[str, str]:
+    """UTC ISO bounds (``...Z``) of a LOCAL calendar day.
+
+    ``appended_at`` is stored UTC, but "new today" is a statement about the
+    operator's day -- the same clock the report's own day comes from. Half-open
+    [start, end) so a row lands in exactly one day regardless of offset.
+    """
+
+    def _fmt(value: datetime) -> str:
+        return (
+            value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+
+    start = datetime.combine(day, time.min).astimezone()
+    return _fmt(start), _fmt(start + timedelta(days=1))
+
+
 def forward_health(
     *,
     experiment_db: ExperimentDB,
     paths: ResearchPaths | None = None,
     collection_date=None,
+    reporting_day: date | None = None,
 ) -> dict:
-    """Production forward-ledger health (provenance='production' only)."""
+    """Production forward-ledger health (provenance='production' only).
+
+    ``matured_today`` counts production outcomes APPENDED on ``reporting_day``
+    (default: today, local) using the durable ``appended_at`` timestamp -- never
+    inferred from a prediction's due date. ``matured_by_horizon`` stays the
+    cumulative per-horizon total, which is its documented meaning.
+    """
     paths = paths or research_paths()
     due = (collection_date or last_completed_us_session()).isoformat()
+    day = reporting_day or date.today()
+    day_start, day_end = _local_day_utc_bounds(day)
     with experiment_db.connect(read_only=True) as conn:
         total = conn.execute(
             "SELECT COUNT(*) FROM forward_prediction WHERE provenance='production'"
@@ -54,12 +80,23 @@ def forward_health(
         last_screen = conn.execute(
             "SELECT MAX(as_of) FROM forward_prediction WHERE provenance='production'"
         ).fetchone()[0]
+        matured_today = conn.execute(
+            "SELECT COUNT(*) FROM forward_outcome o "
+            "JOIN forward_prediction p ON p.prediction_id=o.prediction_id "
+            "WHERE p.provenance='production' AND o.appended_at >= ? AND o.appended_at < ?",
+            (day_start, day_end),
+        ).fetchone()[0]
     return {
         "production_predictions": total,
         "by_horizon": {str(r[0]): r[1] for r in by_horizon},
         "predictions_due": due_count,
         "matured": {str(r[0]): r[1] for r in matured},
         "matured_by_horizon": {str(r[0]): r[1] for r in matured_by_horizon},
+        # Outcomes APPENDED on the reporting day (durable appended_at) and the day
+        # they were measured for, so a reader can never mistake this for a
+        # lifetime total. `matured_by_horizon` remains the cumulative figure.
+        "matured_today": matured_today,
+        "matured_today_day": day.isoformat(),
         "last_production_screen": last_screen,
         "generated_at": utc_now(),
     }

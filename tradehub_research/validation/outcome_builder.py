@@ -32,8 +32,8 @@ from tradehub_research.portfolio.prices import (
     _visible_records,
     next_session_on_or_after,
 )
+from tradehub_research.validation.horizons import HORIZON_SESSIONS, select_exit_bar
 
-HORIZON_SESSIONS = (21, 63, 126, 252)
 BUILDER_VERSION = "outcome-builder-v1"
 
 DECIMAL_ZERO = Decimal(0)
@@ -178,8 +178,10 @@ def build_outcome_label(
         # Exit = horizon sessions after entry, at close.
         bars = _bars_since(db, security_id, entry_session, _snapshot_end_asof())
         exit_bar: dict[str, Any] | None = None
-        if len(bars) >= horizon_sessions:
-            exit_bar = bars[horizon_sessions - 1]
+        # The shared exit rule: the horizon-th session after entry, or None while
+        # the horizon is immature (never the latest available bar).
+        exit_bar = select_exit_bar(bars, horizon_sessions)
+        if exit_bar is not None:
             exit_close = _bar_close(exit_bar)
             if exit_close is None or exit_close <= 0:
                 exit_close = None
