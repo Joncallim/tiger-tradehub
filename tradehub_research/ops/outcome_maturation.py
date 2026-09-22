@@ -35,15 +35,31 @@ HONEST STATES
 
 The outcome table is append-only with ``UNIQUE(prediction_id)``: ONE outcome per
 prediction, forever. A wrong terminal classification therefore cannot be undone,
-so non-OBSERVED labels are only emitted when the data can no longer improve:
+so on the LIVE ledger a permanent non-OBSERVED label is emitted ONLY on positive
+evidence that the outcome can never be recovered:
 
-  * fewer realized sessions than the horizon, or the exit session is still in the
-    future, or the bars are merely lagging -> **pending** (no row); the next run
-    re-evaluates;
-  * the security is resolvable but its data stopped well before the required exit
-    session -> ``CENSORED_INSUFFICIENT_HORIZON``;
-  * the security is delisted / no longer resolvable -> ``DELISTING_OUTCOME_UNKNOWN``;
-  * a realized bar carries an unusable price -> ``CENSORED_INSUFFICIENT_HORIZON``.
+  * the expected entry session has no usable bar -> **AWAITING_ENTRY_BAR**
+    (pending, no row, retried; the entry is never shifted to a later session);
+  * the horizon has not elapsed in market time -> **AWAITING_HORIZON**
+    (pending, no row);
+  * the horizon HAS elapsed but the required canonical exit evidence is missing,
+    or a realized close is unusable -> **AWAITING_EXIT_BAR** (pending, no row,
+    retried). This is a DATA-QUALITY gap, not a verdict: an ingestion/backfill
+    repair or a superseded bar can still produce the genuine OBSERVED outcome,
+    and an already-appended row could never become it;
+  * the security is verifiably delisted at or before the session the horizon
+    needs -> ``DELISTING_OUTCOME_UNKNOWN`` (terminal; the research contract's
+    explicit class -- never dropped, never imputed zero).
+
+There is deliberately NO elapsed-time timeout that converts a data-quality gap
+into a permanent label.
+
+FROZEN SNAPSHOT vs LIVE LEDGER (explicit distinction)
+
+``validation/outcome_builder.py`` labels a FROZEN dataset snapshot, where the
+observation boundary is final: there, fewer realized sessions than the horizon
+is terminally ``CENSORED_INSUFFICIENT_HORIZON``, and that contract is unchanged.
+That label is never emitted by this live path.
 
 ``mature_due_outcomes`` never passes a status outside the schema's enum (the
 pre-fix path could return ``ENTRY_UNAVAILABLE``, which the CHECK constraint
@@ -59,7 +75,7 @@ from datetime import date
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.ops.common import ResearchPaths, research_paths
-from tradehub_research.ops.market_calendar import count_sessions, is_session_day
+from tradehub_research.ops.market_calendar import is_session_day
 from tradehub_research.portfolio import prices
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.forward_collector import append_outcome
@@ -67,22 +83,24 @@ from tradehub_research.validation.horizons import (
     HORIZON_SESSIONS,
     entry_session_for,
     required_exit_session,
-    select_exit_bar,
 )
 
-#: Sessions of grace before a missing exit bar is treated as permanently missing.
-#: The nightly refresh ingests a rolling window, so a bar a few sessions late is
-#: normal; because a censored row can never become OBSERVED, the classification
-#: waits until the data genuinely cannot arrive.
-DATA_GRACE_SESSIONS = 5
-
-#: Statuses the ``forward_outcome`` CHECK constraint accepts.
+#: Statuses the ``forward_outcome`` CHECK constraint accepts (schema surface).
+#: ``CENSORED_INSUFFICIENT_HORIZON`` legitimately belongs to the FROZEN-snapshot
+#: research builder (its dataset boundary is final). This live forward path does
+#: NOT emit it: for the live ledger a missing bar is a repairable data-quality
+#: gap, and ``forward_outcome`` is append-only + UNIQUE(prediction_id), so a
+#: permanent label written for a gap could never become the genuine OBSERVED
+#: outcome. The live path emits only OBSERVED or DELISTING_OUTCOME_UNKNOWN.
 TERMINAL_STATUSES = ("OBSERVED", "DELISTING_OUTCOME_UNKNOWN", "CENSORED_INSUFFICIENT_HORIZON")
+EMITTABLE_STATUSES = ("OBSERVED", "DELISTING_OUTCOME_UNKNOWN")
 
-#: Pending (no row appended) reasons. Pending is retryable by design.
+#: Pending (no row appended) reasons. Pending is retryable by design; a
+#: temporary evidence gap can heal into OBSERVED on a later run.
 AWAITING_ENTRY_BAR = "AWAITING_ENTRY_BAR"
-AWAITING_HORIZON = "AWAITING_HORIZON"
-PENDING_REASONS = (AWAITING_ENTRY_BAR, AWAITING_HORIZON)
+AWAITING_HORIZON = "AWAITING_HORIZON"  # market time has not elapsed yet (normal)
+AWAITING_EXIT_BAR = "AWAITING_EXIT_BAR"  # horizon elapsed, required evidence missing
+PENDING_REASONS = (AWAITING_ENTRY_BAR, AWAITING_HORIZON, AWAITING_EXIT_BAR)
 
 
 def _canonical_session_bars(
@@ -179,7 +197,9 @@ def _evaluate(
     "total_return": float | None, "entry_session_date": str | None,
     "exit_session_date": str | None, "detail": str}``.
     """
-    exists, delisted_at = _security_state(research_db, security_id)
+    # An absent security row is a repairable gap too: it is reported by health as
+    # unrecoverable-for-now, but it is never a terminal label on its own.
+    _exists, delisted_at = _security_state(research_db, security_id)
     bars = _canonical_session_bars(research_db, security_id, as_of, collection_date)
 
     # The entry session is decided by the MARKET CALENDAR, never by whichever bar
@@ -194,22 +214,22 @@ def _evaluate(
             else f"expected entry session {expected_entry} has no usable bar "
             f"(first usable bar is {first})"
         )
-        # Terminal only on positive evidence: the name is gone (unknown), or it
-        # delisted at or before the session the horizon needs -- in which case the
-        # outcome can never be observed (an existing explicit terminal class).
+        # Terminal ONLY on positive evidence that the outcome cannot be recovered:
+        # a verified delisting at or before the session the horizon needs. An
+        # absent security row is itself a repairable gap, so it stays pending.
         required_exit = required_exit_session(expected_entry, horizon_sessions)
-        if not exists or (delisted_at is not None and delisted_at <= required_exit):
+        if delisted_at is not None and delisted_at <= required_exit:
             return {"status": "DELISTING_OUTCOME_UNKNOWN", "pending": None, "detail": detail}
         # Never shift the entry to a later session -- that would silently price a
         # different prediction. Not yet evaluable, retryable, and visible.
         return {"status": None, "pending": AWAITING_ENTRY_BAR, "detail": detail}
 
     entry_session, entry_close = bars[0]
-    # The horizon counts sessions AFTER the entry session -- the same bars the
-    # research builder feeds to its exit rule (bars strictly after entry).
-    post_entry = bars[1:]
-    exit_bar = select_exit_bar(post_entry, horizon_sessions)
+    # The horizon counts sessions AFTER the entry session, and the exit must be
+    # EXACTLY the session the calendar requires -- a missing or UNKNOWN bar is a
+    # data-quality gap, never a reason to shift the exit to another session.
     exit_session = required_exit_session(entry_session, horizon_sessions)
+    realized_after_entry = len(bars) - 1
 
     # A delisting at or before the exit session means the horizon can never be
     # observed: never dropped, never imputed zero (the research contract).
@@ -221,45 +241,44 @@ def _evaluate(
             "detail": f"delisted {delisted_at} at/before the exit session {exit_session}",
         }
 
-    if exit_bar is None:
-        # The horizon has not completed in sessions. Never OBSERVED on fewer.
-        if collection_date < date.fromisoformat(exit_session):
-            return {
-                "status": None,
-                "pending": AWAITING_HORIZON,
-                "detail": f"exit session {exit_session} has not arrived",
-            }
-        # How far behind the exit session the realized data is. With no bar after
-        # the entry session, the entry session itself is the last realized data --
-        # and that case must never index an empty list.
-        last_realized = post_entry[-1][0] if post_entry else entry_session
-        lag = count_sessions(date.fromisoformat(last_realized), date.fromisoformat(exit_session))
-        if lag <= DATA_GRACE_SESSIONS:
-            return {
-                "status": None,
-                "pending": AWAITING_HORIZON,
-                "detail": (
-                    f"{len(post_entry)}/{horizon_sessions} sessions; data {lag} session(s) "
-                    "behind the exit session"
-                ),
-            }
+    if collection_date < date.fromisoformat(exit_session):
+        # Market time has not elapsed yet: normal waiting, not a gap.
         return {
-            "status": "CENSORED_INSUFFICIENT_HORIZON",
-            "pending": None,
+            "status": None,
+            "pending": AWAITING_HORIZON,
+            "detail": f"exit session {exit_session} has not arrived",
+        }
+
+    exit_bar = next((bar for bar in bars if bar[0] == exit_session), None)
+    if exit_bar is None:
+        # Market time HAS elapsed, but the required exit evidence is not available
+        # (missing, or that session is UNKNOWN because of conflicting bars). This
+        # is a DATA-QUALITY gap, not a verdict: an ingestion/backfill repair or a
+        # superseding record can still supply it, and ``forward_outcome`` is
+        # append-only with UNIQUE(prediction_id), so a permanent non-OBSERVED row
+        # written now could never become the genuine OBSERVED outcome. Stay
+        # pending and retry. (The frozen-snapshot research builder is different:
+        # there the dataset boundary IS final, so an insufficient horizon is
+        # terminally CENSORED -- see validation/outcome_builder.py.)
+        return {
+            "status": None,
+            "pending": AWAITING_EXIT_BAR,
             "entry_session_date": entry_session,
             "detail": (
-                f"{len(post_entry)}/{horizon_sessions} sessions, exit session {exit_session} "
-                f"is {lag} sessions past and the data did not arrive"
+                f"{realized_after_entry}/{horizon_sessions} realized sessions; required exit "
+                f"bar for {exit_session} is not available yet"
             ),
         }
 
     _exit_session, exit_close = exit_bar
     if entry_close is None or entry_close == 0 or exit_close is None:
+        # A present but unusable close is ALSO recoverable evidence: bars can be
+        # superseded by a corrected record. Never a permanent label for it.
         return {
-            "status": "CENSORED_INSUFFICIENT_HORIZON",
-            "pending": None,
+            "status": None,
+            "pending": AWAITING_EXIT_BAR,
             "entry_session_date": entry_session,
-            "detail": "a realized bar carries no usable close",
+            "detail": "a realized bar carries no usable close (recoverable: bar may be superseded)",
         }
     return {
         "status": "OBSERVED",

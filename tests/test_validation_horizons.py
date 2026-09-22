@@ -251,9 +251,15 @@ def test_the_research_builders_historical_rule_is_reproduced():
 
 
 def test_the_forward_maturation_uses_the_shared_rule():
-    """The forward path imports the exit rule rather than reimplementing it."""
+    """The forward path imports the horizon rule rather than reimplementing it.
+
+    It resolves the required exit session from the calendar
+    (``required_exit_session``) and requires the bar for EXACTLY that session --
+    the same authoritative definition the research builder uses for its own exit
+    selection.
+    """
     from tradehub_research.ops import outcome_maturation
 
-    assert outcome_maturation.select_exit_bar is _horizons().select_exit_bar
     assert outcome_maturation.required_exit_session is _horizons().required_exit_session
+    assert outcome_maturation.entry_session_for is _horizons().entry_session_for
     assert outcome_maturation.HORIZON_SESSIONS == _horizons().HORIZON_SESSIONS

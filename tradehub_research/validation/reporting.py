@@ -157,6 +157,16 @@ def render_daily_report(data: dict[str, Any]) -> str:
             f"{awaiting.get('recoverable', {}).get('securities', 0)} recoverable / "
             f"{len(awaiting.get('unrecoverable') or [])} unrecoverable)"
         )
+    awaiting_exit = data.get("awaiting_exit") or {}
+    if awaiting_exit.get("total"):
+        lines.append(
+            f"Awaiting exit bar: {awaiting_exit['total']} "
+            f"(oldest as_of {awaiting_exit.get('oldest_as_of')}, "
+            f"{awaiting_exit.get('distinct_securities')} securities, "
+            f"{awaiting_exit.get('age_sessions_past_exit')} sessions past the required exit, "
+            f"{awaiting_exit.get('recoverable', {}).get('securities', 0)} recoverable / "
+            f"{len(awaiting_exit.get('unrecoverable') or [])} unrecoverable)"
+        )
     lines.append(f"Data/system health: {data.get('system_health', 'healthy')}")
     return "\n".join(lines)
 

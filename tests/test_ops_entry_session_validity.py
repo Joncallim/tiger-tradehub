@@ -321,9 +321,10 @@ def test_entry_bar_present_with_no_bars_after_it_is_honest(tmp_path):
     and nothing after it. Before the fix this crashed with an IndexError on an
     empty post-entry list. Behaviour must be honest instead:
       * before the due gate: nothing happens at all;
-      * once the horizon's exit session has arrived with no realized bars, the
-        existing CENSORED_INSUFFICIENT_HORIZON class applies (the entry bar is
-        present -- this is a horizon-data gap, not an entry gap).
+      * once the horizon has elapsed with no realized exit bar, the prediction
+        stays PENDING (AWAITING_EXIT_BAR) -- never a permanent label, because the
+        bar may still be ingested;
+      * when the required exit bar is backfilled, it heals into OBSERVED.
     """
     paths, rdb, exp = _seed(tmp_path, [(EXPECTED_ENTRY, 100.0)])
     _prediction(exp)
@@ -335,15 +336,36 @@ def test_entry_bar_present_with_no_bars_after_it_is_honest(tmp_path):
     assert _outcomes(exp) == []
     assert summary["due"] == 0
 
-    # Due, exit session arrived, no realized bars -> the existing censored class.
+    # Due, horizon elapsed, no realized bars -> pending, no permanent row.
     summary = _run(exp, rdb, paths, exit_session)
+    assert _outcomes(exp) == [], summary
+    assert summary["awaiting"]["AWAITING_EXIT_BAR"] == 1
+
+    # The gap heals once the required exit bar exists.
+    from tradehub_research.evidence import EvidenceStore
+
+    rdb2 = ResearchDB(tmp_path / "research.db")
+    EvidenceStore(rdb2).insert(
+        security_id="S1",
+        source_id="tiingo_eod",
+        structured_fields={
+            "record_type": "price_bar",
+            "provider_ticker": TICKER,
+            "session_date": exit_session,
+            "open": 150.0,
+            "high": 150.0,
+            "low": 150.0,
+            "close": 150.0,
+            "volume": 1000,
+        },
+        extraction_confidence=0.9,
+        event_time=f"{exit_session}T00:00:00Z",
+        public_available_time=f"{next_session(date.fromisoformat(exit_session)).isoformat()}T00:15:00Z",
+        pat_provenance="source_reported",
+        source_record_id=f"{TICKER}:{exit_session}:backfill",
+    )
+    summary = _run(exp, rdb2, paths, exit_session)
     rows = _outcomes(exp)
     assert len(rows) == 1, summary
-    assert rows[0][1] == "CENSORED_INSUFFICIENT_HORIZON", rows
-    assert rows[0][3] == EXPECTED_ENTRY, "the known entry session is recorded"
-    assert summary["matured"] == {"CENSORED_INSUFFICIENT_HORIZON": 1}
-
-    # A later run is a no-op: the row is permanent and never rewritten.
-    summary = _run(exp, rdb, paths, "2027-06-01")
-    assert summary["due"] == 0
-    assert len(_outcomes(exp)) == 1
+    assert rows[0][1] == "OBSERVED"
+    assert rows[0][4] == exit_session

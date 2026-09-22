@@ -248,6 +248,9 @@ def build_daily_report(
         # Due-but-not-evaluable (expected entry-session bar unavailable): pending
         # by design, never terminalised by elapsed time.
         "awaiting_entry": fwd.get("awaiting_entry"),
+        # Horizon elapsed but the required exit evidence is missing: pending and
+        # retryable, never a permanent label for a data gap.
+        "awaiting_exit": fwd.get("awaiting_exit"),
         "system_health": _system_health(fwd, refr, 0),
     }
     return render_daily_report(data)

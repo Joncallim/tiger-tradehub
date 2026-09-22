@@ -200,7 +200,7 @@ def test_twenty_sessions_cannot_be_observed(tmp_path):
 
     assert summary["due"] == 1
     assert _outcomes(exp) == [], "an immature horizon must not be materialized"
-    assert summary["awaiting"]["AWAITING_HORIZON"] == 1
+    assert summary["awaiting"]["AWAITING_EXIT_BAR"] == 1
 
 
 def test_the_same_prediction_becomes_observed_once_the_horizon_completes(tmp_path):
