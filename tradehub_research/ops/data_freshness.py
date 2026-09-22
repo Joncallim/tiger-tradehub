@@ -43,6 +43,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from tradehub_research.ops import refresh_runs
 from tradehub_research.ops.common import ResearchPaths, research_paths
 from tradehub_research.ops.market_calendar import (
     count_sessions,
@@ -75,6 +76,13 @@ CHECKPOINT_LOST = "CHECKPOINT_LOST_RESUME_GAP"
 #: a storage failure and not bad upstream data; the next cycle fixes it.
 NOT_YET_PUBLISHED = "UPSTREAM_SESSION_NOT_YET_PUBLISHED"
 UNRESOLVED = "UNRESOLVED"
+#: The refresh COMPLETED and deliberately left this symbol for a later run: it was
+#: a rotation candidate and the budget (or the fairness slice) did not reach it.
+#: Distinct from INTERRUPTED_INGESTION_BATCH, which means the run did not finish
+#: the work it had taken on. Telling those two apart matters twice over: an
+#: interruption is a defect to chase, a scheduled deferral is the bounded design
+#: working, and only the interruption should spend remediation quota.
+SCHEDULED_DEFERRAL = "SCHEDULED_DEFERRAL"
 
 #: Causes that are genuine data defects and therefore remediable.
 REMEDIABLE = frozenset(
@@ -94,6 +102,11 @@ REMEDIABLE = frozenset(
 
 #: Causes that are legitimate exceptions: nothing to fetch, nothing to fix.
 LEGITIMATE_EXCEPTIONS = frozenset({DELISTED_EMPTY, INVALID_SYMBOL, NO_TRADE_ON_SESSION})
+
+#: Stale, visible, reported -- but NOT remediation work. A completed run already
+#: scheduled these; re-fetching them spends provider quota to duplicate the
+#: rotation's own plan.
+SCHEDULED_ONLY = frozenset({SCHEDULED_DEFERRAL})
 
 _DEFAULT_CLASS_BY_ERROR = {
     "RATE_LIMITED": PROVIDER_THROTTLE,
@@ -231,6 +244,23 @@ class CheckpointStore:
             ).fetchone()
         return int(row["attempts"]) if row else 0
 
+    def reopen_deferred(self, run_key: str, ticker: str, classification: str) -> None:
+        """Return a scheduled-deferral row to the work queue when it becomes work.
+
+        ``seed_symbol`` is INSERT OR IGNORE, so a terminal ``DEFERRED`` row would
+        otherwise never be reset: a symbol the refresh later attempted and failed
+        becomes actionable again, yet stays invisible to ``pending()`` and is
+        reported as targeted while never being fetched. Only rows settled as a
+        deliberate deferral are reopened -- a REPAIRED/EXCLUDED/UNRESOLVED verdict
+        must not be undone by a later pass.
+        """
+        with self._connect() as db:
+            db.execute(
+                "UPDATE remediation_symbol SET disposition='PENDING', classification=? "
+                "WHERE run_key=? AND ticker=? AND disposition='DEFERRED'",
+                (classification, run_key, ticker),
+            )
+
     def settle(
         self,
         run_key: str,
@@ -315,6 +345,12 @@ class LedgerPersistenceError(RuntimeError):
     """
 
 
+#: Failures a *best-effort* ledger write tolerates. ``_ledger_write`` rewraps the
+#: raw I/O errors above in ``LedgerPersistenceError``, so catching the raw tuple
+#: alone would never match and the "optional" write would abort the run anyway.
+LEDGER_WRITE_FAILURES = (LedgerPersistenceError, *LEDGER_IO_FAILURES)
+
+
 def _quota_hourly_remaining(adapter) -> int | None:
     """Hourly provider budget left, or None when it cannot be read.
 
@@ -330,11 +366,18 @@ def _quota_hourly_remaining(adapter) -> int | None:
     return remaining.get("hourly")
 
 
-def _ledger_write(experiment_db, *, ticker: str, error: str) -> None:
-    """Append the EMPTY/delisting finding to the authoritative ledger.
+def _ledger_write(
+    experiment_db, *, ticker: str, error: str | None = None, status: str = "ERROR"
+) -> None:
+    """Append an attempt outcome to the authoritative ledger.
 
     Fails closed on an expected I/O error; lets anything else (including a
     programming fault such as a missing import) propagate untouched.
+
+    A *successful* remediation must be recorded too: the rotation derives each
+    symbol's failure streak from this ledger, so leaving a repair unrecorded
+    leaves the last row an old error and the symbol reads as failing long after
+    it was fixed.
     """
     from tradehub_research.backfill.tiingo_driver import record_attempt
 
@@ -342,7 +385,7 @@ def _ledger_write(experiment_db, *, ticker: str, error: str) -> None:
         record_attempt(
             experiment_db,
             ticker=ticker,
-            status="ERROR",
+            status=status,
             http_status=None,
             bytes_count=None,
             error=error,
@@ -389,11 +432,21 @@ class AuditResult:
     exceptions: list[SecurityFreshness] = field(default_factory=list)
     lagging_within_window: list[str] = field(default_factory=list)
     groups: dict[str, list[str]] = field(default_factory=dict)
+    #: Ticker -> reason, for symbols the last COMPLETED refresh deliberately left
+    #: for a later run. Empty when no completed run exists for this session.
+    scheduled_deferrals: dict[str, str] = field(default_factory=dict)
+    #: The completed run's own record (budget, demand, served), for the report.
+    refresh_run: dict | None = None
     generated_at: str = field(default_factory=_utc_now)
 
     @property
     def stale_count(self) -> int:
         return len(self.stale)
+
+    @property
+    def scheduled_count(self) -> int:
+        """Stale because a completed run scheduled them for later -- not a defect."""
+        return len(self.scheduled_deferrals)
 
     # --- reconciled fleet accounting -------------------------------------
     # Every count below has exactly one meaning, and the report renders them so
@@ -465,6 +518,8 @@ class AuditResult:
             "stale_before": self.stale_before,
             "stale_count": self.stale_count,
             "lagging_within_window": len(self.lagging_within_window),
+            "scheduled_deferrals": self.scheduled_count,
+            "refresh_run": self.refresh_run,
             "exception_count": len(self.exceptions),
             "groups": {k: len(v) for k, v in sorted(self.groups.items())},
             "invariant_errors": self.invariant_errors(),
@@ -491,6 +546,56 @@ def _classify_from_attempt(error: str | None, status: str | None) -> str | None:
         return NOT_YET_PUBLISHED  # timing, not a storage defect
     head = error.split(":", 1)[0].strip()
     return _DEFAULT_CLASS_BY_ERROR.get(head)
+
+
+def _completed_deferrals(paths, expected: date) -> tuple[dict[str, str], dict | None]:
+    """What the last **COMPLETED** refresh deliberately left for a later run.
+
+    Returns ``({TICKER: reason}, run_record)`` and ``({}, None)`` when there is no
+    such record -- including when the roster cannot be read, so an unreadable
+    record degrades to the conservative "interrupted" classification rather than
+    claiming a deliberate deferral.
+
+    Status and dispositions come from ONE ``snapshot()`` read: two separate reads
+    let a same-session re-run claim the row in between, which would return a
+    superseded invocation's deferrals as if the session had completed them.
+    """
+    from tradehub_research.ops import refresh_runs
+
+    try:
+        snapshot = refresh_runs.store_for(paths).snapshot(expected.isoformat())
+    except Exception:  # noqa: BLE001 -- the diagnosis must not crash on its own evidence
+        return {}, None
+    if not snapshot["completed"]:
+        return {}, None
+    return {ticker.upper(): reason for ticker, reason in snapshot["deferrals"].items()}, snapshot[
+        "run"
+    ]
+
+
+def _ledger_write_optional(
+    experiment_db, *, ticker: str, status: str, error: str | None, summary: dict
+) -> bool:
+    """Best-effort ledger evidence for a repair: never fatal, never silent.
+
+    A landed bar is already observable in ``research.db``, so an unwritable
+    ledger must not throw away a repair that genuinely happened -- unlike the
+    EMPTY/delisting finding, which fails closed because the audit and the
+    quarantine read it from this ledger. The shortfall is counted in the summary
+    instead of disappearing.
+    """
+    if experiment_db is None:
+        summary["repair_ledger_unrecorded"] = summary.get("repair_ledger_unrecorded", 0) + 1
+        return False
+    try:
+        _ledger_write(experiment_db, ticker=ticker, status=status, error=error)
+        return True
+    except LEDGER_WRITE_FAILURES:
+        # `_ledger_write` rewraps the raw I/O errors, so this must catch the
+        # wrapper too -- otherwise a best-effort write aborts the whole run and
+        # the repair it was reporting goes unaccounted as well.
+        summary["repair_ledger_unrecorded"] = summary.get("repair_ledger_unrecorded", 0) + 1
+        return False
 
 
 def _last_bar(research_db, security_id: str) -> str | None:
@@ -543,8 +648,8 @@ def audit_universe(
     from tradehub_research.db import ResearchDB
     from tradehub_research.ops.daily_refresh import (
         REFRESH_STALENESS_DAYS,
-        ROTATION_REQUESTS_PER_RUN,
         retired_tickers,
+        rotation_budget_for,
     )
 
     paths = paths or research_paths()
@@ -552,7 +657,8 @@ def audit_universe(
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
     canonical = canonical_tickers_by_cik(research_db)
     retired = retired_tickers()
-    budget = rotation_budget if rotation_budget is not None else ROTATION_REQUESTS_PER_RUN
+    # Deliberate deferral vs interruption: only a COMPLETED run may claim one.
+    deferred, refresh_run = _completed_deferrals(paths, expected)
 
     # The refresh design states its window in CALENDAR days
     # (REFRESH_STALENESS_DAYS = 7, "the whole cohort rolls over every few
@@ -564,11 +670,30 @@ def audit_universe(
         count_sessions(expected - timedelta(days=REFRESH_STALENESS_DAYS), expected), 1
     )
 
+    # Judge against the EFFECTIVE budget the refresh actually runs with, not the
+    # floor constant. `rotation_budget_for` sizes the rotation to the universe
+    # precisely so the contract is achievable by construction, so the floor (40)
+    # is not what production spends. Defaulting to it made every backlog read as a
+    # structural shortfall and told the operator "refresh budget 40/day cannot
+    # cover 443 symbols ... (needs 74/day)" on a deployment whose refresh was
+    # already running at 74/day (2026-09-22) -- a false root cause covering the
+    # real one (candidates exceeding the budget, see `rotation_candidates`).
+    budget = (
+        rotation_budget
+        if rotation_budget is not None
+        else rotation_budget_for(len(canonical), window_sessions=window_sessions, as_of=expected)
+    )
+
     # Structural diagnosis: can the refresh budget hold the contract at all?
     required_daily = -(-len(canonical) // window_sessions)  # ceil
     budget_starved = budget < required_daily
 
-    result = AuditResult(expected_session=expected.isoformat(), universe=len(canonical), fresh=0)
+    result = AuditResult(
+        expected_session=expected.isoformat(),
+        universe=len(canonical),
+        fresh=0,
+        refresh_run=refresh_run,
+    )
     for security_id, ticker in sorted(canonical.items(), key=lambda kv: kv[1]):
         last = _last_bar(research_db, security_id)
         behind = sessions_behind(date.fromisoformat(last) if last else None, expected)
@@ -583,6 +708,12 @@ def audit_universe(
         if last is None:
             if symbol_has_evidence(research_db, ticker) is False:
                 classification = INVALID_SYMBOL  # never resolvable; nothing to fetch
+            elif ticker.upper() in deferred:
+                # A completed run owns this symbol's scheduling even when it holds
+                # no usable bars: re-fetching it would bypass the bounded rotation
+                # schedule -- and, for a CAPACITY_DEFERRED symbol, the rolling-month
+                # ceiling that refused it in the first place.
+                classification = SCHEDULED_DEFERRAL
             else:
                 classification = CHECKPOINT_LOST
         elif ticker.upper() in retired:
@@ -597,8 +728,33 @@ def audit_universe(
             continue
         else:
             # Materially stale: past the contract the refresh itself claims.
+            # Precedence matters here:
+            #   1. a CAPACITY deferral outranks everything below: it records that
+            #      the rolling-month symbol ceiling refused the symbol, which is a
+            #      hard constraint rather than a scheduling choice, so re-fetching
+            #      it would defy the capacity decision -- and it is not a symptom of
+            #      the request budget, so a structural shortfall must not claim it;
+            #   2. then a structural shortfall is the root cause, so it is named;
+            #   3. then a deliberate deferral by a COMPLETED run, which owns that
+            #      symbol's scheduling. This must outrank the ledger-derived
+            #      class: a DEFERRED_COOLING symbol *by definition* has a recent
+            #      failed attempt, so classifying from the attempt first would
+            #      hand every deliberately cooled symbol back to remediation --
+            #      bypassing the fairness slice and spending the quota it exists
+            #      to protect. A FAILED outcome is not a deferral (it is absent
+            #      from ``deferred``), so a symbol the run actually tried and lost
+            #      keeps its failure classification;
+            #   4. then the symbol's own recorded outcome;
+            #   5. else the batch simply did not finish.
             classification = None
-            if attempt:
+            deferral_reason = deferred.get(ticker.upper())
+            if deferral_reason == refresh_runs.DEFERRED_CAPACITY:
+                classification = SCHEDULED_DEFERRAL
+            elif budget_starved:
+                classification = ROTATION_STARVED
+            elif deferral_reason:
+                classification = SCHEDULED_DEFERRAL
+            elif attempt:
                 classification = _classify_from_attempt(attempt.get("error"), attempt.get("status"))
                 # "Fetched but not stored" needs the attempt to have run AFTER
                 # the expected session's publication boundary -- otherwise the
@@ -610,12 +766,21 @@ def audit_universe(
                 ):
                     classification = VALIDATION_FAILURE
             if classification is None:
-                classification = ROTATION_STARVED if budget_starved else INTERRUPTED_BATCH
+                classification = INTERRUPTED_BATCH
 
         if classification == ROTATION_STARVED and notes is None:
             notes = (
                 f"refresh budget {budget}/day cannot cover {len(canonical)} symbols "
                 f"within the {REFRESH_STALENESS_DAYS}-day window (needs {required_daily}/day)"
+            )
+        elif classification == SCHEDULED_DEFERRAL:
+            reason = deferred.get(ticker.upper(), "")
+            planned = (refresh_run or {}).get("candidates")
+            notes = (
+                f"deferred by the completed {expected.isoformat()} refresh "
+                f"({refresh_runs.deferral_reason_text(reason)}); "
+                f"{len(deferred)} of {planned} candidates deferred against a "
+                f"{budget}-request budget"
             )
 
         row = SecurityFreshness(
@@ -630,6 +795,8 @@ def audit_universe(
             last_attempt_error=(attempt or {}).get("error"),
             notes=notes,
         )
+        if classification == SCHEDULED_DEFERRAL:
+            result.scheduled_deferrals[ticker] = deferred[ticker.upper()]
         if classification in LEGITIMATE_EXCEPTIONS:
             result.exceptions.append(row)
         else:
@@ -699,6 +866,23 @@ def remediate(
     store.open_run(run_key, expected.isoformat(), audit.universe, audit.stale_count)
     for row in audit.stale:
         store.seed_symbol(run_key, row.ticker, row.security_id, row.last_bar, row.classification)
+        if row.classification in SCHEDULED_ONLY:
+            # A completed refresh already scheduled this symbol for a later run.
+            # It stays visible in the checkpoint and in the report, but it is not
+            # work: re-fetching it would duplicate the rotation's own plan and
+            # spend provider quota that the genuinely broken symbols need.
+            store.settle(
+                run_key,
+                row.ticker,
+                disposition="DEFERRED",
+                last_bar_after=row.last_bar,
+                classification=row.classification,
+            )
+        else:
+            # It became actionable again (the refresh attempted it and failed, or
+            # the run that deferred it is no longer the latest word). Undo the
+            # previous pass's DEFERRED verdict or `pending()` will never return it.
+            store.reopen_deferred(run_key, row.ticker, row.classification)
     for row in audit.exceptions:
         store.seed_symbol(run_key, row.ticker, row.security_id, row.last_bar, row.classification)
         store.settle(
@@ -719,15 +903,22 @@ def remediate(
         )
     store_evidence = EvidenceStore(research_db)
 
+    scheduled = sum(1 for row in audit.stale if row.classification in SCHEDULED_ONLY)
     summary = {
         "run_key": run_key,
         "expected_session": expected.isoformat(),
-        "targeted": len(audit.stale),
+        # Work remediation will actually attempt: a completed refresh's scheduled
+        # deferrals are already planned, so they are not counted as targets.
+        "targeted": len(audit.stale) - scheduled,
+        "scheduled_deferrals": scheduled,
         "repaired": 0,
         "excluded": len(audit.exceptions),
         "unresolved": 0,
         "attempts": 0,
         "quota_blocked": False,
+        # Repairs whose evidence could not be appended to the ledger (disclosed,
+        # because the rotation's failure streaks read from that ledger).
+        "repair_ledger_unrecorded": 0,
     }
 
     for row in store.pending(run_key, now=now):
@@ -873,6 +1064,13 @@ def remediate(
             summary["excluded"] += 1
             continue
         if verified:
+            # Record the repair in the ledger as well as the checkpoint: the
+            # rotation derives failure streaks from the ledger, so an unrecorded
+            # success leaves the previous error as the newest row and the symbol
+            # reads as failing long after it was fixed.
+            _ledger_write_optional(
+                experiment_db, ticker=ticker, status="SUCCESS", error=None, summary=summary
+            )
             store.settle(run_key, ticker, disposition="REPAIRED", last_bar_after=after)
             summary["repaired"] += 1
             continue

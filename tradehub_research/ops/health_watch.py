@@ -8,6 +8,7 @@ Never modifies state; never tunes anything.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -109,8 +110,85 @@ def _incident_log(paths):
     return paths.research_dir / "freshness_incidents.jsonl"
 
 
+#: Line kind for a remediation attempt recorded against an incident that is
+#: already in the log. The incident line itself stays the first observation.
+REMEDIATION_EVENT = "remediation_attempt"
+
+
+def incident_records(paths) -> list[dict]:
+    """Every durable record, in append order. Tolerant of a partial last line.
+
+    Reads both kinds: the incident itself (``incident_id``) and the
+    ``remediation_attempt`` events appended for later runs of the same incident.
+    """
+    path = _incident_log(paths)
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            records.append(parsed)
+    return records
+
+
+def _remediation_digest(remediation: dict) -> str:
+    """Stable digest of a remediation block, which is what changes per run."""
+    material = json.dumps(remediation or {}, sort_keys=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _remediation_event(incident: str, payload: dict, records: list[dict]) -> dict | None:
+    """The next append-only remediation event, or None when nothing new to say.
+
+    Returns None when the payload carries no remediation block (a bare re-report
+    has no new evidence) or when this exact remediation outcome is already logged
+    anywhere for this incident -- including the incident line's own first
+    observation, so re-running the watch on an unchanged incident stays a single
+    record. A *changed* outcome (a later run whose ledger write failed, say) is
+    always appended instead of being discarded as a duplicate incident.
+    """
+    remediation = payload.get("remediation")
+    if not remediation:
+        return None
+    digest = _remediation_digest(remediation)
+    related = [record for record in records if record.get("incident_id") == incident]
+    seen = {
+        _remediation_digest(record.get("remediation") or {})
+        for record in related
+        if record.get("remediation")
+    }
+    if digest in seen:
+        return None
+    attempts = [record for record in related if record.get("event") == REMEDIATION_EVENT]
+    return {
+        "event": REMEDIATION_EVENT,
+        "incident_id": incident,
+        "attempt": len(attempts) + 1,
+        "remediation_digest": digest,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "remediation": remediation,
+    }
+
+
 def _record_incident(paths, payload: dict) -> str | None:
-    """Append-only structured evidence. Idempotent per incident_id.
+    """Append-only structured evidence.
+
+    The INCIDENT line is idempotent per ``incident_id``: the same expected-session
+    / ticker set is one incident and re-running the watch must not duplicate it.
+
+    Remediation evidence is deliberately *not* part of that identity. A later run
+    can repair the same symbol again and land in a different state -- most
+    importantly a repair whose success row could not be appended to the ledger --
+    and dropping that payload because the incident id already existed left the
+    durable record asserting the earlier, cleaner state. So a changed remediation
+    block is appended as its own ``remediation_attempt`` event: history is never
+    mutated away, and the later failure stays discoverable.
 
     Returns None on success, or a human-readable reason when the log could not be
     written. The caller puts that reason into the report: a failure to record
@@ -120,13 +198,18 @@ def _record_incident(paths, payload: dict) -> str | None:
     path = _incident_log(paths)
     incident = payload.get("incident_id")
     try:
-        if path.exists() and incident:
-            for line in path.read_text().splitlines():
-                if line.strip() and f'"incident_id": "{incident}"' in line:
-                    return None  # already recorded; never double-log the same incident
+        records = incident_records(paths) if path.exists() else []
+        existing = [
+            record for record in records if incident and record.get("incident_id") == incident
+        ]
+        line = payload
+        if any(record.get("event") != REMEDIATION_EVENT for record in existing):
+            line = _remediation_event(str(incident), payload, records)
+            if line is None:
+                return None  # the incident, and this exact attempt, are recorded
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.write(json.dumps(line, sort_keys=True) + "\n")
         return None
     except OSError as exc:
         return f"{type(exc).__name__}: {exc}"
@@ -289,6 +372,14 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
             "Quarantined after remediation: 0",
             "Downstream signals: healthy",
         ]
+        if summary.get("repair_ledger_unrecorded"):
+            # Disclosed even on the happy path: the recovery is real but its
+            # evidence is not, and the failure-streak reader trusts that ledger.
+            lines.append(
+                f"{summary['repair_ledger_unrecorded']:,} repair(s) could not be recorded in the "
+                "attempt ledger; the failure-streak reader trusts that ledger, so those symbols "
+                "may keep reading as failing until it is writable"
+            )
         if problems:
             lines.append("")
             lines.append("REPORT INTEGRITY ERROR (counts do not reconcile):")
@@ -320,6 +411,20 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
     ]
     for cause, members in sorted(audit.groups.items(), key=lambda kv: -len(kv[1])):
         lines.append(f"- {len(members):,} {cause.replace('_', ' ').lower()}")
+    if audit.scheduled_count:
+        run = audit.refresh_run or {}
+        lines.append("")
+        lines.append("Scheduled deferral (bounded by design, not an interruption):")
+        lines.append(
+            f"- {audit.scheduled_count:,} securities deferred by the COMPLETED "
+            f"{audit.expected_session} refresh"
+        )
+        lines.append(
+            f"- that run served {run.get('refreshed') or 0:,} of "
+            f"{run.get('candidates') or 0:,} candidates against a "
+            f"{run.get('rotation_budget') or 0:,}-request budget"
+        )
+        lines.append("- the rotation drains them on later runs; not remediated here")
     oldest = min((s.last_bar for s in after.stale if s.last_bar), default=None)
     if oldest:
         lines.append(f"Oldest unresolved data: {oldest}")
@@ -329,6 +434,12 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
     lines.append("- excluded from affected signals")
     if rec["quota_blocked"]:
         lines.append("- remediation paused on the provider quota reserve (resumes next cycle)")
+    if summary.get("repair_ledger_unrecorded"):
+        lines.append(
+            f"- {summary['repair_ledger_unrecorded']:,} repair(s) could not be recorded in the "
+            "attempt ledger; the failure-streak reader trusts that ledger, so those symbols may "
+            "keep reading as failing until it is writable"
+        )
     if rec["time_budget_exhausted"]:
         lines.append("- remediation hit its time budget (resumes next cycle)")
     if capacity:
@@ -414,10 +525,17 @@ def check_data_freshness(settings, paths) -> None:
             "universe": audit.universe,
             "fresh": audit.fresh,
             "initially_stale": audit.stale_count,
+            "scheduled_deferrals": audit.scheduled_count,
+            "refresh_run": audit.refresh_run,
             "root_causes": {k: len(v) for k, v in sorted(audit.groups.items())},
             "remediation": {
                 "run_key": summary["run_key"],
                 "targeted": summary["targeted"],
+                "scheduled_deferrals": summary.get("scheduled_deferrals", 0),
+                # A repair whose ledger evidence could not be written: disclosed,
+                # because the failure-streak reader trusts that ledger and would
+                # otherwise put the symbol back into cooling with no explanation.
+                "repair_ledger_unrecorded": summary.get("repair_ledger_unrecorded", 0),
                 "repaired": summary["repaired"],
                 "excluded": summary["excluded"],
                 "unresolved": summary["unresolved"],

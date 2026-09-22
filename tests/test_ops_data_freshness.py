@@ -268,6 +268,11 @@ class TestRemediation:
             experiment_db=None,
             paths=_paths(tmp_path),
             run_key=summary["run_key"],
+            # Pin the session: `verify()` otherwise derives `expected` from the
+            # wall clock, so this assertion silently flips at the NYSE close
+            # boundary (observed 2026-09-22: it passed all day, then failed once
+            # `expected_latest_session()` rolled from 2026-09-18 to 2026-09-21).
+            as_of=date(2026, 9, 18),
             store=df.CheckpointStore(tmp_path / "c.sqlite"),
         )
         assert verification["repaired_verified"] == 1
