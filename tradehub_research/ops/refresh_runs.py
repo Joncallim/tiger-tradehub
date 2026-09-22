@@ -169,16 +169,40 @@ class RefreshRunStore:
                 (window_sessions, rotation_budget, candidates, run_key),
             )
 
-    def finish(self, run_key: str, status: str, outcomes: dict[str, str]) -> None:
+    def finish(
+        self,
+        run_key: str,
+        status: str,
+        outcomes: dict[str, str],
+        *,
+        candidates: int | None = None,
+        refreshed: int | None = None,
+        deferred: int | None = None,
+    ) -> None:
         """Close the run and record what happened to every candidate.
 
-        ``outcomes`` maps ticker -> one of ``REFRESHED`` / ``FAILED`` / a
-        ``DEFERRED`` reason. Written atomically with the status: a reader must
-        never see a closed run with a half-written work list.
+        ``outcomes`` covers every symbol the run touched -- the active phase
+        included -- because that is what the diagnosis reads per symbol. The
+        ``candidates``/``refreshed``/``deferred`` totals are the **rotation**
+        numbers the report quotes against the rotation budget, so the caller
+        passes them: deriving them from ``outcomes`` would count an active-set
+        success as a rotation candidate served and let the report claim more work
+        than the budget permits, on a demand larger than the rotation ever had.
+
+        Omitted values fall back to ``outcomes`` (correct when the run had no
+        active phase). Written atomically with the status: a reader must never see
+        a closed run with a half-written work list.
         """
         now = _utc_now()
-        refreshed = sum(1 for d in outcomes.values() if d == REFRESHED)
-        deferred = sum(1 for d in outcomes.values() if d in DEFERRED)
+        refreshed = (
+            refreshed
+            if refreshed is not None
+            else sum(1 for d in outcomes.values() if d == REFRESHED)
+        )
+        deferred = (
+            deferred if deferred is not None else sum(1 for d in outcomes.values() if d in DEFERRED)
+        )
+        candidates = candidates if candidates is not None else len(outcomes)
         db = self._connect()
         try:
             db.execute("BEGIN")
@@ -190,8 +214,8 @@ class RefreshRunStore:
             )
             db.execute(
                 "UPDATE refresh_run SET finished_at=?, status=?, refreshed=?, "
-                "deferred=?, candidates=COALESCE(?, candidates) WHERE run_key=?",
-                (now, status, refreshed, deferred, len(outcomes), run_key),
+                "deferred=?, candidates=? WHERE run_key=?",
+                (now, status, refreshed, deferred, candidates, run_key),
             )
             db.execute("COMMIT")
         except Exception:

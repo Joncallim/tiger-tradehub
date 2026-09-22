@@ -476,12 +476,19 @@ def _update_refresh_run(
         summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
 
 
-def _close_refresh_run(store, run_key: str, outcomes: dict[str, str], summary: dict) -> None:
+def _close_refresh_run(
+    store, run_key: str, outcomes: dict[str, str], summary: dict, active_attempted: set[str]
+) -> None:
     """Close the run record, or leave it OPEN so it reads as interrupted.
 
     Only ``OK`` and ``QUOTA_EXHAUSTED`` are closed. A run that died mid-flight
     stays ``RUNNING``; that is what stops a crashed refresh from being read as a
     deliberate deferral.
+
+    The rotation totals are reported separately from the symbol-level outcomes:
+    an active-set success is real work, but it is not a rotation candidate served,
+    and counting it would make the report quote more work than the rotation
+    budget allows on a demand the rotation never had.
     """
     status = {
         "OK": refresh_runs.COMPLETED,
@@ -489,15 +496,28 @@ def _close_refresh_run(store, run_key: str, outcomes: dict[str, str], summary: d
     }.get(summary.get("status"))
     if store is None or status is None:
         return
+    rotation = {
+        ticker: disposition
+        for ticker, disposition in outcomes.items()
+        if ticker not in active_attempted
+    }
+    rotation_deferred = sum(
+        1 for disposition in rotation.values() if disposition in refresh_runs.DEFERRED
+    )
     try:
-        store.finish(run_key, status, outcomes)
+        store.finish(
+            run_key,
+            status,
+            outcomes,
+            candidates=summary.get("rotation_candidates", len(rotation)),
+            refreshed=summary.get("rotation_refreshed", 0),
+            deferred=rotation_deferred,
+        )
     except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
         summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
         return
     summary["refresh_run_status"] = status
-    summary["refresh_run_deferred"] = sum(
-        1 for disposition in outcomes.values() if disposition in refresh_runs.DEFERRED
-    )
+    summary["refresh_run_deferred"] = rotation_deferred
 
 
 def run_daily_refresh(
@@ -540,6 +560,9 @@ def run_daily_refresh(
     # Declared before the try so every exit path can close the run record.
     run_key = as_of.isoformat()
     outcomes: dict[str, str] = {}
+    #: Symbols attempted by the active phase: they are real work, but not
+    #: rotation candidates, so they are excluded from the rotation totals.
+    active_attempted: set[str] = set()
     # Open (or reset) the session record BEFORE the first fallible request. A
     # same-session re-run must invalidate the previous COMPLETED record straight
     # away: if this run then exhausts quota or dies, the old run's deferral list
@@ -557,6 +580,7 @@ def run_daily_refresh(
             before_success = summary["SUCCESS"]
             _refresh_one(adapter, quota, research_db, experiment_db, store, ticker, as_of, summary)
             summary["active_refreshed"] += 1
+            active_attempted.add(ticker)
             # These symbols were genuinely attempted; record the outcome as such
             # rather than letting them read as "deliberately skipped" later. A
             # symbol the active phase failed is cooling in the rotation, so
@@ -673,11 +697,11 @@ def run_daily_refresh(
     except RuntimeError as exc:
         if "quota" in str(exc):
             summary["status"] = "QUOTA_EXHAUSTED"
-            _close_refresh_run(roster, run_key, outcomes, summary)
+            _close_refresh_run(roster, run_key, outcomes, summary, active_attempted)
             return summary
         raise  # an unexpected fault leaves the run OPEN: reads as interrupted
     summary["status"] = "OK"
-    _close_refresh_run(roster, run_key, outcomes, summary)
+    _close_refresh_run(roster, run_key, outcomes, summary, active_attempted)
     return summary
 
 
