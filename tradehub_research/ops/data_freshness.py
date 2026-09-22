@@ -345,6 +345,12 @@ class LedgerPersistenceError(RuntimeError):
     """
 
 
+#: Failures a *best-effort* ledger write tolerates. ``_ledger_write`` rewraps the
+#: raw I/O errors above in ``LedgerPersistenceError``, so catching the raw tuple
+#: alone would never match and the "optional" write would abort the run anyway.
+LEDGER_WRITE_FAILURES = (LedgerPersistenceError, *LEDGER_IO_FAILURES)
+
+
 def _quota_hourly_remaining(adapter) -> int | None:
     """Hourly provider budget left, or None when it cannot be read.
 
@@ -581,7 +587,10 @@ def _ledger_write_optional(
     try:
         _ledger_write(experiment_db, ticker=ticker, status=status, error=error)
         return True
-    except LEDGER_IO_FAILURES:
+    except LEDGER_WRITE_FAILURES:
+        # `_ledger_write` rewraps the raw I/O errors, so this must catch the
+        # wrapper too -- otherwise a best-effort write aborts the whole run and
+        # the repair it was reporting goes unaccounted as well.
         summary["repair_ledger_unrecorded"] = summary.get("repair_ledger_unrecorded", 0) + 1
         return False
 

@@ -428,27 +428,29 @@ def allocate_rotation(
 
 
 def _open_refresh_run(paths, run_key: str, *, universe: int, summary: dict):
-    """Start the durable run record.
+    """Start (or reset) the durable run record. FAILS CLOSED.
 
-    Best-effort on purpose: when the record cannot be written the audit sees no
-    completed run and falls back to the *conservative* "interrupted"
-    classification, which keeps the symbols actionable. A failed write therefore
-    degrades to more remediation, never to a bogus claim of deliberate deferral.
+    The record is what lets the diagnosis tell a deliberate deferral from an
+    interruption. Proceeding without it on a same-session re-run would leave a
+    previous COMPLETED record and its deferral list in place, and those obsolete
+    deferrals would suppress remediation for a session whose latest attempt
+    actually failed. So an unwritable record aborts the run *before* any provider
+    work rather than fetching under a stale decision.
+
+    (A run that never opens a record at all -- a first run whose store cannot be
+    created -- raises here too, for the same reason: its scheduling decisions
+    could not be recorded, and the diagnosis must not be left reading old state.)
     """
-    try:
-        store = refresh_runs.store_for(paths)
-        store.open_run(
-            run_key,
-            run_key,
-            universe=universe,
-            window_sessions=summary.get("window_sessions"),
-            rotation_budget=summary.get("rotation_budget"),
-            candidates=summary.get("rotation_candidates"),
-        )
-        return store
-    except Exception as exc:  # noqa: BLE001 -- evidence, never the fetch path
-        summary["refresh_run_record_error"] = f"{type(exc).__name__}: {exc}"
-        return None
+    store = refresh_runs.store_for(paths)
+    store.open_run(
+        run_key,
+        run_key,
+        universe=universe,
+        window_sessions=summary.get("window_sessions"),
+        rotation_budget=summary.get("rotation_budget"),
+        candidates=summary.get("rotation_candidates"),
+    )
+    return store
 
 
 def _update_refresh_run(
