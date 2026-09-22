@@ -147,6 +147,16 @@ def render_daily_report(data: dict[str, Any]) -> str:
     lines.append("Learning:")
     lines.append(f"Predictions: {data.get('predictions', 0)}")
     lines.append(f"New matured outcomes: {data.get('new_matured', 0)}")
+    awaiting = data.get("awaiting_entry") or {}
+    if awaiting.get("total"):
+        lines.append(
+            f"Awaiting entry bar: {awaiting['total']} "
+            f"(oldest as_of {awaiting.get('oldest_as_of')}, "
+            f"{awaiting.get('distinct_securities')} securities, "
+            f"age {awaiting.get('age_sessions')} sessions / {awaiting.get('age_days')} days, "
+            f"{awaiting.get('recoverable', {}).get('securities', 0)} recoverable / "
+            f"{len(awaiting.get('unrecoverable') or [])} unrecoverable)"
+        )
     lines.append(f"Data/system health: {data.get('system_health', 'healthy')}")
     return "\n".join(lines)
 

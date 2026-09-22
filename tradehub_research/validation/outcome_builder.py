@@ -22,13 +22,16 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from tradehub_research.db import ResearchDB, utc_now
+from tradehub_research.ops.market_calendar import is_session_day
 from tradehub_research.portfolio.prices import (
     _action_records,
     _cumulative_adjustments,
+    _session_key,
     _visible_records,
     next_session_on_or_after,
 )
@@ -176,7 +179,14 @@ def build_outcome_label(
             return label
 
         # Exit = horizon sessions after entry, at close.
-        bars = _bars_since(db, security_id, entry_session, _snapshot_end_asof())
+        # Only bars dated on a real market session count: a weekend/holiday bar
+        # (e.g. METRY's calendar-daily feed) is not a session and must never set
+        # the exit session or the session count the horizon is measured in.
+        bars = [
+            bar
+            for bar in _bars_since(db, security_id, entry_session, _snapshot_end_asof())
+            if is_session_day(date.fromisoformat(_session_key(bar)))
+        ]
         exit_bar: dict[str, Any] | None = None
         # The shared exit rule: the horizon-th session after entry, or None while
         # the horizon is immature (never the latest available bar).

@@ -215,7 +215,7 @@ def build_daily_report(
     broker = analytics if analytics is not None else _broker_today(LATEST)
     # The report owns the reporting day (it is also the action-ledger day), and
     # passes it down so "new today" is measured on exactly the same clock.
-    fwd = forward_health(experiment_db=experiment_db, reporting_day=date.today())
+    fwd = forward_health(experiment_db=experiment_db, paths=paths, reporting_day=date.today())
     refr = refresh_health(settings=settings, paths=paths)
     acts = _ledger_actions(LEDGER, date.today().isoformat())
 
@@ -245,6 +245,9 @@ def build_daily_report(
         # own day, from the durable appended_at timestamp. The cumulative
         # per-horizon totals stay on the weekly report, where they are documented.
         "new_matured": fwd.get("matured_today", 0),
+        # Due-but-not-evaluable (expected entry-session bar unavailable): pending
+        # by design, never terminalised by elapsed time.
+        "awaiting_entry": fwd.get("awaiting_entry"),
         "system_health": _system_health(fwd, refr, 0),
     }
     return render_daily_report(data)

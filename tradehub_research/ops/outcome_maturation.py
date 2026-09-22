@@ -194,8 +194,11 @@ def _evaluate(
             else f"expected entry session {expected_entry} has no usable bar "
             f"(first usable bar is {first})"
         )
-        # Terminal only when the horizon of the name is genuinely unresolvable.
-        if not exists or (delisted_at is not None and delisted_at <= expected_entry):
+        # Terminal only on positive evidence: the name is gone (unknown), or it
+        # delisted at or before the session the horizon needs -- in which case the
+        # outcome can never be observed (an existing explicit terminal class).
+        required_exit = required_exit_session(expected_entry, horizon_sessions)
+        if not exists or (delisted_at is not None and delisted_at <= required_exit):
             return {"status": "DELISTING_OUTCOME_UNKNOWN", "pending": None, "detail": detail}
         # Never shift the entry to a later session -- that would silently price a
         # different prediction. Not yet evaluable, retryable, and visible.
@@ -226,9 +229,11 @@ def _evaluate(
                 "pending": AWAITING_HORIZON,
                 "detail": f"exit session {exit_session} has not arrived",
             }
-        lag = count_sessions(
-            date.fromisoformat(post_entry[-1][0]), date.fromisoformat(exit_session)
-        )
+        # How far behind the exit session the realized data is. With no bar after
+        # the entry session, the entry session itself is the last realized data --
+        # and that case must never index an empty list.
+        last_realized = post_entry[-1][0] if post_entry else entry_session
+        lag = count_sessions(date.fromisoformat(last_realized), date.fromisoformat(exit_session))
         if lag <= DATA_GRACE_SESSIONS:
             return {
                 "status": None,

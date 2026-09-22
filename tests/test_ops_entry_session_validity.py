@@ -313,3 +313,37 @@ def test_every_emitted_session_is_a_valid_market_session(tmp_path):
             f"{prediction_id} entry {entry} is not the calendar's expected entry "
             f"for as_of {as_of_by_prediction[prediction_id]}"
         )
+
+
+def test_entry_bar_present_with_no_bars_after_it_is_honest(tmp_path):
+    """Regression (found live): one bar, exactly on the expected entry session,
+
+    and nothing after it. Before the fix this crashed with an IndexError on an
+    empty post-entry list. Behaviour must be honest instead:
+      * before the due gate: nothing happens at all;
+      * once the horizon's exit session has arrived with no realized bars, the
+        existing CENSORED_INSUFFICIENT_HORIZON class applies (the entry bar is
+        present -- this is a horizon-data gap, not an entry gap).
+    """
+    paths, rdb, exp = _seed(tmp_path, [(EXPECTED_ENTRY, 100.0)])
+    _prediction(exp)
+    exit_session = required_exit_session(EXPECTED_ENTRY, 21)
+
+    # Not due yet: the written due date is the session-exact maturity.
+    early = next_session(date.fromisoformat(EXPECTED_ENTRY)).isoformat()
+    summary = _run(exp, rdb, paths, early)
+    assert _outcomes(exp) == []
+    assert summary["due"] == 0
+
+    # Due, exit session arrived, no realized bars -> the existing censored class.
+    summary = _run(exp, rdb, paths, exit_session)
+    rows = _outcomes(exp)
+    assert len(rows) == 1, summary
+    assert rows[0][1] == "CENSORED_INSUFFICIENT_HORIZON", rows
+    assert rows[0][3] == EXPECTED_ENTRY, "the known entry session is recorded"
+    assert summary["matured"] == {"CENSORED_INSUFFICIENT_HORIZON": 1}
+
+    # A later run is a no-op: the row is permanent and never rewritten.
+    summary = _run(exp, rdb, paths, "2027-06-01")
+    assert summary["due"] == 0
+    assert len(_outcomes(exp)) == 1
