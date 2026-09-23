@@ -90,35 +90,41 @@ def _pending_evidence(
 
     with experiment_db.connect(read_only=True) as conn:
         due_rows = conn.execute(
-            "SELECT p.prediction_id, p.security_id, p.as_of, p.horizon_sessions "
+            "SELECT p.security_id, p.as_of, p.horizon_sessions, COUNT(*) AS n "
             "FROM forward_prediction p "
             "WHERE p.provenance='production' AND p.outcome_due_date <= ? "
             "AND NOT EXISTS (SELECT 1 FROM forward_outcome o "
-            "                WHERE o.prediction_id=p.prediction_id)",
+            "                WHERE o.prediction_id=p.prediction_id) "
+            "GROUP BY 1, 2, 3",
             (collection_date.isoformat(),),
         ).fetchall()
 
     buckets: dict[str, dict[str, dict]] = {reason: {} for reason in PENDING_REASONS}
+    # The classification depends only on (security, as_of, horizon) -- the variants
+    # of one prediction share it, so evaluate each unit once and scale by its rows.
+    units: dict[tuple[str, str, int], int] = {}
     for row in due_rows:
-        as_of = str(row["as_of"])[:10]
-        horizon = int(row["horizon_sessions"])
+        key = (str(row["security_id"]), str(row["as_of"])[:10], int(row["horizon_sessions"]))
+        units[key] = units.get(key, 0) + int(row["n"] if "n" in row.keys() else 1)
+    records_cache: dict[str, list] = {}
+    for (security_id, as_of, horizon), row_count in units.items():
         result = _evaluate(
             research_db,
-            security_id=str(row["security_id"]),
+            security_id=security_id,
             as_of=as_of,
             horizon_sessions=horizon,
             collection_date=collection_date,
+            records_cache=records_cache,
         )
         reason = result["pending"]
         if result["status"] is not None or reason not in buckets:
             continue
         exit_session = required_exit_session(entry_session_for(as_of), horizon)
-        security_id = str(row["security_id"])
         info = buckets[reason].setdefault(
             security_id,
             {"predictions": 0, "oldest_as_of": as_of, "oldest_exit_session": exit_session},
         )
-        info["predictions"] += 1
+        info["predictions"] += row_count
         if as_of < info["oldest_as_of"]:
             info["oldest_as_of"] = as_of
             info["oldest_exit_session"] = exit_session
@@ -220,6 +226,8 @@ def forward_health(
     paths = paths or research_paths()
     collection = collection_date or last_completed_us_session()
     due = collection.isoformat()
+    from tradehub_research.validation.horizons import entry_session_for, required_exit_session
+
     day = reporting_day or date.today()
     day_start, day_end = _local_day_utc_bounds(day)
     pending = _pending_evidence(experiment_db, ResearchDB(paths.research_db), collection)
@@ -231,13 +239,14 @@ def forward_health(
             "SELECT horizon_sessions, COUNT(*) FROM forward_prediction "
             "WHERE provenance='production' GROUP BY horizon_sessions ORDER BY horizon_sessions"
         ).fetchall()
-        due_count = conn.execute(
-            "SELECT COUNT(*) FROM forward_prediction WHERE provenance='production' "
-            "AND outcome_due_date <= ? AND NOT EXISTS "
+        due_rows = conn.execute(
+            "SELECT as_of, horizon_sessions, COUNT(*) AS n FROM forward_prediction "
+            "WHERE provenance='production' AND outcome_due_date <= ? AND NOT EXISTS "
             "(SELECT 1 FROM forward_outcome o "
-            " WHERE o.prediction_id=forward_prediction.prediction_id)",
+            " WHERE o.prediction_id=forward_prediction.prediction_id) "
+            "GROUP BY 1, 2",
             (due,),
-        ).fetchone()[0]
+        ).fetchall()
         matured = conn.execute(
             "SELECT outcome_status, COUNT(*) FROM forward_outcome o "
             "JOIN forward_prediction p ON p.prediction_id=o.prediction_id "
@@ -258,10 +267,24 @@ def forward_health(
             "WHERE p.provenance='production' AND o.appended_at >= ? AND o.appended_at < ?",
             (day_start, day_end),
         ).fetchone()[0]
+
+    def _mature(row) -> bool:
+        exit_session = required_exit_session(
+            entry_session_for(str(row["as_of"])[:10]), int(row["horizon_sessions"])
+        )
+        return collection >= date.fromisoformat(exit_session)
+
+    mature_count = sum(int(row["n"]) for row in due_rows if _mature(row))
     return {
         "production_predictions": total,
         "by_horizon": {str(r[0]): r[1] for r in by_horizon},
-        "predictions_due": due_count,
+        # ``predictions_due`` = genuinely mature: the AUTHORITATIVE required exit
+        # session has elapsed (an outcome could be materialized once its evidence
+        # exists). ``predictions_due_check`` = the advisory scheduling gate
+        # (``outcome_due_date``), which for legacy immutable rows precedes the
+        # session-exact maturity and must never be described as "due".
+        "predictions_due": mature_count,
+        "predictions_due_check": sum(int(row["n"]) for row in due_rows),
         "matured": {str(r[0]): r[1] for r in matured},
         "matured_by_horizon": {str(r[0]): r[1] for r in matured_by_horizon},
         # Outcomes APPENDED on the reporting day (durable appended_at) and the day

@@ -94,7 +94,7 @@ def _setup(
             },
             extraction_confidence=0.95,
             event_time=f"{day}T00:00:00Z",
-            public_available_time=f"{_next_session(day)}T00:15:00Z",
+            public_available_time=f"{day}T20:15:00Z",
             pat_provenance="source_reported",
             source_record_id=f"rec-{day}-{i}",
         )

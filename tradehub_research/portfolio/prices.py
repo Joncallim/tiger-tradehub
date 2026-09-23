@@ -357,8 +357,20 @@ def latest_close_microusd(db: Any, security_id: str, as_of: str) -> tuple[int | 
     return int(micro), _session_key(bar)
 
 
+#: Realized-price visibility bound for outcome labels: "every bar in this
+#: snapshot". Deliberately NOT the observation time -- realized prices are
+#: outcome-side data (the decision-time FEATURE path is PIT-filtered and guarded
+#: by the lookahead canaries). The live forward ledger passes its collection date
+#: instead, so a correction published later is never consumed early.
+_OUTCOME_VISIBILITY_BOUND = "9999-12-31T00:00:00Z"
+
+
 def next_session_on_or_after(
-    db: Any, security_id: str, after_ts: str
+    db: Any,
+    security_id: str,
+    after_ts: str,
+    *,
+    visibility_bound: str = _OUTCOME_VISIBILITY_BOUND,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Canonical bar ON the market session the calendar expects next.
 
@@ -381,8 +393,8 @@ def next_session_on_or_after(
     result is (None, None): the entry is NEVER shifted to a later session, which
     would silently price a different prediction.
     """
-    records = _visible_records(db, security_id, _OUTCOME_VISIBILITY_BOUND)
-    bars = _bar_records(records, _OUTCOME_VISIBILITY_BOUND)
+    records = _visible_records(db, security_id, visibility_bound)
+    bars = _bar_records(records, visibility_bound)
     expected_session = entry_session_for(after_ts)
     for bar in bars:
         session = _session_key(bar)
@@ -393,6 +405,3 @@ def next_session_on_or_after(
             # bar. Do not substitute a later one.
             return None, None
     return None, None
-
-
-_OUTCOME_VISIBILITY_BOUND = "9999-12-31T00:00:00Z"

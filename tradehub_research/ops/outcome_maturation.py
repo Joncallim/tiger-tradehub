@@ -71,12 +71,13 @@ from __future__ import annotations
 import json
 import sys
 from datetime import date
+from typing import Any
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.ops.common import ResearchPaths, research_paths
-from tradehub_research.ops.market_calendar import is_session_day
-from tradehub_research.portfolio import prices
+from tradehub_research.portfolio.prices import _session_key
+from tradehub_research.validation import outcome_prices
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.forward_collector import append_outcome
 from tradehub_research.validation.horizons import (
@@ -103,80 +104,16 @@ AWAITING_EXIT_BAR = "AWAITING_EXIT_BAR"  # horizon elapsed, required evidence mi
 PENDING_REASONS = (AWAITING_ENTRY_BAR, AWAITING_HORIZON, AWAITING_EXIT_BAR)
 
 
-def _canonical_session_bars(
-    research_db: ResearchDB,
-    security_id: str,
-    as_of: str,
-    collection_date: date,
-) -> list[tuple[str, float | None]]:
-    """Canonical SESSION bars strictly after ``as_of``: [(session_date, close)].
+def _security_state(db: Any, security_id: str) -> tuple[bool, str | None]:
+    """``(exists, delisted_at)`` for a security, from an open connection.
 
-    Three filters, in order:
-
-    1. the existing canonical rule (``portfolio.prices._bar_records``): identical
-       duplicate bars for one session collapse, CONFLICTING bars for one session
-       make that session UNKNOWN, and a bar whose session date is after the
-       collection date is never consumed;
-    2. the market calendar: a bar dated on a weekend or a market holiday IS NOT A
-       SESSION and is dropped entirely -- it may never establish an entry, an
-       exit, a session count or a due/maturity date. Live example: ``METRY``
-       (METRO INC./ADR) carries calendar-daily Tiingo bars, 194 of 621 on
-       weekends/holidays;
-    3. sessions only: one row per completed trading session, oldest first.
-
-    Nothing is ever shifted: dropping a non-session bar does not move the entry.
+    A security that is absent from the table, or carries a ``delisted_at``, is
+    reported operationally (see ``ops/health.py``). Only a verified delisting
+    at/before the session the horizon needs is a TERMINAL label.
     """
-    with research_db.connect(read_only=True) as conn:
-        rows = conn.execute(
-            "SELECT evidence_id, source_id, security_id, event_time, structured_fields "
-            "FROM evidence_event WHERE security_id=? AND source_id='tiingo_eod' "
-            "AND json_extract(structured_fields, '$.record_type')='price_bar' "
-            "AND json_extract(structured_fields, '$.session_date') > ? "
-            "ORDER BY json_extract(structured_fields, '$.session_date'), evidence_id",
-            (security_id, as_of[:10]),
-        ).fetchall()
-    records = [
-        {
-            "evidence_id": row["evidence_id"],
-            "source_id": row["source_id"],
-            "security_id": row["security_id"],
-            "event_time": row["event_time"],
-            "structured_fields": json.loads(row["structured_fields"] or "{}"),
-        }
-        for row in rows
-    ]
-    bars: list[tuple[str, float | None]] = []
-    for record in prices._bar_records(records, collection_date.isoformat()):
-        fields = record["structured_fields"]
-        session = str(fields.get("session_date") or "")[:10]
-        if not session:
-            continue
-        try:
-            day = date.fromisoformat(session)
-        except ValueError:
-            continue
-        if not is_session_day(day):
-            continue  # a weekend/holiday bar is not a session
-        close = fields.get("close")
-        try:
-            close = float(close) if close is not None else None
-        except (TypeError, ValueError):
-            close = None
-        bars.append((session, close))
-    return bars
-
-
-def _security_state(research_db: ResearchDB, security_id: str) -> tuple[bool, str | None]:
-    """``(exists, delisted_at)`` for a security.
-
-    A security that is absent from the table, or carries a ``delisted_at``, can
-    never resolve a horizon: its outcome is unknown, which is a terminal and
-    honest label -- not a reason to wait.
-    """
-    with research_db.connect(read_only=True) as conn:
-        row = conn.execute(
-            "SELECT delisted_at FROM security WHERE security_id=?", (security_id,)
-        ).fetchone()
+    row = db.execute(
+        "SELECT delisted_at FROM security WHERE security_id=?", (security_id,)
+    ).fetchone()
     if row is None:
         return False, None
     delisted_at = row["delisted_at"]
@@ -190,104 +127,172 @@ def _evaluate(
     as_of: str,
     horizon_sessions: int,
     collection_date: date,
+    records_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict:
-    """Classify one due prediction against its realized sessions.
+    """Classify one due prediction against its realized sessions and evidence.
 
     Returns ``{"status": <enum or None>, "pending": <reason or None>,
-    "total_return": float | None, "entry_session_date": str | None,
+    "raw_return"|"total_return": float | None, "entry_session_date": str | None,
     "exit_session_date": str | None, "detail": str}``.
+
+    Evidence authority: every bar and corporate action is read through
+    ``validation.outcome_prices`` -> ``portfolio.prices._visible_records``, i.e.
+    the same supersession / withdrawal / publication-visibility / approved-PAT
+    semantics the rest of the repository uses, bounded by the COLLECTION DATE so
+    a correction published later is never consumed early. The entry price
+    convention, the exact exit session and the raw/total return definitions are
+    the shared ones -- identical to the frozen research builder.
     """
-    # An absent security row is a repairable gap too: it is reported by health as
-    # unrecoverable-for-now, but it is never a terminal label on its own.
-    _exists, delisted_at = _security_state(research_db, security_id)
-    bars = _canonical_session_bars(research_db, security_id, as_of, collection_date)
-
-    # The entry session is decided by the MARKET CALENDAR, never by whichever bar
-    # happens to be first: the first valid session strictly after the prediction's
-    # as_of. A weekend/holiday bar can therefore never become "the entry".
+    # Visibility bound: the WHOLE collection day. The nightly refresh ingests the
+    # session's EOD evidence that evening (typically ~20:15Z) and maturation runs
+    # hours later, so anything published during the collection day is visible --
+    # while a correction published on a LATER day is correctly not consumed early.
+    bound = f"{collection_date.isoformat()}T23:59:59Z"
     expected_entry = entry_session_for(as_of)
-    if not bars or bars[0][0] != expected_entry:
-        first = bars[0][0] if bars else None
-        detail = (
-            f"expected entry session {expected_entry} has no usable bar"
-            if first is None
-            else f"expected entry session {expected_entry} has no usable bar "
-            f"(first usable bar is {first})"
+    expected_exit = required_exit_session(expected_entry, horizon_sessions)
+
+    with research_db.connect(read_only=True) as db:
+        # ONE evidence resolution per evaluation (chain resolution loads the
+        # security's whole history -- never do it three times per row). A caller
+        # working over one collection date may pass a cache keyed by security_id:
+        # the visibility bound is the collection date, so the resolution is shared
+        # by every cohort and horizon evaluated in that run.
+        if records_cache is None:
+            records = outcome_prices.visible_records(db, security_id, bound)
+        else:
+            records = records_cache.get(security_id)
+            if records is None:
+                records = outcome_prices.visible_records(db, security_id, bound)
+                records_cache[security_id] = records
+        _exists, delisted_at = _security_state(db, security_id)
+
+        # Terminal on positive evidence: verified delisting at/before the session
+        # the horizon needs means the outcome can never be observed.
+        if delisted_at is not None and delisted_at <= expected_exit:
+            entry_session_known = None
+            _bar, session, _price, _conv = outcome_prices.entry_for(
+                db, security_id, as_of, visibility_bound=bound, records=records
+            )
+            if session is not None:
+                entry_session_known = session
+            return {
+                "status": "DELISTING_OUTCOME_UNKNOWN",
+                "pending": None,
+                "entry_session_date": entry_session_known,
+                "detail": (
+                    f"delisted {delisted_at} at/before the required exit session {expected_exit}"
+                ),
+            }
+
+        # Entry: the calendar's expected entry session, from the canonical
+        # visible/terminal evidence layer.
+        entry_bar, entry_session, entry_price, entry_convention = outcome_prices.entry_for(
+            db, security_id, as_of, visibility_bound=bound, records=records
         )
-        # Terminal ONLY on positive evidence that the outcome cannot be recovered:
-        # a verified delisting at or before the session the horizon needs. An
-        # absent security row is itself a repairable gap, so it stays pending.
-        required_exit = required_exit_session(expected_entry, horizon_sessions)
-        if delisted_at is not None and delisted_at <= required_exit:
-            return {"status": "DELISTING_OUTCOME_UNKNOWN", "pending": None, "detail": detail}
-        # Never shift the entry to a later session -- that would silently price a
-        # different prediction. Not yet evaluable, retryable, and visible.
-        return {"status": None, "pending": AWAITING_ENTRY_BAR, "detail": detail}
+        if entry_bar is None or entry_session is None:
+            return {
+                "status": None,
+                "pending": AWAITING_ENTRY_BAR,
+                "detail": (
+                    f"expected entry session {expected_entry} has no visible terminal bar "
+                    "(never shifted to a later session)"
+                ),
+            }
+        if entry_price is None:
+            # Unusable ENTRY data is an entry gap, not an exit gap.
+            return {
+                "status": None,
+                "pending": AWAITING_ENTRY_BAR,
+                "entry_session_date": entry_session,
+                "detail": (
+                    f"entry session {entry_session} carries no usable (positive) "
+                    f"{entry_convention} price"
+                ),
+            }
 
-    entry_session, entry_close = bars[0]
-    # The horizon counts sessions AFTER the entry session, and the exit must be
-    # EXACTLY the session the calendar requires -- a missing or UNKNOWN bar is a
-    # data-quality gap, never a reason to shift the exit to another session.
-    exit_session = required_exit_session(entry_session, horizon_sessions)
-    realized_after_entry = len(bars) - 1
+        exit_session = required_exit_session(entry_session, horizon_sessions)
+        if delisted_at is not None and delisted_at <= exit_session:
+            return {
+                "status": "DELISTING_OUTCOME_UNKNOWN",
+                "pending": None,
+                "entry_session_date": entry_session,
+                "detail": f"delisted {delisted_at} at/before the exit session {exit_session}",
+            }
 
-    # A delisting at or before the exit session means the horizon can never be
-    # observed: never dropped, never imputed zero (the research contract).
-    if delisted_at is not None and delisted_at <= exit_session:
+        if collection_date < date.fromisoformat(exit_session):
+            # Market time has not elapsed yet: normal waiting, not a gap.
+            return {
+                "status": None,
+                "pending": AWAITING_HORIZON,
+                "entry_session_date": entry_session,
+                "detail": f"exit session {exit_session} has not arrived",
+            }
+
+        # Exit: EXACTLY the required session, from the same visible evidence set.
+        bars = outcome_prices.visible_session_bars(
+            db,
+            security_id,
+            after_session=entry_session,
+            up_to=bound,
+            visibility_bound=bound,
+            records=records,
+        )
+        exit_bar = next(
+            (bar for bar in bars if _session_key(bar) == exit_session),
+            None,
+        )
+        if exit_bar is None:
+            # Missing, or that session is UNKNOWN because its bars conflict. A
+            # DATA-QUALITY gap, not a verdict: forward_outcome is append-only with
+            # UNIQUE(prediction_id), so a permanent non-OBSERVED row written now
+            # could never become the genuine OBSERVED outcome. Stay pending and
+            # retry. (The frozen-snapshot builder is different: there the dataset
+            # boundary is final, so an insufficient horizon is terminally
+            # CENSORED -- see validation/outcome_builder.py.)
+            return {
+                "status": None,
+                "pending": AWAITING_EXIT_BAR,
+                "entry_session_date": entry_session,
+                "detail": (
+                    f"{len(bars)}/{horizon_sessions} realized sessions; no visible canonical "
+                    f"exit bar for {exit_session}"
+                ),
+            }
+
+        exit_close = outcome_prices.bar_close(exit_bar)
+        if exit_close is None or exit_close <= 0:
+            return {
+                "status": None,
+                "pending": AWAITING_EXIT_BAR,
+                "entry_session_date": entry_session,
+                "detail": (
+                    f"exit bar for {exit_session} carries no usable (positive) close "
+                    "(recoverable: the record may be corrected)"
+                ),
+            }
+
+        raw_return, total_return = outcome_prices.outcome_returns(
+            db,
+            security_id,
+            entry_session=entry_session,
+            entry_price=entry_price,
+            exit_session=exit_session,
+            exit_close=exit_close,
+            visibility_bound=bound,
+            records=records,
+        )
         return {
-            "status": "DELISTING_OUTCOME_UNKNOWN",
+            "status": "OBSERVED",
             "pending": None,
+            "raw_return": float(raw_return) if raw_return is not None else None,
+            "total_return": float(total_return) if total_return is not None else None,
             "entry_session_date": entry_session,
-            "detail": f"delisted {delisted_at} at/before the exit session {exit_session}",
-        }
-
-    if collection_date < date.fromisoformat(exit_session):
-        # Market time has not elapsed yet: normal waiting, not a gap.
-        return {
-            "status": None,
-            "pending": AWAITING_HORIZON,
-            "detail": f"exit session {exit_session} has not arrived",
-        }
-
-    exit_bar = next((bar for bar in bars if bar[0] == exit_session), None)
-    if exit_bar is None:
-        # Market time HAS elapsed, but the required exit evidence is not available
-        # (missing, or that session is UNKNOWN because of conflicting bars). This
-        # is a DATA-QUALITY gap, not a verdict: an ingestion/backfill repair or a
-        # superseding record can still supply it, and ``forward_outcome`` is
-        # append-only with UNIQUE(prediction_id), so a permanent non-OBSERVED row
-        # written now could never become the genuine OBSERVED outcome. Stay
-        # pending and retry. (The frozen-snapshot research builder is different:
-        # there the dataset boundary IS final, so an insufficient horizon is
-        # terminally CENSORED -- see validation/outcome_builder.py.)
-        return {
-            "status": None,
-            "pending": AWAITING_EXIT_BAR,
-            "entry_session_date": entry_session,
+            "exit_session_date": exit_session,
             "detail": (
-                f"{realized_after_entry}/{horizon_sessions} realized sessions; required exit "
-                f"bar for {exit_session} is not available yet"
+                f"{horizon_sessions} sessions {entry_session} -> {exit_session} "
+                f"({entry_convention})"
             ),
         }
-
-    _exit_session, exit_close = exit_bar
-    if entry_close is None or entry_close == 0 or exit_close is None:
-        # A present but unusable close is ALSO recoverable evidence: bars can be
-        # superseded by a corrected record. Never a permanent label for it.
-        return {
-            "status": None,
-            "pending": AWAITING_EXIT_BAR,
-            "entry_session_date": entry_session,
-            "detail": "a realized bar carries no usable close (recoverable: bar may be superseded)",
-        }
-    return {
-        "status": "OBSERVED",
-        "pending": None,
-        "total_return": exit_close / entry_close - 1.0,
-        "entry_session_date": entry_session,
-        "exit_session_date": exit_session,
-        "detail": f"{horizon_sessions} sessions {entry_session} -> {exit_session}",
-    }
 
 
 def mature_due_outcomes(
@@ -320,18 +325,28 @@ def mature_due_outcomes(
     counts = {status: 0 for status in TERMINAL_STATUSES}
     awaiting = {reason: 0 for reason in PENDING_REASONS}
     materialized = 0
+    # The classification depends only on (security, as_of, horizon): the variants
+    # of one prediction share it, so evaluate each unit ONCE and apply the result
+    # to every prediction in it (evidence resolution is the expensive part).
+    evaluated: dict[tuple[str, str, int], dict] = {}
+    records_cache: dict[str, list[dict[str, Any]]] = {}
     for row in pending:
         horizon = int(row["horizon_sessions"])
         if horizon not in HORIZON_SESSIONS:
             awaiting["UNKNOWN_HORIZON"] = awaiting.get("UNKNOWN_HORIZON", 0) + 1
             continue
-        result = _evaluate(
-            research_db,
-            security_id=str(row["security_id"]),
-            as_of=str(row["as_of"]),
-            horizon_sessions=horizon,
-            collection_date=due,
-        )
+        key = (str(row["security_id"]), str(row["as_of"])[:10], horizon)
+        result = evaluated.get(key)
+        if result is None:
+            result = _evaluate(
+                research_db,
+                security_id=key[0],
+                as_of=key[1],
+                horizon_sessions=horizon,
+                collection_date=due,
+                records_cache=records_cache,
+            )
+            evaluated[key] = result
         if result["status"] is None:
             awaiting[result["pending"]] = awaiting.get(result["pending"], 0) + 1
             continue
@@ -339,6 +354,7 @@ def mature_due_outcomes(
             experiment_db,
             prediction_id=str(row["prediction_id"]),
             outcome_status=result["status"],
+            raw_return=result.get("raw_return"),
             total_return=result.get("total_return"),
             entry_session_date=result.get("entry_session_date"),
             exit_session_date=result.get("exit_session_date"),

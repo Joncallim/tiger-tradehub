@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import pytest
+
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
@@ -120,7 +122,7 @@ def _seed(
             },
             extraction_confidence=0.9,
             event_time=f"{day}T00:00:00Z",
-            public_available_time=f"{next_session(date.fromisoformat(day)).isoformat()}T00:15:00Z",
+            public_available_time=f"{day}T20:15:00Z",
             pat_provenance="source_reported",
             source_record_id=f"{TICKER}:{day}:price_bar:{close}:{len(duplicates or [])}",
         )
@@ -203,7 +205,9 @@ def test_a_saturday_bar_never_becomes_the_entry_session(tmp_path):
     rows = _outcomes(exp)
     assert len(rows) == 1
     assert rows[0][3] == EXPECTED_ENTRY, f"a Saturday must never be the entry: {rows[0][3]}"
-    assert rows[0][2] == 121.0 / 100.0 - 1.0, "the Saturday close must not be the entry price"
+    assert rows[0][2] == pytest.approx(121.0 / 100.0 - 1.0), (
+        "the Saturday close must not be the entry price"
+    )
 
 
 def test_a_sunday_bar_is_ignored(tmp_path):
@@ -215,7 +219,7 @@ def test_a_sunday_bar_is_ignored(tmp_path):
     rows = _outcomes(exp)
     assert len(rows) == 1
     assert rows[0][3] == EXPECTED_ENTRY
-    assert rows[0][2] == 121.0 / 100.0 - 1.0
+    assert rows[0][2] == pytest.approx(121.0 / 100.0 - 1.0)
 
 
 def test_a_market_holiday_bar_is_ignored_and_does_not_shift_the_horizon(tmp_path):
@@ -233,7 +237,9 @@ def test_a_market_holiday_bar_is_ignored_and_does_not_shift_the_horizon(tmp_path
     assert len(rows) == 1
     assert rows[0][3] == EXPECTED_ENTRY
     assert rows[0][4] == required_exit_session(EXPECTED_ENTRY, 21)
-    assert rows[0][2] == 121.0 / 100.0 - 1.0, "the holiday bar must not count as a session"
+    assert rows[0][2] == pytest.approx(121.0 / 100.0 - 1.0), (
+        "the holiday bar must not count as a session"
+    )
 
 
 def test_a_missing_expected_entry_bar_is_not_replaced_by_a_later_bar(tmp_path):
@@ -281,7 +287,7 @@ def test_the_horizon_is_counted_from_valid_sessions_only(tmp_path):
     assert len(rows) == 1
     assert rows[0][3] == EXPECTED_ENTRY
     assert rows[0][4] == required_exit_session(EXPECTED_ENTRY, 21)
-    assert rows[0][2] == 121.0 / 100.0 - 1.0
+    assert rows[0][2] == pytest.approx(121.0 / 100.0 - 1.0)
 
 
 def test_every_emitted_session_is_a_valid_market_session(tmp_path):
@@ -360,7 +366,7 @@ def test_entry_bar_present_with_no_bars_after_it_is_honest(tmp_path):
         },
         extraction_confidence=0.9,
         event_time=f"{exit_session}T00:00:00Z",
-        public_available_time=f"{next_session(date.fromisoformat(exit_session)).isoformat()}T00:15:00Z",
+        public_available_time=f"{exit_session}T20:15:00Z",
         pat_provenance="source_reported",
         source_record_id=f"{TICKER}:{exit_session}:backfill",
     )

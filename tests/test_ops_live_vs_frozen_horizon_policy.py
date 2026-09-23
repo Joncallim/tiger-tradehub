@@ -111,7 +111,7 @@ def _insert_bar(research_db: ResearchDB, day: str, close: float, *, tag: str = "
         },
         extraction_confidence=0.9,
         event_time=f"{day}T00:00:00Z",
-        public_available_time=f"{_next_session(day)}T00:15:00Z",
+        public_available_time=f"{day}T20:15:00Z",
         pat_provenance="source_reported",
         source_record_id=f"{TICKER}:{day}:{close}{tag}",
     )

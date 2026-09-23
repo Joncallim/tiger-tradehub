@@ -198,9 +198,14 @@ def _system_health(fwd: dict, refr: dict, refr_count: int) -> str:
         flags.append("data healthy")
     if not fwd.get("production_predictions"):
         flags.append("no production predictions")
-    due = fwd.get("predictions_due", 0)
-    if due:
-        flags.append(f"{due} outcomes due")
+    # ``predictions_due`` means the required market-session horizon has actually
+    # elapsed; ``predictions_due_check`` is only the advisory scheduling gate.
+    mature = fwd.get("predictions_due") or 0
+    if mature:
+        flags.append(f"{mature} outcomes mature")
+    awaiting = (fwd.get("predictions_due_check") or 0) - mature
+    if awaiting > 0:
+        flags.append(f"{awaiting} scheduled for maturity check (horizon not elapsed)")
     return "healthy" if not flags else "; ".join(flags)
 
 
