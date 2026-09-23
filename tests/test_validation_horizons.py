@@ -151,20 +151,30 @@ def test_only_the_contract_horizons_are_accepted():
     horizons = _horizons()
     with pytest.raises(ValueError):
         horizons.required_exit_session("2026-09-04", 30)
-    with pytest.raises(ValueError):
-        horizons.select_exit_bar([{"session_date": "2026-09-08"}], 1)
 
 
-def test_select_exit_bar_never_substitutes_a_later_bar():
+def test_exit_is_resolved_by_exact_session_never_by_available_bar_count():
+    """The exit bar is the REQUIRED session's, never "the N-th available bar".
+
+    ``select_exit_bar`` was removed: counting available bars equates "N bars" with
+    "N market sessions", so one absent session silently moved the exit (and the
+    horizon) to a later date. Both planes resolve the exit through
+    ``outcome_prices.exit_bar_for`` on the calendar-required session.
+    """
+    from tradehub_research.validation import outcome_prices
+
     horizons = _horizons()
-    bars = [{"session_date": f"2026-06-{day:02d}"} for day in range(1, 32)]
-    assert horizons.select_exit_bar(bars, 21) is bars[20]
-    # Immature: fewer sessions than the horizon -> no exit at all, never bars[-1].
-    assert horizons.select_exit_bar(bars[:20], 21) is None
-    assert horizons.select_exit_bar([], 21) is None
-    # Only the contract horizons are horizon values at all.
-    with pytest.raises(ValueError):
-        horizons.select_exit_bar(bars, 30)
+    required = horizons.required_exit_session("2026-06-01", 21)
+    assert required == "2026-07-01"
+
+    def _rec(day: str) -> dict:
+        return {"structured_fields": {"session_date": day}, "event_time": f"{day}T20:15:00Z"}
+
+    bars = [_rec("2026-06-01"), _rec("2026-07-01")]
+    assert outcome_prices.exit_bar_for(bars, required) is bars[1]
+    # A later bar is not a substitute for the required session.
+    assert outcome_prices.exit_bar_for([_rec("2026-07-02")], required) is None
+    assert outcome_prices.exit_bar_for([], required) is None
 
 
 def test_horizons_are_the_four_contract_values():
@@ -235,19 +245,30 @@ def test_every_declared_horizon_tuple_matches_the_one_definition():
 def test_the_research_builder_uses_the_shared_exit_rule():
     """Identity, not equivalence: one function object is the rule."""
     horizons = _horizons()
-    from tradehub_research.validation import outcome_builder
+    from tradehub_research.validation import outcome_builder, outcome_prices
 
     assert outcome_builder.HORIZON_SESSIONS == horizons.HORIZON_SESSIONS
-    assert outcome_builder.select_exit_bar is horizons.select_exit_bar
+    assert outcome_builder.required_exit_session is horizons.required_exit_session
+    assert outcome_prices.exit_bar_for.__module__ == "tradehub_research.validation.outcome_prices"
 
 
-def test_the_research_builders_historical_rule_is_reproduced():
-    """The shared rule is behaviour-identical to the pre-refactor expression."""
+def test_the_exact_session_rule_agrees_with_the_historical_count_rule():
+    """With complete session data the exact-session exit IS the N-th session."""
+
+    from tradehub_research.ops.market_calendar import next_session
+
     horizons = _horizons()
-    bars = [{"session_date": f"2026-06-{day:02d}"} for day in range(1, 31)]
-    for horizon in (21, 63, 126, 252):
-        historical = bars[horizon - 1] if len(bars) >= horizon else None
-        assert horizons.select_exit_bar(bars, horizon) is historical
+    entry = horizons.entry_session_for("2026-05-29")  # Monday 2026-06-01
+    assert entry == "2026-06-01"
+    # the 21 sessions strictly after the entry
+    sessions: list[str] = []
+    cursor = date.fromisoformat(entry)
+    for _ in range(21):
+        cursor = next_session(cursor)
+        sessions.append(cursor.isoformat())
+    # historical rule: the horizon-th realized session
+    assert sessions[20] == horizons.required_exit_session(entry, 21)
+    assert sessions[20] == "2026-07-01"  # 21 sessions after Mon 2026-06-01
 
 
 def test_the_forward_maturation_uses_the_shared_rule():

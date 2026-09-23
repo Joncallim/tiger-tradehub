@@ -15,15 +15,26 @@ existing canonical duplicate/conflict semantics are preserved.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
+from tradehub_research.ops.common import evaluation_clock
 from tradehub_research.ops.market_calendar import is_session_day, next_session
 from tradehub_research.portfolio.prices import next_session_on_or_after
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.horizons import entry_session_for, required_exit_session
 from tradehub_research.validation.outcome_builder import build_outcome_label
+
+
+def _night_after(session_date: str) -> datetime:
+    """The scheduled 23:45 (+08) = 15:45Z run that can see `session_date`'s EOD.
+
+    The real Tiingo PAT for a US session is 20:15 ET -> UTC (the next UTC day), so
+    the first run able to use that session is the following night's.
+    """
+    return datetime.fromisoformat(f"{session_date}T15:45:00+00:00") + timedelta(days=1)
+
 
 SECURITY = "sec-1"
 OBSERVATION = "2026-05-29T20:15:00Z"  # a Friday
@@ -238,7 +249,7 @@ def test_both_planes_use_the_same_entry_rule(tmp_path):
         security_id=SECURITY,
         as_of=OBSERVATION[:10],
         horizon_sessions=21,
-        collection_date=date.fromisoformat(required_exit_session(EXPECTED_ENTRY, 21)),
+        clock=evaluation_clock(_night_after(required_exit_session(EXPECTED_ENTRY, 21))),
     )
     assert helper_session == forward["entry_session_date"] == EXPECTED_ENTRY
     assert forward["status"] == "OBSERVED"

@@ -9,7 +9,7 @@ days, recoverability) and rendered in the daily report when non-zero.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
@@ -20,6 +20,16 @@ from tradehub_research.ops.market_calendar import is_session_day
 from tradehub_research.ops.outcome_maturation import mature_due_outcomes
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.horizons import entry_session_for, required_exit_session
+
+
+def _night_after(session_date: str) -> datetime:
+    """The scheduled 23:45 (+08) = 15:45Z run that can see `session_date`'s EOD.
+
+    The real Tiingo PAT for a US session is 20:15 ET -> UTC (the next UTC day), so
+    the first run able to use that session is the following night's.
+    """
+    return datetime.fromisoformat(f"{session_date}T15:45:00+00:00") + timedelta(days=1)
+
 
 SECURITY = "S1"
 AS_OF = "2026-05-29"  # Friday, expected entry Monday 2026-06-01
@@ -132,7 +142,7 @@ def _run_maturation(exp, research_db, paths, collection: date):
         settings=ResearchSettings(db_path=research_db.path, busy_timeout_ms=5000),
         experiment_db=exp,
         paths=paths,
-        collection_date=collection,
+        now=_night_after(collection),
     )
 
 
@@ -148,7 +158,7 @@ def test_missing_entry_bar_is_exposed_with_age_and_recoverability(tmp_path):
     _prediction(exp)
     due = date.fromisoformat(required_exit_session(EXPECTED_ENTRY, 21))
 
-    health = forward_health(experiment_db=exp, paths=paths, collection_date=due)
+    health = forward_health(experiment_db=exp, paths=paths, now=_night_after(due))
     awaiting = health["awaiting_entry"]
     assert awaiting["total"] == 1
     assert awaiting["distinct_securities"] == 1
@@ -187,7 +197,7 @@ def test_a_delisted_security_is_reported_unrecoverable(tmp_path):
     _prediction(exp)
     due = date.fromisoformat(required_exit_session(EXPECTED_ENTRY, 21))
 
-    health = forward_health(experiment_db=exp, paths=paths, collection_date=due)
+    health = forward_health(experiment_db=exp, paths=paths, now=_night_after(due))
     awaiting = health["awaiting_entry"]
     assert awaiting["total"] == 1
     assert awaiting["recoverable"]["securities"] == 0
@@ -201,7 +211,7 @@ def test_health_reports_zero_when_there_is_nothing_awaiting(tmp_path):
     _prediction(exp)
     due = date.fromisoformat(required_exit_session(EXPECTED_ENTRY, 21))
 
-    health = forward_health(experiment_db=exp, paths=paths, collection_date=due)
+    health = forward_health(experiment_db=exp, paths=paths, now=_night_after(due))
     assert health["awaiting_entry"]["total"] == 0
     assert health["awaiting_entry"]["unrecoverable"] == []
 
@@ -229,7 +239,7 @@ def test_report_renders_the_waiting_line_only_when_present(tmp_path):
     assert "2 recoverable / 1 unrecoverable" in rendered
 
 
-def test_live_collection_date_is_used_by_default(tmp_path):
+def test_the_live_clock_is_used_by_default(tmp_path):
     """A sanity check that health defaults to the last completed US session."""
     sessions = _sessions_from(EXPECTED_ENTRY, 22)
     paths, research_db, exp = _seed(tmp_path, session_dates=sessions)

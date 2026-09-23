@@ -70,12 +70,17 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
-from tradehub_research.ops.common import ResearchPaths, research_paths
+from tradehub_research.ops.common import (
+    EvaluationClock,
+    ResearchPaths,
+    evaluation_clock,
+    research_paths,
+)
 from tradehub_research.portfolio.prices import _session_key
 from tradehub_research.validation import outcome_prices
 from tradehub_research.validation.experiment_db import ExperimentDB
@@ -126,7 +131,7 @@ def _evaluate(
     security_id: str,
     as_of: str,
     horizon_sessions: int,
-    collection_date: date,
+    clock: EvaluationClock,
     records_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict:
     """Classify one due prediction against its realized sessions and evidence.
@@ -143,11 +148,13 @@ def _evaluate(
     convention, the exact exit session and the raw/total return definitions are
     the shared ones -- identical to the frozen research builder.
     """
-    # Visibility bound: the WHOLE collection day. The nightly refresh ingests the
-    # session's EOD evidence that evening (typically ~20:15Z) and maturation runs
-    # hours later, so anything published during the collection day is visible --
-    # while a correction published on a LATER day is correctly not consumed early.
-    bound = f"{collection_date.isoformat()}T23:59:59Z"
+    # Two clocks, kept apart (see ops.common.EvaluationClock):
+    #   * visibility  = the actual evaluation timestamp -- evidence published after
+    #     it is never consumed early (the real Tiingo PAT is 20:15 ET -> UTC, i.e.
+    #     the next UTC day for a US session);
+    #   * maturity    = the market-session cutoff -- a horizon has elapsed only
+    #     when the calendar says the required exit session is complete.
+    bound = clock.visibility_bound
     expected_entry = entry_session_for(as_of)
     expected_exit = required_exit_session(expected_entry, horizon_sessions)
 
@@ -219,7 +226,7 @@ def _evaluate(
                 "detail": f"delisted {delisted_at} at/before the exit session {exit_session}",
             }
 
-        if collection_date < date.fromisoformat(exit_session):
+        if clock.session_cutoff < date.fromisoformat(exit_session):
             # Market time has not elapsed yet: normal waiting, not a gap.
             return {
                 "status": None,
@@ -300,17 +307,19 @@ def mature_due_outcomes(
     settings: ResearchSettings,
     experiment_db: ExperimentDB,
     paths: ResearchPaths | None = None,
-    collection_date: date | None = None,
+    now: datetime | None = None,
 ) -> dict:
-    """Append outcomes for production predictions due at collection_date.
+    """Append outcomes for production predictions that are due for evaluation.
 
-    ``outcome_due_date`` is the SCHEDULING gate (an advisory calendar date, and
-    for pre-fix rows the legacy approximation). Whether a horizon has matured is
-    verified separately, from the realized sessions.
+    ``now`` (default: the current UTC instant) is the injectable EVALUATION CLOCK:
+    ``outcome_due_date`` is only the coarse advisory scheduling gate, the market
+    session cutoff comes from the exchange calendar, and evidence visibility is
+    bounded by ``now`` itself (see ``ops.common.EvaluationClock``). Whether a
+    horizon has matured is verified separately, from realized sessions.
     """
     paths = paths or research_paths()
     research_db = ResearchDB(paths.research_db, settings.busy_timeout_ms)
-    due = collection_date or date.fromisoformat(utc_now()[:10])
+    clock = evaluation_clock(now)
 
     with experiment_db.connect(read_only=True) as conn:
         pending = conn.execute(
@@ -319,7 +328,7 @@ def mature_due_outcomes(
             "WHERE p.provenance='production' AND p.outcome_due_date <= ? "
             "AND NOT EXISTS (SELECT 1 FROM forward_outcome o "
             "WHERE o.prediction_id=p.prediction_id)",
-            (due.isoformat(),),
+            (clock.evaluation_date.isoformat(),),
         ).fetchall()
 
     counts = {status: 0 for status in TERMINAL_STATUSES}
@@ -343,7 +352,7 @@ def mature_due_outcomes(
                 security_id=key[0],
                 as_of=key[1],
                 horizon_sessions=horizon,
-                collection_date=due,
+                clock=clock,
                 records_cache=records_cache,
             )
             evaluated[key] = result
@@ -364,7 +373,8 @@ def mature_due_outcomes(
 
     return {
         "status": "OK",
-        "collection_date": due.isoformat(),
+        "evaluation_now": clock.visibility_bound,
+        "session_cutoff": clock.session_cutoff.isoformat(),
         "due": len(pending),
         "materialized": materialized,
         # Rows appended by THIS run, keyed by the status written.

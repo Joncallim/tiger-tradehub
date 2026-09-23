@@ -18,7 +18,7 @@ Invariants enforced here:
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -30,6 +30,16 @@ from tradehub_research.ops.market_calendar import is_session_day, next_session
 from tradehub_research.ops.outcome_maturation import mature_due_outcomes
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.horizons import entry_session_for, required_exit_session
+
+
+def _night_after(session_date: str) -> datetime:
+    """The scheduled 23:45 (+08) = 15:45Z run that can see `session_date`'s EOD.
+
+    The real Tiingo PAT for a US session is 20:15 ET -> UTC (the next UTC day), so
+    the first run able to use that session is the following night's.
+    """
+    return datetime.fromisoformat(f"{session_date}T15:45:00+00:00") + timedelta(days=1)
+
 
 SECURITY = "S1"
 TICKER = "METRY"
@@ -169,7 +179,7 @@ def _run(
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(collection_date),
+        now=_night_after(collection_date),
     )
 
 

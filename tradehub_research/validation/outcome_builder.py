@@ -27,7 +27,7 @@ from typing import Any
 
 from tradehub_research.db import ResearchDB, utc_now
 from tradehub_research.validation import outcome_prices
-from tradehub_research.validation.horizons import HORIZON_SESSIONS, select_exit_bar
+from tradehub_research.validation.horizons import HORIZON_SESSIONS, required_exit_session
 
 BUILDER_VERSION = "outcome-builder-v1"
 
@@ -120,14 +120,18 @@ def build_outcome_label(
         exit_bar: dict[str, Any] | None = None
         # The shared exit rule: the horizon-th session after entry, or None while
         # the horizon is immature (never the latest available bar).
-        exit_bar = select_exit_bar(bars, horizon_sessions)
+        # The exit is the CALENDAR's required session, exactly -- never "the N-th
+        # available bar" (that equates N bars with N market sessions, so one absent
+        # session would move the exit and the measured horizon). A frozen snapshot
+        # has a final dataset boundary, so a missing required session is terminal
+        # CENSORED; the live ledger keeps the same case pending instead.
+        required_exit = required_exit_session(entry_session, horizon_sessions)
+        exit_bar = outcome_prices.exit_bar_for(bars, required_exit)
         if exit_bar is not None:
             exit_close = outcome_prices.bar_close(exit_bar)
             if exit_close is None or exit_close <= 0:
                 exit_close = None
-            exit_session = str(
-                exit_bar["structured_fields"].get("session_date", exit_bar["event_time"])
-            )[:10]
+            exit_session = required_exit
         else:
             exit_close = None
             exit_session = None

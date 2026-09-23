@@ -25,7 +25,7 @@ pre-refactor code violated:
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -37,6 +37,16 @@ from tradehub_research.ops.health import forward_health
 from tradehub_research.ops.outcome_maturation import mature_due_outcomes
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.horizons import entry_session_for, required_exit_session
+
+
+def _night_after(session_date: str) -> datetime:
+    """The scheduled 23:45 (+08) = 15:45Z run that can see `session_date`'s EOD.
+
+    The real Tiingo PAT for a US session is 20:15 ET -> UTC (the next UTC day), so
+    the first run able to use that session is the following night's.
+    """
+    return datetime.fromisoformat(f"{session_date}T15:45:00+00:00") + timedelta(days=1)
+
 
 SECURITY = "S1"
 TICKER = "TST"
@@ -184,7 +194,7 @@ def _run(exp, research_db, paths, collection: str) -> dict:
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(collection),
+        now=_night_after(collection),
     )
 
 
@@ -434,9 +444,7 @@ def test_advisory_gate_is_not_reported_as_genuinely_due(tmp_path):
     _bar(rdb, entry, close=100.0, tag="entry")
 
     def health(day: str) -> dict:
-        return forward_health(
-            experiment_db=exp, paths=paths, collection_date=date.fromisoformat(day)
-        )
+        return forward_health(experiment_db=exp, paths=paths, now=_night_after(day))
 
     for day in ("2026-09-27", "2026-09-28", "2026-09-29"):
         h = health(day)
@@ -508,13 +516,9 @@ def test_due_counts_are_predictions_not_grouped_rows(tmp_path):
         conn.commit()
     _bar(rdb, entry, close=100.0, tag="entry")
 
-    before = forward_health(
-        experiment_db=exp, paths=paths, collection_date=date.fromisoformat("2026-09-27")
-    )
+    before = forward_health(experiment_db=exp, paths=paths, now=_night_after("2026-09-27"))
     assert before["predictions_due_check"] == 3, before
     assert before["predictions_due"] == 0, before
 
-    at_gate = forward_health(
-        experiment_db=exp, paths=paths, collection_date=date.fromisoformat(exit_session)
-    )
+    at_gate = forward_health(experiment_db=exp, paths=paths, now=_night_after(exit_session))
     assert at_gate["predictions_due"] == 3, at_gate

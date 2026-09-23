@@ -32,7 +32,7 @@ provenance is never consumed at all.
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from tradehub_research.ops.market_calendar import is_session_day
@@ -41,7 +41,6 @@ from tradehub_research.portfolio.prices import (
     _action_records,
     _bar_records,
     _cumulative_adjustments,
-    _d,
     _session_key,
     _visible_records,
 )
@@ -62,12 +61,31 @@ def visible_records(db: Any, security_id: str, visibility_bound: str) -> list[di
     return _visible_records(db, security_id, visibility_bound)
 
 
+def _price(value: Any) -> Decimal | None:
+    """Safe price conversion: missing/unparseable/non-finite -> None.
+
+    ``portfolio.prices._d`` is ``Decimal(str(value))`` with no exception handling,
+    so a null, absent or malformed price would raise. Outcome pricing must be able
+    to say "unusable" instead: an unusable ENTRY price is an entry gap and an
+    unusable EXIT price is an exit gap (never an outcome, never a crash).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        dec = Decimal(str(value))
+    except (InvalidOperation, ArithmeticError, TypeError, ValueError):
+        return None
+    return dec if dec.is_finite() else None
+
+
 def bar_open(bar: dict[str, Any]) -> Decimal | None:
-    return _d(bar["structured_fields"].get("open"))
+    """Entry price convention input: the session OPEN, or None when unusable."""
+    return _price(bar["structured_fields"].get("open"))
 
 
 def bar_close(bar: dict[str, Any]) -> Decimal | None:
-    return _d(bar["structured_fields"].get("close"))
+    """The session CLOSE, or None when missing/unusable (never a partial number)."""
+    return _price(bar["structured_fields"].get("close"))
 
 
 def _entry_bar_from(
@@ -82,6 +100,23 @@ def _entry_bar_from(
         if session > expected_session:
             return None, None
     return None, None
+
+
+def exit_bar_for(bars: list[dict[str, Any]], exit_session: str) -> dict[str, Any] | None:
+    """The canonical bar for EXACTLY ``exit_session``, else None.
+
+    The exit is the calendar's required session -- never "the N-th available bar".
+    Counting available bars silently equates "N bars" with "N market sessions", so
+    a single absent session would move the exit (and the measured horizon) to a
+    later date. Both planes must resolve the exit this way.
+    """
+    for bar in bars:
+        session = _session_key(bar)
+        if session == exit_session:
+            return bar
+        if session > exit_session:
+            return None
+    return None
 
 
 def entry_for(

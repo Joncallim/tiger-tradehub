@@ -16,7 +16,7 @@ terminally ``CENSORED_INSUFFICIENT_HORIZON``, and that contract is unchanged.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB
@@ -27,6 +27,16 @@ from tradehub_research.ops.market_calendar import is_session_day
 from tradehub_research.ops.outcome_maturation import mature_due_outcomes
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.horizons import entry_session_for, required_exit_session
+
+
+def _night_after(session_date: str) -> datetime:
+    """The scheduled 23:45 (+08) = 15:45Z run that can see `session_date`'s EOD.
+
+    The real Tiingo PAT for a US session is 20:15 ET -> UTC (the next UTC day), so
+    the first run able to use that session is the following night's.
+    """
+    return datetime.fromisoformat(f"{session_date}T15:45:00+00:00") + timedelta(days=1)
+
 
 SECURITY = "S1"
 TICKER = "TST"
@@ -163,7 +173,7 @@ def _run(exp, research_db, paths, collection: str) -> dict:
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(collection),
+        now=_night_after(collection),
     )
 
 
@@ -203,9 +213,7 @@ def test_horizon_elapsed_with_missing_exit_bar_is_awaiting_exit_bar(tmp_path):
         assert _rows(exp) == [], f"a data gap must never become permanent: {summary}"
         assert summary["awaiting"]["AWAITING_EXIT_BAR"] == 1, summary
     # ...and it is exposed in health with age.
-    health = forward_health(
-        experiment_db=exp, paths=paths, collection_date=date.fromisoformat("2027-01-04")
-    )
+    health = forward_health(experiment_db=exp, paths=paths, now=_night_after("2027-01-04"))
     block = health["awaiting_exit"]
     assert block["total"] == 1 and block["distinct_securities"] == 1
     assert block["oldest_as_of"] == AS_OF

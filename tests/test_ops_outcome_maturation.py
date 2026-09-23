@@ -22,7 +22,7 @@ hard-codes holiday knowledge, and both databases are seeded locally.
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -36,6 +36,16 @@ from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.forward_collector import _outcome_due_date
 
 VALID_STATUSES = {"OBSERVED", "DELISTING_OUTCOME_UNKNOWN", "CENSORED_INSUFFICIENT_HORIZON"}
+
+
+def _night_after(session_date: str) -> datetime:
+    """The scheduled 23:45 (+08) = 15:45Z run that can see `session_date`'s EOD.
+
+    The real Tiingo PAT for a US session is 20:15 ET -> UTC (the next UTC day), so
+    the first run able to use that session is the following night's.
+    """
+    return datetime.fromisoformat(f"{session_date}T15:45:00+00:00") + timedelta(days=1)
+
 
 SECURITY = "S1"
 TICKER = "TEST"
@@ -195,7 +205,7 @@ def test_twenty_sessions_cannot_be_observed(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
 
     assert summary["due"] == 1
@@ -214,7 +224,7 @@ def test_the_same_prediction_becomes_observed_once_the_horizon_completes(tmp_pat
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
 
     rows = _outcomes(exp)
@@ -242,7 +252,7 @@ def test_weekends_and_holidays_are_not_sessions(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(sessions[-1]),
+        now=_night_after(sessions[-1]),
     )
 
     row = _outcomes(exp)[0]
@@ -269,7 +279,7 @@ def test_bars_after_the_horizon_do_not_move_the_exit(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(extra[-1]),
+        now=_night_after(extra[-1]),
     )
 
     row = _outcomes(exp)[0]
@@ -289,7 +299,7 @@ def test_longer_horizons_use_the_same_rule(tmp_path, horizon):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
     assert _outcomes(exp) == [], f"h{horizon}: {horizon - 1} sessions is immature"
 
@@ -300,7 +310,7 @@ def test_longer_horizons_use_the_same_rule(tmp_path, horizon):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
     rows = _outcomes(exp)
     assert len(rows) == 1 and rows[0]["outcome_status"] == "OBSERVED"
@@ -326,7 +336,7 @@ def test_no_entry_session_is_pending_not_a_bogus_status(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
 
     assert _outcomes(exp) == []
@@ -370,7 +380,7 @@ def test_every_appended_status_is_in_the_schema_enum(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
 
     for row in _outcomes(exp):
@@ -388,7 +398,7 @@ def test_a_delisted_name_is_recorded_not_dropped(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
 
     rows = _outcomes(exp)
@@ -419,7 +429,7 @@ def test_prediction_rows_are_never_modified(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
     assert snapshot() == before
     # The immutability trigger raises sqlite3.IntegrityError (RAISE(ABORT)).
@@ -442,7 +452,7 @@ def test_replay_bootstrap_predictions_are_out_of_scope(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(due),
+        now=_night_after(due),
     )
     assert summary["due"] == 0
     assert _outcomes(exp) == []
@@ -460,7 +470,7 @@ def test_second_run_does_not_double_append(tmp_path):
             settings=_settings(research_db),
             experiment_db=exp,
             paths=paths,
-            collection_date=date.fromisoformat(due),
+            now=_night_after(due),
         )
     assert len(_outcomes(exp)) == 1
 
@@ -480,6 +490,6 @@ def test_an_immature_horizon_is_not_censored_prematurely(tmp_path):
         settings=_settings(research_db),
         experiment_db=exp,
         paths=paths,
-        collection_date=date.fromisoformat(sessions[-1]) + timedelta(days=1),
+        now=_night_after(sessions[-1]) + timedelta(days=1),
     )
     assert _outcomes(exp) == [], "a censored row here could never be observed later"

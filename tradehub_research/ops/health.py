@@ -12,7 +12,13 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
-from tradehub_research.ops.common import ResearchPaths, last_completed_us_session, research_paths
+from tradehub_research.ops.common import (
+    EvaluationClock,
+    ResearchPaths,
+    evaluation_clock,
+    last_completed_us_session,  # freshness reference session (NOT the outcome clock)
+    research_paths,
+)
 from tradehub_research.ops.market_calendar import count_sessions
 from tradehub_research.validation.experiment_db import ExperimentDB
 
@@ -62,7 +68,7 @@ def _local_day_utc_bounds(day: date) -> tuple[str, str]:
 
 
 def _pending_evidence(
-    experiment_db: ExperimentDB, research_db: ResearchDB, collection_date: date
+    experiment_db: ExperimentDB, research_db: ResearchDB, clock: EvaluationClock
 ) -> dict[str, dict]:
     """Due-but-unmaterialised predictions, bucketed by PENDING reason.
 
@@ -96,7 +102,7 @@ def _pending_evidence(
             "AND NOT EXISTS (SELECT 1 FROM forward_outcome o "
             "                WHERE o.prediction_id=p.prediction_id) "
             "GROUP BY 1, 2, 3",
-            (collection_date.isoformat(),),
+            (clock.evaluation_date.isoformat(),),
         ).fetchall()
 
     buckets: dict[str, dict[str, dict]] = {reason: {} for reason in PENDING_REASONS}
@@ -113,7 +119,7 @@ def _pending_evidence(
             security_id=security_id,
             as_of=as_of,
             horizon_sessions=horizon,
-            collection_date=collection_date,
+            clock=clock,
             records_cache=records_cache,
         )
         reason = result["pending"]
@@ -182,9 +188,11 @@ def _pending_evidence(
             "total": sum(i["predictions"] for i in bucket.values()),
             "distinct_securities": len(bucket),
             "oldest_as_of": oldest,
-            "age_days": (collection_date - date.fromisoformat(oldest)).days if oldest else None,
+            "age_days": (
+                (clock.evaluation_date - date.fromisoformat(oldest)).days if oldest else None
+            ),
             "age_sessions": (
-                count_sessions(date.fromisoformat(entry_session_for(oldest)), collection_date)
+                count_sessions(date.fromisoformat(entry_session_for(oldest)), clock.session_cutoff)
                 if oldest
                 else None
             ),
@@ -192,8 +200,8 @@ def _pending_evidence(
             # evidence has been missing in market time.
             "oldest_required_exit_session": oldest_exit,
             "age_sessions_past_exit": (
-                count_sessions(date.fromisoformat(oldest_exit), collection_date)
-                if oldest_exit and collection_date > date.fromisoformat(oldest_exit)
+                count_sessions(date.fromisoformat(oldest_exit), clock.session_cutoff)
+                if oldest_exit and clock.session_cutoff > date.fromisoformat(oldest_exit)
                 else None
             ),
             "recoverable": recoverable,
@@ -207,7 +215,7 @@ def forward_health(
     *,
     experiment_db: ExperimentDB,
     paths: ResearchPaths | None = None,
-    collection_date=None,
+    now: datetime | None = None,
     reporting_day: date | None = None,
 ) -> dict:
     """Production forward-ledger health (provenance='production' only).
@@ -224,13 +232,12 @@ def forward_health(
     are never converted to a terminal status by the passage of time alone.
     """
     paths = paths or research_paths()
-    collection = collection_date or last_completed_us_session()
-    due = collection.isoformat()
+    clock = evaluation_clock(now)
     from tradehub_research.validation.horizons import entry_session_for, required_exit_session
 
     day = reporting_day or date.today()
     day_start, day_end = _local_day_utc_bounds(day)
-    pending = _pending_evidence(experiment_db, ResearchDB(paths.research_db), collection)
+    pending = _pending_evidence(experiment_db, ResearchDB(paths.research_db), clock)
     with experiment_db.connect(read_only=True) as conn:
         total = conn.execute(
             "SELECT COUNT(*) FROM forward_prediction WHERE provenance='production'"
@@ -245,7 +252,7 @@ def forward_health(
             "(SELECT 1 FROM forward_outcome o "
             " WHERE o.prediction_id=forward_prediction.prediction_id) "
             "GROUP BY 1, 2",
-            (due,),
+            (clock.evaluation_date.isoformat(),),
         ).fetchall()
         matured = conn.execute(
             "SELECT outcome_status, COUNT(*) FROM forward_outcome o "
@@ -269,13 +276,17 @@ def forward_health(
         ).fetchone()[0]
 
     def _mature(row) -> bool:
+        # Genuinely mature = the CALENDAR says the required exit session is
+        # complete (the market-session clock), not "the advisory date has passed".
         exit_session = required_exit_session(
             entry_session_for(str(row["as_of"])[:10]), int(row["horizon_sessions"])
         )
-        return collection >= date.fromisoformat(exit_session)
+        return clock.session_cutoff >= date.fromisoformat(exit_session)
 
     mature_count = sum(int(row["n"]) for row in due_rows if _mature(row))
     return {
+        "evaluation_now": clock.visibility_bound,
+        "session_cutoff": clock.session_cutoff.isoformat(),
         "production_predictions": total,
         "by_horizon": {str(r[0]): r[1] for r in by_horizon},
         # ``predictions_due`` = genuinely mature: the AUTHORITATIVE required exit

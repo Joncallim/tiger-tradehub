@@ -24,7 +24,7 @@ session. The contract values are 21/63/126/252. Weekends and market holidays are
 never sessions, so a horizon is measured on the market calendar -- never in
 calendar days, and never by "whatever bars happen to exist".
 
-  * :func:`select_exit_bar` -- the exit bar for the horizon, or ``None`` while the
+  * :func:`required_exit_session` -- the CALENDAR session the horizon needs
     horizon is IMMATURE. It never substitutes the latest available bar.
   * :func:`required_exit_session` -- the calendar date that exit session falls on.
   * :func:`session_horizon_due_date` -- the date a NEW prediction's horizon
@@ -51,9 +51,7 @@ second-clock mistake this module exists to prevent.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
 from datetime import date, timedelta
-from typing import Any
 
 from tradehub_research.ops.market_calendar import next_session
 
@@ -116,23 +114,3 @@ def legacy_advisory_due_date(as_of: str, horizon_sessions: int) -> str:
     day = date.fromisoformat(as_of[:10])
     days = round(horizon / (SESSIONS_PER_TRADING_YEAR / 365.25))
     return (day + timedelta(days=days)).isoformat()
-
-
-def select_exit_bar(bars: Sequence[Any], horizon_sessions: int) -> Any | None:
-    """The exit bar for ``horizon_sessions`` completed sessions after entry.
-
-    ``bars`` must be the canonical session bars STRICTLY AFTER the entry session,
-    ordered oldest-first, one per session. Returns ``None`` when fewer than
-    ``horizon_sessions`` sessions exist -- the horizon is immature, and the caller
-    must not substitute the latest available bar for it.
-    """
-    horizon = _validate(horizon_sessions)
-    if len(bars) < horizon:
-        return None
-    return bars[horizon - 1]
-
-
-def is_mature(bars: Iterable[Any], horizon_sessions: int) -> bool:
-    """Whether the realized bars already contain the full horizon."""
-    horizon = _validate(horizon_sessions)
-    return len(list(bars)) >= horizon
