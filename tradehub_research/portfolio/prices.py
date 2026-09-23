@@ -34,6 +34,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from tradehub_research.portfolio.types import INT64_MAX, INT64_MIN
+from tradehub_research.validation.horizons import entry_session_for
 
 DECIMAL_ZERO = Decimal(0)
 PRECISION = 38
@@ -356,27 +357,51 @@ def latest_close_microusd(db: Any, security_id: str, as_of: str) -> tuple[int | 
     return int(micro), _session_key(bar)
 
 
-def next_session_on_or_after(
-    db: Any, security_id: str, after_ts: str
-) -> tuple[dict[str, Any] | None, str | None]:
-    """First canonical bar with session date > ``after_ts``'s date.
-
-    Returns (bar, session_date) or (None, None) when no eligible session
-    exists. This is the outcome-builder ENTRY convention (handoff sec 6.3):
-    "first eligible session after the observation timestamp". The entry
-    price is the REALIZED next-session open/close -- an outcome-side label,
-    deliberately NOT a decision-time-visible price (the decision-time
-    feature path remains PIT-filtered and is guarded by the lookahead
-    canaries). A far-future visibility bound is therefore correct here:
-    realized labels may use realized prices; only features may not.
-    """
-    records = _visible_records(db, security_id, _OUTCOME_VISIBILITY_BOUND)
-    bars = _bar_records(records, _OUTCOME_VISIBILITY_BOUND)
-    cutoff = after_ts[:10]
-    for bar in bars:
-        if _session_key(bar) > cutoff:
-            return bar, _session_key(bar)
-    return None, None
-
-
+#: Realized-price visibility bound for outcome labels: "every bar in this
+#: snapshot". Deliberately NOT the observation time -- realized prices are
+#: outcome-side data (the decision-time FEATURE path is PIT-filtered and guarded
+#: by the lookahead canaries). The live forward ledger passes its collection date
+#: instead, so a correction published later is never consumed early.
 _OUTCOME_VISIBILITY_BOUND = "9999-12-31T00:00:00Z"
+
+
+def next_session_on_or_after(
+    db: Any,
+    security_id: str,
+    after_ts: str,
+    *,
+    visibility_bound: str = _OUTCOME_VISIBILITY_BOUND,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Canonical bar ON the market session the calendar expects next.
+
+    Returns (bar, session_date) or (None, None) when that session has no usable
+    bar. This is the outcome-builder ENTRY convention (handoff sec 6.3): "first
+    eligible session after the observation timestamp". The entry price is the
+    REALIZED next-session open/close -- an outcome-side label, deliberately NOT a
+    decision-time-visible price (the decision-time feature path remains
+    PIT-filtered and is guarded by the lookahead canaries). A far-future
+    visibility bound is therefore correct here: realized labels may use realized
+    prices; only features may not.
+
+    SESSION VALIDITY (fixed 2026-09-22): the expected session comes from the one
+    authoritative market calendar (``validation.horizons.entry_session_for``, the
+    same rule the forward maturation uses), and the bar must be dated on EXACTLY
+    that session. A price bar dated on a weekend or a market holiday is never a
+    session and is never accepted as the entry -- live example: ``METRY`` (METRO
+    INC./ADR) carries calendar-daily Tiingo bars. If the expected session has no
+    usable bar (missing, or UNKNOWN because of conflicting same-session rows) the
+    result is (None, None): the entry is NEVER shifted to a later session, which
+    would silently price a different prediction.
+    """
+    records = _visible_records(db, security_id, visibility_bound)
+    bars = _bar_records(records, visibility_bound)
+    expected_session = entry_session_for(after_ts)
+    for bar in bars:
+        session = _session_key(bar)
+        if session == expected_session:
+            return bar, session
+        if session > expected_session:
+            # Bars are ordered: the expected session is behind us with no usable
+            # bar. Do not substitute a later one.
+            return None, None
+    return None, None

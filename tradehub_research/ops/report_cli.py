@@ -198,9 +198,14 @@ def _system_health(fwd: dict, refr: dict, refr_count: int) -> str:
         flags.append("data healthy")
     if not fwd.get("production_predictions"):
         flags.append("no production predictions")
-    due = fwd.get("predictions_due", 0)
-    if due:
-        flags.append(f"{due} outcomes due")
+    # ``predictions_due`` means the required market-session horizon has actually
+    # elapsed; ``predictions_due_check`` is only the advisory scheduling gate.
+    mature = fwd.get("predictions_due") or 0
+    if mature:
+        flags.append(f"{mature} outcomes mature")
+    awaiting = (fwd.get("predictions_due_check") or 0) - mature
+    if awaiting > 0:
+        flags.append(f"{awaiting} scheduled for maturity check (horizon not elapsed)")
     return "healthy" if not flags else "; ".join(flags)
 
 
@@ -213,7 +218,9 @@ def build_daily_report(
 ) -> str:
     paths = paths or research_paths()
     broker = analytics if analytics is not None else _broker_today(LATEST)
-    fwd = forward_health(experiment_db=experiment_db)
+    # The report owns the reporting day (it is also the action-ledger day), and
+    # passes it down so "new today" is measured on exactly the same clock.
+    fwd = forward_health(experiment_db=experiment_db, paths=paths, reporting_day=date.today())
     refr = refresh_health(settings=settings, paths=paths)
     acts = _ledger_actions(LEDGER, date.today().isoformat())
 
@@ -230,7 +237,6 @@ def build_daily_report(
             actions.append(f"{acts.unknown} outcome(s) unknown")
         actions_text = "; ".join(actions) if actions else "No action"
 
-    matured = fwd.get("matured_by_horizon", {})
     data = {
         "asset_value": broker.get("asset_value"),
         "daily_pnl": broker.get("daily_pnl"),
@@ -240,7 +246,16 @@ def build_daily_report(
         "cash_balance": broker.get("cash_balance"),
         "actions": actions_text,
         "predictions": fwd.get("production_predictions", 0),
-        "new_matured": sum(matured.values()),
+        # NEW TODAY, not lifetime: production outcomes appended on the report's
+        # own day, from the durable appended_at timestamp. The cumulative
+        # per-horizon totals stay on the weekly report, where they are documented.
+        "new_matured": fwd.get("matured_today", 0),
+        # Due-but-not-evaluable (expected entry-session bar unavailable): pending
+        # by design, never terminalised by elapsed time.
+        "awaiting_entry": fwd.get("awaiting_entry"),
+        # Horizon elapsed but the required exit evidence is missing: pending and
+        # retryable, never a permanent label for a data gap.
+        "awaiting_exit": fwd.get("awaiting_exit"),
         "system_health": _system_health(fwd, refr, 0),
     }
     return render_daily_report(data)

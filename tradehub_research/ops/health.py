@@ -8,23 +8,236 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.db import ResearchDB, utc_now
-from tradehub_research.ops.common import ResearchPaths, last_completed_us_session, research_paths
+from tradehub_research.ops.common import (
+    EvaluationClock,
+    ResearchPaths,
+    evaluation_clock,
+    last_completed_us_session,  # freshness reference session (NOT the outcome clock)
+    research_paths,
+)
+from tradehub_research.ops.market_calendar import count_sessions
 from tradehub_research.validation.experiment_db import ExperimentDB
+
+#: Pending-reason constants (imported lazily to keep the module import light).
+_PENDING = {
+    "entry": "AWAITING_ENTRY_BAR",
+    "exit": "AWAITING_EXIT_BAR",
+    "horizon": "AWAITING_HORIZON",
+}
+
+
+def _block(pending: dict[str, dict], reason: str) -> dict:
+    """One pending bucket, or a zeroed block when nothing is in that state."""
+    return pending.get(reason) or _empty_pending_block()
+
+
+def _empty_pending_block() -> dict:
+    return {
+        "total": 0,
+        "distinct_securities": 0,
+        "oldest_as_of": None,
+        "age_days": None,
+        "age_sessions": None,
+        "oldest_required_exit_session": None,
+        "age_sessions_past_exit": None,
+        "recoverable": {"securities": 0, "predictions": 0},
+        "unrecoverable": [],
+        "note": "pending by design; never terminalised on a timeout",
+    }
+
+
+def _local_day_utc_bounds(day: date) -> tuple[str, str]:
+    """UTC ISO bounds (``...Z``) of a LOCAL calendar day.
+
+    ``appended_at`` is stored UTC, but "new today" is a statement about the
+    operator's day -- the same clock the report's own day comes from. Half-open
+    [start, end) so a row lands in exactly one day regardless of offset.
+    """
+
+    def _fmt(value: datetime) -> str:
+        return (
+            value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+
+    start = datetime.combine(day, time.min).astimezone()
+    return _fmt(start), _fmt(start + timedelta(days=1))
+
+
+def _pending_evidence(
+    experiment_db: ExperimentDB, research_db: ResearchDB, clock: EvaluationClock
+) -> dict[str, dict]:
+    """Due-but-unmaterialised predictions, bucketed by PENDING reason.
+
+    One pass over the due set evaluates each prediction with the maturation's own
+    classifier, so health and the job can never disagree.
+
+    Pending is deliberate and retryable: ``forward_outcome`` is append-only with
+    ``UNIQUE(prediction_id)``, so a permanent label written for a temporary
+    evidence gap could never become the genuine OBSERVED outcome. Nothing here is
+    converted to a terminal status by elapsed time.
+
+    Buckets:
+      * ``AWAITING_ENTRY_BAR``  -- the expected entry session has no usable bar;
+      * ``AWAITING_HORIZON``    -- market time has not elapsed yet (normal);
+      * ``AWAITING_EXIT_BAR``   -- horizon elapsed, required exit evidence missing
+                                   (a data-quality gap, not a verdict).
+
+    Each security is additionally classified ``recoverable`` or, on positive
+    evidence, ``delisted`` / ``retired`` / ``unknown_security`` -- operational
+    classification only; the maturation still decides terminal labels.
+    """
+    from tradehub_research.ops.daily_refresh import retired_tickers
+    from tradehub_research.ops.outcome_maturation import PENDING_REASONS, _evaluate
+    from tradehub_research.validation.horizons import entry_session_for, required_exit_session
+
+    with experiment_db.connect(read_only=True) as conn:
+        due_rows = conn.execute(
+            "SELECT p.security_id, p.as_of, p.horizon_sessions, COUNT(*) AS n "
+            "FROM forward_prediction p "
+            "WHERE p.provenance='production' AND p.outcome_due_date <= ? "
+            "AND NOT EXISTS (SELECT 1 FROM forward_outcome o "
+            "                WHERE o.prediction_id=p.prediction_id) "
+            "GROUP BY 1, 2, 3",
+            (clock.evaluation_date.isoformat(),),
+        ).fetchall()
+
+    buckets: dict[str, dict[str, dict]] = {reason: {} for reason in PENDING_REASONS}
+    # The classification depends only on (security, as_of, horizon) -- the variants
+    # of one prediction share it, so evaluate each unit once and scale by its rows.
+    units: dict[tuple[str, str, int], int] = {}
+    for row in due_rows:
+        key = (str(row["security_id"]), str(row["as_of"])[:10], int(row["horizon_sessions"]))
+        units[key] = units.get(key, 0) + int(row["n"] if "n" in row.keys() else 1)
+    records_cache: dict[str, list] = {}
+    for (security_id, as_of, horizon), row_count in units.items():
+        result = _evaluate(
+            research_db,
+            security_id=security_id,
+            as_of=as_of,
+            horizon_sessions=horizon,
+            clock=clock,
+            records_cache=records_cache,
+        )
+        reason = result["pending"]
+        if result["status"] is not None or reason not in buckets:
+            continue
+        exit_session = required_exit_session(entry_session_for(as_of), horizon)
+        info = buckets[reason].setdefault(
+            security_id,
+            {"predictions": 0, "oldest_as_of": as_of, "oldest_exit_session": exit_session},
+        )
+        info["predictions"] += row_count
+        if as_of < info["oldest_as_of"]:
+            info["oldest_as_of"] = as_of
+            info["oldest_exit_session"] = exit_session
+
+    retired = {str(t).upper() for t in retired_tickers()}
+    all_ids = {sid for bucket in buckets.values() for sid in bucket}
+    tickers: dict[str, tuple[str | None, str | None]] = {}
+    if all_ids:
+        with research_db.connect(read_only=True) as conn:
+            tickers = {
+                str(r["security_id"]): (
+                    (str(r["canonical_ticker"]).upper() if r["canonical_ticker"] else None),
+                    (str(r["delisted_at"])[:10] if r["delisted_at"] else None),
+                )
+                for r in conn.execute(
+                    "SELECT security_id, canonical_ticker, delisted_at FROM security "
+                    "WHERE security_id IN ({})".format(",".join("?" * len(all_ids))),
+                    tuple(all_ids),
+                ).fetchall()
+            }
+
+    blocks: dict[str, dict] = {}
+    for reason, bucket in buckets.items():
+        recoverable = {"securities": 0, "predictions": 0}
+        unrecoverable: list[dict] = []
+        for security_id, info in sorted(bucket.items()):
+            ticker, delisted_at = tickers.get(security_id, (None, None))
+            if security_id not in tickers:
+                classification = "unknown_security"
+            elif delisted_at is not None:
+                classification = "delisted"
+            elif ticker is not None and ticker in retired:
+                classification = "retired"
+            else:
+                recoverable["securities"] += 1
+                recoverable["predictions"] += info["predictions"]
+                continue
+            unrecoverable.append(
+                {
+                    "security_id": security_id,
+                    "ticker": ticker,
+                    "reason": classification,
+                    "predictions": info["predictions"],
+                    "oldest_as_of": info["oldest_as_of"],
+                }
+            )
+        oldest = min((i["oldest_as_of"] for i in bucket.values()), default=None)
+        oldest_exit = None
+        if bucket:
+            oldest_exit = min(
+                (i["oldest_exit_session"] for i in bucket.values() if i["oldest_as_of"] == oldest),
+                default=None,
+            )
+        blocks[reason] = {
+            "total": sum(i["predictions"] for i in bucket.values()),
+            "distinct_securities": len(bucket),
+            "oldest_as_of": oldest,
+            "age_days": (
+                (clock.evaluation_date - date.fromisoformat(oldest)).days if oldest else None
+            ),
+            "age_sessions": (
+                count_sessions(date.fromisoformat(entry_session_for(oldest)), clock.session_cutoff)
+                if oldest
+                else None
+            ),
+            # Only meaningful for the exit-data gap: how long the required exit
+            # evidence has been missing in market time.
+            "oldest_required_exit_session": oldest_exit,
+            "age_sessions_past_exit": (
+                count_sessions(date.fromisoformat(oldest_exit), clock.session_cutoff)
+                if oldest_exit and clock.session_cutoff > date.fromisoformat(oldest_exit)
+                else None
+            ),
+            "recoverable": recoverable,
+            "unrecoverable": unrecoverable,
+            "note": "pending by design; never terminalised on a timeout",
+        }
+    return blocks
 
 
 def forward_health(
     *,
     experiment_db: ExperimentDB,
     paths: ResearchPaths | None = None,
-    collection_date=None,
+    now: datetime | None = None,
+    reporting_day: date | None = None,
 ) -> dict:
-    """Production forward-ledger health (provenance='production' only)."""
+    """Production forward-ledger health (provenance='production' only).
+
+    ``matured_today`` counts production outcomes APPENDED on ``reporting_day``
+    (default: today, local) using the durable ``appended_at`` timestamp -- never
+    inferred from a prediction's due date. ``matured_by_horizon`` stays the
+    cumulative per-horizon total, which is its documented meaning.
+
+    ``awaiting_entry`` / ``awaiting_exit`` / ``awaiting_horizon`` expose
+    predictions that are due but not yet evaluable -- missing entry bar, missing
+    required exit evidence once the horizon has elapsed, or the horizon simply not
+    elapsed yet -- each with age and recoverability. All are pending on purpose and
+    are never converted to a terminal status by the passage of time alone.
+    """
     paths = paths or research_paths()
-    due = (collection_date or last_completed_us_session()).isoformat()
+    clock = evaluation_clock(now)
+    from tradehub_research.validation.horizons import entry_session_for, required_exit_session
+
+    day = reporting_day or date.today()
+    day_start, day_end = _local_day_utc_bounds(day)
+    pending = _pending_evidence(experiment_db, ResearchDB(paths.research_db), clock)
     with experiment_db.connect(read_only=True) as conn:
         total = conn.execute(
             "SELECT COUNT(*) FROM forward_prediction WHERE provenance='production'"
@@ -33,13 +246,14 @@ def forward_health(
             "SELECT horizon_sessions, COUNT(*) FROM forward_prediction "
             "WHERE provenance='production' GROUP BY horizon_sessions ORDER BY horizon_sessions"
         ).fetchall()
-        due_count = conn.execute(
-            "SELECT COUNT(*) FROM forward_prediction WHERE provenance='production' "
-            "AND outcome_due_date <= ? AND NOT EXISTS "
+        due_rows = conn.execute(
+            "SELECT as_of, horizon_sessions, COUNT(*) AS n FROM forward_prediction "
+            "WHERE provenance='production' AND outcome_due_date <= ? AND NOT EXISTS "
             "(SELECT 1 FROM forward_outcome o "
-            " WHERE o.prediction_id=forward_prediction.prediction_id)",
-            (due,),
-        ).fetchone()[0]
+            " WHERE o.prediction_id=forward_prediction.prediction_id) "
+            "GROUP BY 1, 2",
+            (clock.evaluation_date.isoformat(),),
+        ).fetchall()
         matured = conn.execute(
             "SELECT outcome_status, COUNT(*) FROM forward_outcome o "
             "JOIN forward_prediction p ON p.prediction_id=o.prediction_id "
@@ -54,12 +268,48 @@ def forward_health(
         last_screen = conn.execute(
             "SELECT MAX(as_of) FROM forward_prediction WHERE provenance='production'"
         ).fetchone()[0]
+        matured_today = conn.execute(
+            "SELECT COUNT(*) FROM forward_outcome o "
+            "JOIN forward_prediction p ON p.prediction_id=o.prediction_id "
+            "WHERE p.provenance='production' AND o.appended_at >= ? AND o.appended_at < ?",
+            (day_start, day_end),
+        ).fetchone()[0]
+
+    def _mature(row) -> bool:
+        # Genuinely mature = the CALENDAR says the required exit session is
+        # complete (the market-session clock), not "the advisory date has passed".
+        exit_session = required_exit_session(
+            entry_session_for(str(row["as_of"])[:10]), int(row["horizon_sessions"])
+        )
+        return clock.session_cutoff >= date.fromisoformat(exit_session)
+
+    mature_count = sum(int(row["n"]) for row in due_rows if _mature(row))
     return {
+        "evaluation_now": clock.visibility_bound,
+        "session_cutoff": clock.session_cutoff.isoformat(),
         "production_predictions": total,
         "by_horizon": {str(r[0]): r[1] for r in by_horizon},
-        "predictions_due": due_count,
+        # ``predictions_due`` = genuinely mature: the AUTHORITATIVE required exit
+        # session has elapsed (an outcome could be materialized once its evidence
+        # exists). ``predictions_due_check`` = the advisory scheduling gate
+        # (``outcome_due_date``), which for legacy immutable rows precedes the
+        # session-exact maturity and must never be described as "due".
+        "predictions_due": mature_count,
+        "predictions_due_check": sum(int(row["n"]) for row in due_rows),
         "matured": {str(r[0]): r[1] for r in matured},
         "matured_by_horizon": {str(r[0]): r[1] for r in matured_by_horizon},
+        # Outcomes APPENDED on the reporting day (durable appended_at) and the day
+        # they were measured for, so a reader can never mistake this for a
+        # lifetime total. `matured_by_horizon` remains the cumulative figure.
+        "matured_today": matured_today,
+        "matured_today_day": day.isoformat(),
+        # Due but not evaluable, bucketed by pending reason, with age and
+        # recoverability. Pending on purpose: never terminalised by elapsed time,
+        # because forward_outcome is append-only and a gap could otherwise never
+        # heal into the genuine OBSERVED outcome.
+        "awaiting_entry": _block(pending, _PENDING["entry"]),
+        "awaiting_exit": _block(pending, _PENDING["exit"]),
+        "awaiting_horizon": _block(pending, _PENDING["horizon"]),
         "last_production_screen": last_screen,
         "generated_at": utc_now(),
     }
@@ -119,10 +369,11 @@ def refresh_health(
 
 def main(argv: list[str] | None = None) -> int:
     settings = ResearchSettings()
-    exp = ExperimentDB(research_paths().experiment_db)
+    paths = research_paths()
+    exp = ExperimentDB(paths.experiment_db)
     out = {
-        "forward": forward_health(experiment_db=exp),
-        "refresh": refresh_health(settings=settings),
+        "forward": forward_health(experiment_db=exp, paths=paths),
+        "refresh": refresh_health(settings=settings, paths=paths),
     }
     print(json.dumps(out, sort_keys=True))
     return 0

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from tradehub_research.config import ResearchSettings
@@ -161,10 +161,12 @@ def test_maturation_honest_when_bars_missing(tmp_path):
         settings=settings,
         experiment_db=exp,
         paths=paths,
-        collection_date=date(2026, 8, 29),
+        now=datetime(2026, 8, 29, 15, 45, tzinfo=timezone.utc),
     )
     assert summary["status"] == "OK"
-    health = forward_health(experiment_db=exp, paths=paths, collection_date=date(2026, 8, 29))
+    health = forward_health(
+        experiment_db=exp, paths=paths, now=datetime(2026, 8, 29, 15, 45, tzinfo=timezone.utc)
+    )
     assert health["production_predictions"] > 0
     assert health["matured"] == {}  # nothing matured yet (horizons not due)
 

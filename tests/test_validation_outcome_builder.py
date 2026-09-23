@@ -165,12 +165,34 @@ def test_entry_unavailable_when_no_future_session(tmp_path):
     assert label["outcome_status"] == "ENTRY_UNAVAILABLE"
 
 
+def _trading_days(start: str, count: int) -> list[str]:
+    """``count`` valid market sessions from ``start`` (inclusive).
+
+    Fixtures use real sessions: a horizon is measured in completed trading
+    sessions, so calendar-daily fixtures (which include weekends) would not
+    describe a reachable horizon.
+    """
+    from datetime import date, timedelta
+
+    from tradehub_research.ops.market_calendar import is_session_day
+
+    out: list[str] = []
+    day = date.fromisoformat(start)
+    while len(out) < count:
+        if is_session_day(day):
+            out.append(day.isoformat())
+        day += timedelta(days=1)
+    return out
+
+
 def test_split_adjusts_total_return_but_not_raw(tmp_path):
     """A 2:1 split inside the window: raw return uses raw closes; total
     return applies the cumulative factor."""
-    sessions = [(f"2024-01-{day:02d}", 100.0, 100.0) for day in range(1, 31)]
+    days = _trading_days("2024-01-03", 25)
+    sessions = [(d, 100.0, 100.0) for d in days]
     research_db, experiment_db = _setup(tmp_path, sessions)
-    _seed_split(research_db, "sec-1", "2024-01-10", 2.0)
+    # Inside (entry, exit]: the entry is the first session, the exit the 21st.
+    _seed_split(research_db, "sec-1", days[4], 2.0)
 
     label = build_outcome_label(
         research_db,
@@ -181,7 +203,8 @@ def test_split_adjusts_total_return_but_not_raw(tmp_path):
         horizon_sessions=21,
     )
 
-    assert label["outcome_status"] == "OBSERVED"
+    assert label["outcome_status"] == "OBSERVED", label
+    assert label["entry_session_date"] == days[0]
     assert label["raw_return"] is not None
     assert label["total_return"] is not None
     # After a 2:1 split the pre-split price history is halved in adjusted
@@ -190,10 +213,12 @@ def test_split_adjusts_total_return_but_not_raw(tmp_path):
 
 
 def test_benchmark_relative_return(tmp_path):
-    sessions = [(f"2024-01-{day:02d}", 100.0, 100.0 + day) for day in range(1, 31)]
+    days = _trading_days("2024-01-03", 25)
+    sessions = [(d, 100.0, 100.0 + i) for i, d in enumerate(days)]
     research_db, experiment_db = _setup(tmp_path, sessions)
 
-    benchmark_returns = {f"2024-01-{day:02d}": 0.001 for day in range(1, 31)}
+    # The benchmark series is keyed by the same realized sessions.
+    benchmark_returns = {d: 0.001 for d in days}
     label = build_outcome_label(
         research_db,
         experiment_db,

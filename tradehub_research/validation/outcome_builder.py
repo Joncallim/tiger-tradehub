@@ -26,14 +26,9 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from tradehub_research.db import ResearchDB, utc_now
-from tradehub_research.portfolio.prices import (
-    _action_records,
-    _cumulative_adjustments,
-    _visible_records,
-    next_session_on_or_after,
-)
+from tradehub_research.validation import outcome_prices
+from tradehub_research.validation.horizons import HORIZON_SESSIONS, required_exit_session
 
-HORIZON_SESSIONS = (21, 63, 126, 252)
 BUILDER_VERSION = "outcome-builder-v1"
 
 DECIMAL_ZERO = Decimal(0)
@@ -82,54 +77,6 @@ def _security_delisted_at(db: Any, security_id: str) -> str | None:
     return str(row["delisted_at"])[:10]
 
 
-def _bar_close(bar: dict[str, Any]) -> Decimal | None:
-    return _d(bar["structured_fields"].get("close"))
-
-
-def _bar_open(bar: dict[str, Any]) -> Decimal | None:
-    return _d(bar["structured_fields"].get("open"))
-
-
-def _bars_since(db: Any, security_id: str, entry_date: str, as_of: str) -> list[dict[str, Any]]:
-    """Canonical bars strictly after entry_date, visible at as_of (for exits).
-
-    The exit side uses the SAME realized-price bound as entry
-    (_OUTCOME_VISIBILITY_BOUND) so labels are deterministic when replayed
-    against a frozen snapshot -- realized prices, never decision-time data.
-    """
-    records = _visible_records(db, security_id, as_of)
-    cutoff = as_of[:10]
-    bars = [
-        r
-        for r in records
-        if r["structured_fields"].get("record_type") == "price_bar"
-        and str(r["structured_fields"].get("session_date", r["event_time"]))[:10] > entry_date
-        and str(r["structured_fields"].get("session_date", r["event_time"]))[:10] <= cutoff
-    ]
-    bars.sort(key=lambda r: str(r["structured_fields"].get("session_date", r["event_time"]))[:10])
-    # collapse duplicate sessions (identical bars collapse; conflicting -> drop)
-    canonical: list[dict[str, Any]] = []
-    index = 0
-    while index < len(bars):
-        session = str(
-            bars[index]["structured_fields"].get("session_date", bars[index]["event_time"])
-        )[:10]
-        group = []
-        while (
-            index < len(bars)
-            and str(
-                bars[index]["structured_fields"].get("session_date", bars[index]["event_time"])
-            )[:10]
-            == session
-        ):
-            group.append(bars[index])
-            index += 1
-        serialized = {json.dumps(r["structured_fields"], sort_keys=True) for r in group}
-        if len(serialized) == 1:
-            canonical.append(group[0])
-    return canonical
-
-
 def build_outcome_label(
     research_db: ResearchDB,
     experiment_db: ResearchDB,
@@ -150,24 +97,12 @@ def build_outcome_label(
     if horizon_sessions not in HORIZON_SESSIONS:
         raise ValueError(f"horizon_sessions must be one of {HORIZON_SESSIONS}")
     with research_db.connect(read_only=True) as db:
-        entry_bar, entry_session = next_session_on_or_after(db, security_id, observation_date)
-        if entry_bar is None or entry_session is None:
-            label = _base_label(
-                dataset_snapshot_id, security_id, observation_date, horizon_sessions
-            )
-            label["outcome_status"] = "ENTRY_UNAVAILABLE"
-            _insert_label(experiment_db, label)
-            return label
-
-        entry_close = _bar_close(entry_bar)
-        entry_open = _bar_open(entry_bar)
-        entry_price = entry_open if entry_open is not None and entry_open > 0 else entry_close
-        entry_convention = (
-            "next_session_open"
-            if entry_open is not None and entry_open > 0
-            else "next_session_close_fallback"
+        # Shared outcome pricing: entry-session selection, entry price convention
+        # and the return definition are identical to the live forward ledger.
+        entry_bar, entry_session, entry_price, entry_convention = outcome_prices.entry_for(
+            db, security_id, observation_date, visibility_bound=_snapshot_end_asof()
         )
-        if entry_price is None or entry_price <= 0:
+        if entry_bar is None or entry_session is None or entry_price is None:
             label = _base_label(
                 dataset_snapshot_id, security_id, observation_date, horizon_sessions
             )
@@ -175,17 +110,28 @@ def build_outcome_label(
             _insert_label(experiment_db, label)
             return label
 
-        # Exit = horizon sessions after entry, at close.
-        bars = _bars_since(db, security_id, entry_session, _snapshot_end_asof())
+        # Exit = horizon sessions after entry, at close. Bars come from the shared
+        # visible/canonical evidence layer, restricted to real market sessions: a
+        # weekend/holiday bar (e.g. METRY's calendar-daily feed) is not a session
+        # and must never set the exit session or the session count.
+        bars = outcome_prices.visible_session_bars(
+            db, security_id, after_session=entry_session, visibility_bound=_snapshot_end_asof()
+        )
         exit_bar: dict[str, Any] | None = None
-        if len(bars) >= horizon_sessions:
-            exit_bar = bars[horizon_sessions - 1]
-            exit_close = _bar_close(exit_bar)
+        # The shared exit rule: the horizon-th session after entry, or None while
+        # the horizon is immature (never the latest available bar).
+        # The exit is the CALENDAR's required session, exactly -- never "the N-th
+        # available bar" (that equates N bars with N market sessions, so one absent
+        # session would move the exit and the measured horizon). A frozen snapshot
+        # has a final dataset boundary, so a missing required session is terminal
+        # CENSORED; the live ledger keeps the same case pending instead.
+        required_exit = required_exit_session(entry_session, horizon_sessions)
+        exit_bar = outcome_prices.exit_bar_for(bars, required_exit)
+        if exit_bar is not None:
+            exit_close = outcome_prices.bar_close(exit_bar)
             if exit_close is None or exit_close <= 0:
                 exit_close = None
-            exit_session = str(
-                exit_bar["structured_fields"].get("session_date", exit_bar["event_time"])
-            )[:10]
+            exit_session = required_exit
         else:
             exit_close = None
             exit_session = None
@@ -197,15 +143,18 @@ def build_outcome_label(
         delisting_event_ref, _delisted_date = _delisting_info(db, security_id, _snapshot_end_asof())
         security_delisted_at = _security_delisted_at(db, security_id)
 
-        actions = _action_records(_visible_records(db, security_id, _snapshot_end_asof()))
         raw_return: Decimal | None = None
         total_return: Decimal | None = None
         if exit_close is not None and exit_close > 0:
-            raw_return = exit_close / entry_price - 1
-            adjustments = _cumulative_adjustments(actions, entry_session, exit_session)
-            if adjustments != (None, None):
-                cum_factor, cum_dividend = adjustments
-                total_return = (exit_close * cum_factor + cum_dividend) / entry_price - 1
+            raw_return, total_return = outcome_prices.outcome_returns(
+                db,
+                security_id,
+                entry_session=entry_session,
+                entry_price=entry_price,
+                exit_session=exit_session,
+                exit_close=exit_close,
+                visibility_bound=_snapshot_end_asof(),
+            )
 
         label = _base_label(dataset_snapshot_id, security_id, observation_date, horizon_sessions)
         label["entry_convention"] = entry_convention
