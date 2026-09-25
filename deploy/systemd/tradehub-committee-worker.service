@@ -1,0 +1,28 @@
+[Unit]
+Description=TradeHub bounded committee model worker (drives issued committee work)
+Documentation=https://github.com/Joncallim/tiger-tradehub/blob/main/deploy/README.md
+After=tradehub-research.service
+Wants=tradehub-research.service
+
+[Service]
+Type=oneshot
+User=tradehub-research
+WorkingDirectory=/opt/tiger-tradehub
+EnvironmentFile=/etc/tradehub/research.env
+# The worker is an ACTUATOR: it fetches the pinned artifact over MCP, submits
+# through the authenticated committee API, and lets the scorer/finalizer advance.
+# It exits immediately when the current cycle has no outstanding work, and it never
+# touches the historical backlog. Spend/work bounds live in the module defaults
+# (max-runs 4, max-model-calls 12, max-seconds 840) and can be overridden here or
+# on the command line.
+ExecStart=/opt/tiger-tradehub/.venv/bin/python -m tradehub_research.ops.committee_worker
+# The runner CLI is named absolutely: a systemd service does not inherit the login
+# PATH, and a missing runner would look like an unready provider.
+Environment=RESEARCH_COMMITTEE_WORKER_HERMES=/opt/hermes/venv/bin/hermes
+Nice=10
+# Outer wall: the module's own --max-seconds bound is 840s, so a wedged invocation
+# is killed well before the next timer tick.
+TimeoutStartSec=1020
+
+[Install]
+WantedBy=multi-user.target

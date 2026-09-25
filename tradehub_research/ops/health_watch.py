@@ -783,6 +783,213 @@ def check_decision_plane(research_db, *, now: datetime | None = None) -> None:
     )
 
 
+# --------------------------------------------------------------------------- #
+# worker plane: is committee work being DRIVEN, and if not, why?
+# --------------------------------------------------------------------------- #
+
+#: The worker timer fires every 15 minutes, so a genuinely running worker is
+#: never silent for hours on end.
+WORKER_STALE_HOURS = 3.0
+#: The router scores on the final role's accepted submission, so accepted
+#: assessments with no score snapshot for this long mean the scorer is stuck.
+SCORER_STALL_HOURS = 1.0
+#: The finalizer timer runs every 5 minutes.
+FINALIZER_STALL_HOURS = 1.0
+
+
+def _decision_summary(conn, pipeline_run_id: str) -> dict:
+    """Durable decision state of one cycle (engine-owned tables, read-only)."""
+    decision = conn.execute(
+        "SELECT run_id, decision_as_of FROM portfolio_run WHERE pipeline_run_id = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (pipeline_run_id,),
+    ).fetchone()
+    if decision is None:
+        return {}
+    proposals = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM trade_proposal WHERE decision_id = ?", (decision["run_id"],)
+        ).fetchone()[0]
+    )
+    finals = [
+        row["final_status"]
+        for row in conn.execute(
+            "SELECT final_status FROM portfolio_state_observation WHERE run_id = ?",
+            (decision["run_id"],),
+        )
+    ]
+    return {
+        "decision_as_of": decision["decision_as_of"],
+        "proposals": proposals,
+        "final_statuses": finals,
+    }
+
+
+def worker_plane_state(research_db, *, paths=None, now=None) -> dict:
+    """Committee-worker observability, from durable state + the queue itself.
+
+    Reports the cause chain a future incident needs: is there work, did the worker
+    run, did submissions land, did the scorer/finalizer advance, and did the cycle
+    end in a legitimate no-action decision (which is HEALTHY, never an alert).
+    """
+    from tradehub_research.ops import committee_worker as worker
+    from tradehub_research.ops.common import research_paths
+
+    now = now or datetime.now(timezone.utc)
+    paths = paths or research_paths()
+    cycle = worker.newest_genuine_cycle(research_db)
+    state = worker.read_state(worker.state_path(paths))
+    out: dict = {
+        "cycle_as_of": (cycle or {}).get("as_of"),
+        "pipeline_run_id": (cycle or {}).get("run_id"),
+        "outstanding_runs": 0,
+        "issued_work_items": 0,
+        "accepted_assessments": 0,
+        "malformed_attempts": 0,
+        "scored_candidates": 0,
+        "candidate_population": 0,
+        "oldest_outstanding_at": None,
+        "oldest_outstanding_hours": 0.0,
+        "oldest_accepted_at": None,
+        "claimed_runs": list(state.get("claimed_runs") or []),
+        "last_worker_activity_at": state.get("last_activity_at"),
+        "last_worker_success_at": state.get("last_success_at"),
+        "last_worker_exit": state.get("last_exit"),
+        "last_run_accepted": 0,
+        "last_run_failures": [],
+        "provider_readiness": {
+            provider: {
+                "ready": entry.get("ready"),
+                "model": entry.get("probed_model"),
+                "checked_at": entry.get("checked_at"),
+                "reason": entry.get("reason"),
+            }
+            for provider, entry in sorted((state.get("providers") or {}).items())
+        },
+        "providers_ready": bool(state.get("providers_ready")),
+        "configuration_error": state.get("configuration_error"),
+        "proposals": 0,
+        "decision_status": None,
+        "decision_as_of": None,
+        "decision_no_action": False,
+    }
+    if cycle is None:
+        return out
+    run_id = cycle["run_id"]
+    outstanding = worker.outstanding_runs(research_db, run_id, 10_000)
+    out["outstanding_runs"] = len(outstanding)
+    out["issued_work_items"] = sum(int(r.get("work_items") or 0) for r in outstanding)
+    out["scored_candidates"] = worker.scored_population(research_db, run_id)
+    out["candidate_population"] = worker.candidate_population(research_db, run_id)
+    ages = [_age_hours(r.get("created_at"), now) for r in outstanding]
+    ages = [age for age in ages if age is not None]
+    if ages:
+        out["oldest_outstanding_hours"] = max(ages)
+        out["oldest_outstanding_at"] = min(
+            (r["created_at"] for r in outstanding if r.get("created_at")), default=None
+        )
+    with research_db.connect(read_only=True) as conn:
+        attempts = conn.execute(
+            "SELECT a.outcome, a.role, a.requested_at FROM model_call_attempt a "
+            "JOIN committee_run c ON c.committee_run_id = a.committee_run_id "
+            "WHERE c.pipeline_run_id = ?",
+            (run_id,),
+        ).fetchall()
+        out["accepted_assessments"] = sum(1 for a in attempts if a["outcome"] == "accepted")
+        out["malformed_attempts"] = sum(1 for a in attempts if a["outcome"] != "accepted")
+        accepted_ages = [
+            _age_hours(a["requested_at"], now) for a in attempts if a["outcome"] == "accepted"
+        ]
+        accepted_ages = [age for age in accepted_ages if age is not None]
+        if accepted_ages:
+            out["oldest_accepted_at"] = min(accepted_ages)
+        summary = _decision_summary(conn, run_id)
+        out["proposals"] = int(conn.execute("SELECT COUNT(*) FROM trade_proposal").fetchone()[0])
+        if summary:
+            out["decision_as_of"] = summary["decision_as_of"]
+            out["decision_status"] = "COMPLETE"
+            # D: a real decision that recommended no action. HEALTHY, never an alert.
+            out["decision_no_action"] = (
+                summary["proposals"] == 0
+                and bool(summary["final_statuses"])
+                and all(status == "NO_ACTION" for status in summary["final_statuses"])
+            )
+    for record in state.get("last_run_records") or []:
+        for role in record.get("roles") or []:
+            if role.get("outcome") == "accepted":
+                out["last_run_accepted"] += 1
+            for key in ("http_error", "harness_defect", "runner_error", "last_preflight_error"):
+                if role.get(key):
+                    out["last_run_failures"].append(f"{role.get('role')}: {role[key]}")
+        if str(record.get("stopped") or "").startswith(("submit-failed", "preflight-not-clean")):
+            out["last_run_failures"].append(str(record.get("stopped")))
+    return out
+
+
+def _age_hours(value, now: datetime) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (now - parsed).total_seconds() / 3600
+
+
+def check_worker_plane(research_db, *, paths=None, now=None) -> dict:
+    """A/B/C alert separately; D (a real NO_ACTION decision) is healthy.
+
+    A: work exists but the worker has not run.
+    B: the worker is running but submissions are failing.
+    C: assessments exist but the scorer/finalizer is not advancing.
+    D: the decision completed legitimately with zero proposals -- surfaced in the
+       state and the daily report, deliberately NOT an alert.
+    """
+    now = now or datetime.now(timezone.utc)
+    state = worker_plane_state(research_db, paths=paths, now=now)
+    if state.get("configuration_error"):
+        _alert(f"committee worker misconfigured: {state['configuration_error']}")
+    provider_notes = [
+        f"{provider}: {entry.get('reason') or 'unready'}"
+        for provider, entry in state["provider_readiness"].items()
+        if entry.get("ready") is not True
+    ]
+    worker_age = _age_hours(state.get("last_worker_activity_at"), now)
+    if state["outstanding_runs"] and (worker_age is None or worker_age > WORKER_STALE_HOURS):
+        _alert(
+            f"committee work is not being driven: {state['outstanding_runs']} outstanding run(s) "
+            f"on the {state['cycle_as_of']} cycle, {state['issued_work_items']} work item(s); "
+            f"last worker activity {state.get('last_worker_activity_at') or 'never'}"
+            + (f"; provider readiness: {'; '.join(provider_notes)}" if provider_notes else "")
+        )
+    elif (
+        state["outstanding_runs"] and state["last_run_failures"] and not state["last_run_accepted"]
+    ):
+        failure = str(state["last_run_failures"][0])[:200]
+        _alert(
+            f"committee worker submissions are failing: {failure} "
+            f"({state['outstanding_runs']} run(s) still outstanding)"
+        )
+    if state["accepted_assessments"] and not state["scored_candidates"]:
+        acceptance_age = state.get("oldest_accepted_at")
+        if acceptance_age is None or acceptance_age > SCORER_STALL_HOURS:
+            _alert(
+                f"committee assessments are not being scored: {state['accepted_assessments']} "
+                f"accepted on the {state['cycle_as_of']} cycle with 0 score snapshots"
+            )
+    elif state["scored_candidates"] and state["decision_as_of"] is None:
+        scored_age = state.get("oldest_accepted_at")
+        if scored_age is None or scored_age > FINALIZER_STALL_HOURS:
+            _alert(
+                f"scored candidates are not being finalised: {state['scored_candidates']}/"
+                f"{state['candidate_population']} scored on the {state['cycle_as_of']} cycle with "
+                "no portfolio decision"
+            )
+    return state
+
+
 def main() -> int:
     from tradehub_research.config import ResearchSettings
     from tradehub_research.db import ResearchDB
@@ -796,6 +1003,7 @@ def main() -> int:
     check_data_freshness(settings, paths)
     check_forward_ledger(exp, paths)
     check_decision_plane(ResearchDB(paths.research_db, settings.busy_timeout_ms))
+    check_worker_plane(ResearchDB(paths.research_db, settings.busy_timeout_ms), paths=paths)
     check_paper_proof_and_kill_switch()
     check_services()
     check_reconciliation()

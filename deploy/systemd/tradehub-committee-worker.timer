@@ -1,0 +1,15 @@
+[Unit]
+Description=Drive TradeHub committee work issued by the research cycle
+Documentation=https://github.com/Joncallim/tiger-tradehub/blob/main/deploy/README.md
+
+[Timer]
+# Every 15 minutes, offset off the :00/:30/:45 marks so the 23:00 reports, the
+# 23:30 forward capture and the 23:45 maturation never collide with it. The worker
+# no-ops in milliseconds when the current cycle has no outstanding work, which
+# makes this self-healing (a late cycle, a failed batch and a restarted host are
+# all recovered by the next tick) instead of depending on timing luck.
+OnCalendar=*:10/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target
