@@ -329,6 +329,41 @@ def _week_benchmark(
     return pct, None
 
 
+def _decision_plane_note(*, settings, paths, experiment_db) -> str | None:
+    """One compact line exposing the committee/decision plane.
+
+    Deliberately shown because a legitimate NO-ACTION decision is HEALTHY state,
+    not a pipeline failure: an operator must be able to tell "the committee ran and
+    recommended nothing" apart from "nothing is driving the committee".
+    """
+    try:
+        from tradehub_research.db import ResearchDB
+        from tradehub_research.ops.health_watch import worker_plane_state
+
+        plane = worker_plane_state(
+            ResearchDB(paths.research_db, settings.busy_timeout_ms), paths=paths
+        )
+    except Exception as exc:  # noqa: BLE001 - a report must never fail to render
+        return f"decision plane unavailable ({type(exc).__name__})"
+    if not plane.get("cycle_as_of"):
+        return "decision plane: no research cycle"
+    parts = [
+        f"cycle {str(plane['cycle_as_of'])[:10]}",
+        f"{plane['scored_candidates']}/{plane['candidate_population']} scored",
+    ]
+    if plane.get("outstanding_runs"):
+        parts.append(f"{plane['outstanding_runs']} run(s) undriven")
+    parts.append(
+        "worker active " + str(plane["last_worker_activity_at"] or "never")[:16]
+        if plane.get("last_worker_activity_at")
+        else "worker never ran"
+    )
+    parts.append(f"{plane['proposals']} proposal(s) lifetime")
+    if plane.get("decision_no_action"):
+        parts.append("decision complete, no action recommended (healthy)")
+    return "decision plane: " + ", ".join(parts) + ""
+
+
 def build_daily_report(
     *,
     settings: ResearchSettings,
@@ -360,6 +395,13 @@ def build_daily_report(
             actions.append(f"{acts.unknown} outcome(s) unknown")
         actions_text = "; ".join(actions) if actions else "No action"
 
+    system_health = _system_health(
+        fwd, refr, 0, accounting=accounting, accounting_error=accounting_error
+    )
+    plane_note = _decision_plane_note(settings=settings, paths=paths, experiment_db=experiment_db)
+    if plane_note:
+        system_health = f"{system_health}; {plane_note}"
+
     data = {
         "asset_value": broker.get("asset_value"),
         "daily_pnl": broker.get("daily_pnl"),
@@ -379,9 +421,7 @@ def build_daily_report(
         # Horizon elapsed but the required exit evidence is missing: pending and
         # retryable, never a permanent label for a data gap.
         "awaiting_exit": fwd.get("awaiting_exit"),
-        "system_health": _system_health(
-            fwd, refr, 0, accounting=accounting, accounting_error=accounting_error
-        ),
+        "system_health": system_health,
     }
     return render_daily_report(data)
 

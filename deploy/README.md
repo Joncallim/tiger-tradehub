@@ -173,3 +173,57 @@ main  (authoritative branch)
 
 Read the live values with `deployment_cli.py verify --json`; never from a
 hand-maintained file.
+
+## The committee model worker (`tradehub-committee-worker`)
+
+The research cycle issues committee work envelopes; without a driver they simply
+accumulate (`BLOCKED_NO_VALID_SCORE` -> zero proposals -> an idle runner), which is
+exactly what happened between 2026-09-15 and 2026-09-25. `tradehub-committee-worker`
+is the actuator that closes that loop, and nothing more:
+
+```
+research cycle -> committee queue -> worker -> assessments -> score snapshots
+-> finalizer -> proposal / legitimate NO_ACTION -> runner
+```
+
+It replays the documented contract only: the work envelope and the submission go
+through the authenticated committee API (whose router owns every retry, escalation
+and scoring decision), and the artifact comes from the pinned MCP surface
+(`get_evidence_pack`, fail-closed on a wrong or unpinned hash). It never queries
+arbitrary evidence, never builds score snapshots, never calls the finalizer, never
+touches eligibility or policy, and never processes the superseded historical backlog
+(current genuine cycle only).
+
+Install/enable (host-local, mirrors the other timers):
+
+```bash
+sudo install -m 0644 deploy/systemd/tradehub-committee-worker.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/tradehub-committee-worker.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tradehub-committee-worker.timer
+```
+
+Operate and observe:
+
+```bash
+systemctl list-timers tradehub-committee-worker.timer
+journalctl -u tradehub-committee-worker.service -n 50 -o cat
+# one bounded invocation by hand (defaults: 4 runs, 12 model calls, 840 s)
+sudo -u tradehub-research env $(grep -v '^#' /etc/tradehub/research.env | xargs) \
+  /opt/tiger-tradehub/.venv/bin/python -m tradehub_research.ops.committee_worker --dry-run
+sudo -u tradehub-research ... -m tradehub_research.ops.committee_worker --probe-only
+```
+
+Durable worker state lives in `$TRADEHUB_RESEARCH_DIR/committee-worker-state.json`
+(last activity, provider readiness, last batch records, counters) and is read by the
+health watch's worker-plane conditions (A: work exists but the worker never ran;
+B: running but submissions are failing; C: assessments exist but the scorer or
+finalizer is not advancing; D: a completed decision that legitimately recommended no
+action is HEALTHY and is never alerted).
+
+Role routes are provider-independent and configurable via
+`RESEARCH_COMMITTEE_WORKER_ROUTES` (JSON override); the worker refuses to run when
+neutral A/B or red-team/arbiter would share a provider. Providers are reached
+through the configured runner CLI (`RESEARCH_COMMITTEE_WORKER_HERMES`, default
+`hermes`), so no model credentials are added to the research plane.
+
