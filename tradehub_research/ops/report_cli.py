@@ -20,6 +20,7 @@ Weekly shape:
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -27,7 +28,8 @@ from typing import NamedTuple
 
 from tradehub_research.config import ResearchSettings
 from tradehub_research.ops.common import ResearchPaths, research_paths
-from tradehub_research.ops.health import forward_health, refresh_health
+from tradehub_research.ops.health import forward_health, freshness_accounting, refresh_health
+from tradehub_research.validation.benchmark import load_latest_benchmark, window_return_pct
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.reporting import render_daily_report, render_weekly_report
 
@@ -190,23 +192,133 @@ def _ledger_actions(ledger_path: Path, today: str) -> LedgerActions:
     return LedgerActions(executions, refusals, unknown)
 
 
-def _system_health(fwd: dict, refr: dict, refr_count: int) -> str:
-    flags = []
-    if refr.get("stale_count"):
-        flags.append(f"{refr['stale_count']} stale data names")
-    elif refr_count:
-        flags.append("data healthy")
+def _freshness_flags(accounting: dict | None, accounting_error: str | None) -> list[str]:
+    """Fleet accounting flags, from the freshness audit's own authority.
+
+    The audit already EXCLUDES legitimately unfetchable names (delisted / invalid
+    symbol / no-trade) from eligibility. Describing those exclusions as staleness
+    is how the live report came to headline "42 stale data names" against a real
+    backlog of 2 (LCGMF, TRLEF) -- an incident count that the health watch, which
+    reads the same audit, never corroborated. The genuinely unresolved names are
+    named here so a real gap cannot hide inside a total.
+    """
+    if accounting_error:
+        return [f"data-freshness audit unavailable ({accounting_error})"]
+    if not accounting:
+        return []
+    flags: list[str] = []
+    unresolved = accounting.get("unresolved_count", 0)
+    if unresolved:
+        names = ", ".join(str(ticker) for ticker in accounting.get("unresolved", [])[:5])
+        flags.append(f"{unresolved} unresolved data gap(s): {names}")
+    else:
+        flags.append("no unresolved data gaps")
+    if accounting.get("excluded_exceptions"):
+        flags.append(
+            f"{accounting['excluded_exceptions']} names excluded as legitimate exceptions "
+            "(delisted/unfetchable)"
+        )
+    if accounting.get("lagging_within_window"):
+        flags.append(f"{accounting['lagging_within_window']} lagging within the rolling window")
+    return flags
+
+
+def _forward_flags(fwd: dict) -> list[str]:
+    """Forward-ledger flags. ``predictions_due`` means the session horizon elapsed."""
+    flags: list[str] = []
     if not fwd.get("production_predictions"):
         flags.append("no production predictions")
-    # ``predictions_due`` means the required market-session horizon has actually
-    # elapsed; ``predictions_due_check`` is only the advisory scheduling gate.
     mature = fwd.get("predictions_due") or 0
     if mature:
         flags.append(f"{mature} outcomes mature")
     awaiting = (fwd.get("predictions_due_check") or 0) - mature
     if awaiting > 0:
         flags.append(f"{awaiting} scheduled for maturity check (horizon not elapsed)")
+    return flags
+
+
+def _data_health_line(fwd: dict, accounting: dict | None, accounting_error: str | None) -> str:
+    """The data/system health line, derived from the audit's authority."""
+    flags = _freshness_flags(accounting, accounting_error) + _forward_flags(fwd)
     return "healthy" if not flags else "; ".join(flags)
+
+
+def _system_health(
+    fwd: dict,
+    refr: dict,
+    refr_count: int,
+    *,
+    accounting: dict | None = None,
+    accounting_error: str | None = None,
+) -> str:
+    """Compose the daily health line.
+
+    When the freshness audit's accounting is available it is authoritative and
+    the ``refr``-based wording is not used at all; the legacy wording survives
+    only as the fallback for a run where the audit could not be read.
+    """
+    if accounting is not None or accounting_error is not None:
+        flags = _freshness_flags(accounting, accounting_error)
+    else:
+        flags = []
+        if refr.get("stale_count"):
+            flags.append(f"{refr['stale_count']} stale data names")
+        elif refr_count:
+            flags.append("data healthy")
+    flags = flags + _forward_flags(fwd)
+    return "healthy" if not flags else "; ".join(flags)
+
+
+def _freshness_view(*, settings, paths, experiment_db) -> tuple[dict | None, str | None]:
+    """The audit's fleet accounting, or ``(None, error type)``.
+
+    A report surface must always deliver: if the audit cannot run (unreadable
+    database, path/permission change), the report says the audit is unavailable
+    AND names the error type rather than falling back to a second, disagreeing
+    staleness derivation or failing to send at all.
+    """
+    try:
+        return (
+            freshness_accounting(settings=settings, paths=paths, experiment_db=experiment_db),
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001 -- a report must never fail to deliver
+        return None, type(exc).__name__
+
+
+def _week_benchmark(
+    *, experiment_db, settings, paths, rows: list[dict]
+) -> tuple[float | None, str | None]:
+    """The weekly benchmark return over the report's own window.
+
+    Returns ``(pct, note)``. ``benchmark_pct`` was a parameter ``main()`` never
+    supplied, so "Benchmark:" and "Relative:" could never render a number at all.
+    Wiring it exposes two gaps the report must STATE rather than render as a bare
+    "unavailable": a vintage whose series does not reach the window, and a pinned
+    artifact whose recorded cache path points into the pre-migration checkout.
+    Never extrapolates: an uncovered window stays unavailable, with the reason.
+    """
+    if not rows or experiment_db is None:
+        return None, None
+    raw_cache = getattr(settings, "adapter_cache_dir", None) or getattr(paths, "raw_cache", None)
+    if raw_cache is None:
+        return None, "benchmark unavailable (benchmark cache directory unknown)"
+    end = str(rows[-1].get("date") or "")
+    try:
+        start = (date.fromisoformat(end) - timedelta(days=7)).isoformat()
+    except ValueError:
+        return None, None
+    try:
+        vintage = load_latest_benchmark(experiment_db, Path(raw_cache))
+    except (ValueError, OSError, sqlite3.Error, TypeError, AttributeError) as exc:
+        return None, f"benchmark unavailable ({type(exc).__name__})"
+    pct = window_return_pct(vintage.series, start, end)
+    if pct is None:
+        return None, (
+            f"benchmark vintage {vintage.vintage_label} ends {vintage.last_session}; "
+            f"window {start}..{end} not covered"
+        )
+    return pct, None
 
 
 def build_daily_report(
@@ -223,6 +335,9 @@ def build_daily_report(
     fwd = forward_health(experiment_db=experiment_db, paths=paths, reporting_day=date.today())
     refr = refresh_health(settings=settings, paths=paths)
     acts = _ledger_actions(LEDGER, date.today().isoformat())
+    accounting, accounting_error = _freshness_view(
+        settings=settings, paths=paths, experiment_db=experiment_db
+    )
 
     actions = []
     if acts.error:
@@ -256,7 +371,9 @@ def build_daily_report(
         # Horizon elapsed but the required exit evidence is missing: pending and
         # retryable, never a permanent label for a data gap.
         "awaiting_exit": fwd.get("awaiting_exit"),
-        "system_health": _system_health(fwd, refr, 0),
+        "system_health": _system_health(
+            fwd, refr, 0, accounting=accounting, accounting_error=accounting_error
+        ),
     }
     return render_daily_report(data)
 
@@ -279,6 +396,18 @@ def build_weekly_report(
         rows, history_error = loaded.rows, loaded.error
     fwd = forward_health(experiment_db=experiment_db)
     refr = refresh_health(settings=settings, paths=paths)
+    accounting, accounting_error = _freshness_view(
+        settings=settings, paths=paths, experiment_db=experiment_db
+    )
+    # The benchmark is measured over the SAME window as the portfolio's week. It
+    # is wired here because it was previously a parameter no caller ever set, so
+    # "Benchmark:" and "Relative:" could never render a number at all.
+    if benchmark_pct is None:
+        benchmark_pct, benchmark_note = _week_benchmark(
+            experiment_db=experiment_db, settings=settings, paths=paths, rows=rows
+        )
+    else:
+        benchmark_note = None
 
     asset_value = broker.get("asset_value")
     week_ago = _week_ago_value(rows)
@@ -293,10 +422,16 @@ def build_weekly_report(
     matured = fwd.get("matured_by_horizon", {})
     acts = _ledger_actions(LEDGER, date.today().isoformat())
     system = []
-    if refr.get("stale_count"):
-        system.append(f"{refr['stale_count']} stale data names")
-    elif refr.get("with_bars"):
-        system.append("data healthy")
+    if accounting is not None or accounting_error is not None:
+        system.extend(_freshness_flags(accounting, accounting_error))
+    else:
+        # Legacy wording, used ONLY when the audit could not be read.
+        if refr.get("stale_count"):
+            system.append(f"{refr['stale_count']} stale data names")
+        elif refr.get("with_bars"):
+            system.append("data healthy")
+    if benchmark_note:
+        system.append(benchmark_note)
     if acts.executions:
         system.append(f"{acts.executions} PAPER execution(s) today")
     if acts.unknown:
