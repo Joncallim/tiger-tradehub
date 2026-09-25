@@ -677,8 +677,115 @@ def check_reconciliation() -> None:
         _alert("sanitized broker handoff unreadable")
 
 
+#: A genuine committee queue is driven within days of issue (the research cycle
+#: runs M/W/F and the model worker follows it). A run with no score this long
+#: after it was issued is a stalled decision plane, not a busy one.
+DECISION_STALL_HOURS = 72.0
+
+
+def _parse_utc(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def decision_plane_state(research_db, *, now: datetime | None = None) -> dict:
+    """Outstanding committee work versus the decision gate (read-only).
+
+    "Outstanding" is a GENUINE committee run that produced no ``score_snapshot``
+    -- the exact condition ``decision_pipeline`` reports as BLOCKED_NO_VALID_SCORE,
+    so the watch cannot disagree with the gate. Acceptance runs are excluded: they
+    are historical fixtures, not the production queue.
+
+    Live, this is the gap that let the paper loop sit idle for ten days while the
+    watch stayed silent: every other condition covered an INPUT to the decision,
+    none covered the decision itself.
+    """
+    from tradehub_research.ops.acceptance_rows import genuine_clause
+
+    now = now or datetime.now(timezone.utc)
+    predicate, params = genuine_clause("c.pipeline_run_id")
+    with research_db.connect(read_only=True) as conn:
+        outstanding = conn.execute(
+            "SELECT c.created_at FROM committee_run c "
+            f"WHERE {predicate} AND NOT EXISTS ("
+            "  SELECT 1 FROM score_snapshot s WHERE s.committee_run_id=c.committee_run_id)",
+            params,
+        ).fetchall()
+        latest_predicate, latest_params = genuine_clause("p.run_id")
+        latest = conn.execute(
+            f"SELECT p.run_id, p.as_of FROM pipeline_run p WHERE {latest_predicate} "
+            "ORDER BY p.as_of DESC LIMIT 1",
+            latest_params,
+        ).fetchone()
+        latest_as_of = None
+        candidates = scored = 0
+        if latest is not None:
+            latest_as_of = latest["as_of"]
+            candidates = conn.execute(
+                "SELECT count(*) FROM candidate WHERE run_id=?", (latest["run_id"],)
+            ).fetchone()[0]
+            scored = conn.execute(
+                "SELECT count(*) FROM score_snapshot s JOIN committee_run c "
+                "ON c.committee_run_id=s.committee_run_id WHERE c.pipeline_run_id=?",
+                (latest["run_id"],),
+            ).fetchone()[0]
+        proposals = conn.execute("SELECT count(*) FROM trade_proposal").fetchone()[0]
+
+    ages = [
+        (at, (now - at).total_seconds() / 3600)
+        for at in (_parse_utc(row["created_at"]) for row in outstanding)
+        if at is not None
+    ]
+    oldest_at, oldest_hours = (None, 0.0)
+    if ages:
+        oldest_at, oldest_hours = max(ages, key=lambda item: item[1])
+    return {
+        "outstanding_runs": len(outstanding),
+        "oldest_outstanding_at": (
+            oldest_at.isoformat().replace("+00:00", "Z") if oldest_at is not None else None
+        ),
+        "oldest_outstanding_hours": oldest_hours,
+        "latest_pipeline_as_of": latest_as_of,
+        "latest_pipeline_candidates": candidates,
+        "latest_pipeline_scored": scored,
+        "proposals_lifetime": proposals,
+    }
+
+
+def check_decision_plane(research_db, *, now: datetime | None = None) -> None:
+    """The decision plane: work issued but never scored, decisions blocked."""
+    import sqlite3
+
+    try:
+        state = decision_plane_state(research_db, now=now)
+    except (sqlite3.Error, OSError) as exc:
+        _alert(f"decision-plane state unreadable ({type(exc).__name__})")
+        return
+    if not state["outstanding_runs"] or state["oldest_outstanding_hours"] < DECISION_STALL_HOURS:
+        return
+    if state["latest_pipeline_as_of"]:
+        cycle = (
+            f"{state['latest_pipeline_scored']}/{state['latest_pipeline_candidates']} "
+            f"candidates scored on the {str(state['latest_pipeline_as_of'])[:10]} cycle"
+        )
+    else:
+        cycle = "no pipeline run recorded"
+    _alert(
+        f"decision plane stalled: {state['outstanding_runs']} committee run(s) without a score, "
+        f"oldest {str(state['oldest_outstanding_at'])[:10]} "
+        f"({state['oldest_outstanding_hours']:.0f}h); {cycle}; "
+        f"{state['proposals_lifetime']} proposal(s) ever"
+    )
+
+
 def main() -> int:
     from tradehub_research.config import ResearchSettings
+    from tradehub_research.db import ResearchDB
     from tradehub_research.ops.common import research_paths
     from tradehub_research.validation.experiment_db import ExperimentDB
 
@@ -688,6 +795,7 @@ def main() -> int:
     check_cycle_health(paths)
     check_data_freshness(settings, paths)
     check_forward_ledger(exp, paths)
+    check_decision_plane(ResearchDB(paths.research_db, settings.busy_timeout_ms))
     check_paper_proof_and_kill_switch()
     check_services()
     check_reconciliation()

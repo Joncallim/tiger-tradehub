@@ -367,6 +367,39 @@ def refresh_health(
     }
 
 
+def freshness_accounting(
+    *,
+    settings: ResearchSettings,
+    paths: ResearchPaths | None = None,
+    experiment_db: ExperimentDB,
+) -> dict:
+    """Authoritative fleet accounting, read from the freshness audit itself.
+
+    The reports used to describe the fleet with ``refresh_health``'s crude
+    7-day cutoff, which counts names the audit has ALREADY classified as
+    legitimately unfetchable (delisted / invalid symbol / no-trade, excluded from
+    eligibility) as if they were incidents -- live, that read "42 stale data
+    names" against a real backlog of 2 (LCGMF, TRLEF). Two surfaces describing
+    one system must not disagree, and a design-level exclusion must never be
+    promoted into an incident.
+
+    Read-only and network-free (``audit_universe`` only reads the databases), so
+    it is safe inside report generation. The unresolved securities are named, so
+    a genuine gap cannot hide inside a total.
+    """
+    from tradehub_research.ops import data_freshness as df
+
+    paths = paths or research_paths()
+    audit = df.audit_universe(settings=settings, paths=paths, experiment_db=experiment_db)
+    return {
+        "universe": audit.universe_total,
+        "excluded_exceptions": audit.excluded_exceptions,
+        "lagging_within_window": len(audit.lagging_within_window),
+        "unresolved": [str(item.ticker) for item in audit.stale],
+        "unresolved_count": audit.stale_count,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     settings = ResearchSettings()
     paths = research_paths()
