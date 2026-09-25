@@ -309,6 +309,55 @@ def test_weekly_report_states_a_missing_cache_file_instead_of_a_bare_unavailable
     assert "unavailable" in report
 
 
+def test_weekly_report_prefers_the_deployment_aware_raw_cache_path(tmp_path, monkeypatch):
+    """The deployed report cron does not carry RESEARCH_ADAPTER_CACHE_DIR.
+
+    `settings.adapter_cache_dir` therefore silently falls back to the in-repo
+    default there, while `paths.raw_cache` (derived from TRADEHUB_RESEARCH_DIR /
+    TRADEHUB_RAW_CACHE) IS passed through. Using the settings value made the
+    DEPLOYED weekly report read "benchmark unavailable (ValueError)" -- the pinned
+    artifact reported missing -- instead of the vintage-coverage reason that an
+    operator shell with the full env rendered.
+    """
+    from types import SimpleNamespace
+
+    from tradehub_research.ops import report_cli
+
+    settings = _settings(tmp_path)  # its adapter_cache_dir points at an EMPTY decoy
+    db = ExperimentDB(tmp_path / "experiment.db")
+    db.migrate()
+    # Mirror the LIVE artifact exactly: a RELATIVE pre-migration cache path, so
+    # resolution depends on which cache root the report chooses.
+    live = tmp_path / "live_raw" / "benchmark" / "ff_daily_factors.csv"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text(_ff_text(LIVE_ROWS), encoding="utf-8")
+    as_read = live.read_text(encoding="utf-8", errors="replace")
+    _, parsed_hash = parse_ff_daily_factors(as_read)
+    pin_benchmark_artifact(
+        db,
+        source="ken-french-daily-factors",
+        source_url="https://example.invalid/daily_factors.zip",
+        vintage_label="fetched 2026-08-28T14:43:47Z",
+        raw_content_hash=hashlib.sha256(as_read.encode()).hexdigest(),
+        parsed_series_hash=parsed_hash,
+        cache_path="data/research/raw/benchmark/ff_daily_factors.csv",
+    )
+    paths = SimpleNamespace(raw_cache=tmp_path / "live_raw")
+    monkeypatch.setattr(report_cli, "forward_health", lambda **kw: {"production_predictions": 0})
+    monkeypatch.setattr(report_cli, "freshness_accounting", lambda **kw: _AUDIT_OK)
+    monkeypatch.setattr(report_cli, "refresh_health", lambda **kw: {})
+
+    report = report_cli.build_weekly_report(
+        settings=settings,
+        experiment_db=db,
+        paths=paths,
+        analytics=ANALYTICS,
+        history=HISTORY_ROWS,
+    )
+    assert "ValueError" not in report, report
+    assert "2026-06-30" in report and "not covered" in report, report
+
+
 def test_weekly_report_without_history_keeps_todays_behaviour(tmp_path, monkeypatch):
     """No broker history -> no window -> no new claim about the benchmark."""
     settings = _settings(tmp_path)
