@@ -300,7 +300,15 @@ def _week_benchmark(
     """
     if not rows or experiment_db is None:
         return None, None
-    raw_cache = getattr(settings, "adapter_cache_dir", None) or getattr(paths, "raw_cache", None)
+    # ``paths.raw_cache`` is the DEPLOYMENT-AWARE source: it derives from
+    # TRADEHUB_RESEARCH_DIR / TRADEHUB_RAW_CACHE, both of which the report cron
+    # passes through its sudo --preserve-env list. ``settings.adapter_cache_dir``
+    # comes from RESEARCH_ADAPTER_CACHE_DIR, which that list does NOT carry, so
+    # there it silently falls back to the in-repo default and the pinned cache
+    # file is reported missing -- which is exactly what the deployed weekly
+    # report did ("benchmark unavailable (ValueError)") while an operator shell
+    # with the full env rendered the vintage-coverage reason.
+    raw_cache = getattr(paths, "raw_cache", None) or getattr(settings, "adapter_cache_dir", None)
     if raw_cache is None:
         return None, "benchmark unavailable (benchmark cache directory unknown)"
     end = str(rows[-1].get("date") or "")
