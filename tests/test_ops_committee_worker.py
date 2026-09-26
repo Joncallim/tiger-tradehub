@@ -204,12 +204,22 @@ class FakeApi:
 
 
 class FakeMcp:
-    def __init__(self, artifact=None):
-        # The pinned artifact always carries the hash the envelope requested.
-        self.artifact = artifact or {**ARTIFACT, "pack_hash": WORK["pack_hash"]}
+    """Mimics the MCP tool's WRAPPER response, not the bare artifact."""
+
+    def __init__(self, artifact=None, *, pinned: bool = True, pack_hash: str | None = None):
+        self.artifact = artifact or ARTIFACT
+        self.pinned = pinned
+        self.pack_hash = pack_hash or WORK["pack_hash"]
 
     def evidence_pack(self, candidate_id, pack_hash):
-        return self.artifact
+        return {
+            "artifact": self.artifact,
+            "pack_hash": self.pack_hash,
+            "pinned": self.pinned,
+            "representation": "BOUNDED_COMMITTEE_VIEW",
+            "lineage_hash": "lineage-hash",
+            "pack_spec_version": 2,
+        }
 
 
 def _stub_run(monkeypatch, **fields):
@@ -222,10 +232,23 @@ def _stub_run(monkeypatch, **fields):
 
 
 def _drive(
-    monkeypatch, *, api, mcp=None, preflight_result=None, output=None, budget=None, **kwargs
+    monkeypatch,
+    *,
+    api,
+    mcp=None,
+    preflight_result=None,
+    output=None,
+    model=None,
+    budget=None,
+    **kwargs,
 ):
     monkeypatch.setattr(worker, "preflight", lambda *a, **k: preflight_result)
-    monkeypatch.setattr(worker, "run_model", lambda *a, **k: output if output is not None else "{}")
+    if model is None:
+        monkeypatch.setattr(
+            worker, "run_model", lambda *a, **k: output if output is not None else "{}"
+        )
+    else:
+        monkeypatch.setattr(worker, "run_model", model)
     # Readiness has its own test; here the route is available.
     monkeypatch.setattr(worker, "_probe", lambda route: (True, None))
     return worker.drive_run(
@@ -322,11 +345,59 @@ def test_model_call_budget_stops_the_invocation(monkeypatch):
 def test_envelope_is_never_sent_when_a_pin_mismatch_is_detected(monkeypatch):
     _stub_run(monkeypatch, comparator_config_hash="cc")
     api = FakeApi([WORK])
-    mcp = FakeMcp({**ARTIFACT, "pack_hash": "c" * 64})
+    mcp = FakeMcp(pack_hash="c" * 64)
     record = _drive(monkeypatch, api=api, mcp=mcp, preflight_result=None)
 
     assert api.sent == []
     assert record["stopped"] == "pin-mismatch"
+
+
+def test_unpinned_artifact_is_refused_before_any_model_call(monkeypatch):
+    """The MCP wrapper's `pinned` flag is authoritative: an unpinned artifact is not
+    a legitimate committee input."""
+    _stub_run(monkeypatch, comparator_config_hash="cc")
+    api = FakeApi([WORK])
+    calls = {"n": 0}
+
+    def _counting_model(*args, **kwargs):
+        calls["n"] += 1
+        return "{}"
+
+    monkeypatch.setattr(worker, "run_model", _counting_model)
+    record = _drive(monkeypatch, api=api, mcp=FakeMcp(pinned=False), preflight_result=None)
+
+    assert record["stopped"] == "artifact-not-pinned"
+    assert api.sent == []
+    assert calls["n"] == 0
+
+
+def test_model_side_validation_failure_after_corrections_consumes_the_attempt(monkeypatch):
+    """A defect the MODEL owns must consume the attempt, not re-drive the run forever.
+
+    Live observation: a model kept exceeding the missing-evidence bound, and the
+    worker retried the same run on every tick, spending 4 calls each time.
+    """
+    _stub_run(monkeypatch, comparator_config_hash="cc")
+    api = FakeApi([WORK])
+    calls = {"n": 0}
+
+    def _counting_model(*args, **kwargs):
+        calls["n"] += 1
+        return "{}"
+
+    monkeypatch.setattr(worker, "run_model", _counting_model)
+    record = _drive(
+        monkeypatch,
+        api=api,
+        model=_counting_model,
+        preflight_result="AssessmentValidationError: missing evidence bound exceeded",
+    )
+
+    assert calls["n"] == worker.MAX_CORRECTIONS_PER_ROLE + 1  # bounded, not unbounded
+    assert len(api.sent) == 1
+    assert api.sent[0]["outcome"] == "malformed"
+    assert "missing evidence bound exceeded" in api.sent[0]["diagnostic_excerpt"]
+    assert record["roles"][0]["outcome"] == "malformed"
 
 
 def test_provider_readiness_backs_off_and_reuses_a_fresh_success(monkeypatch):
@@ -349,6 +420,23 @@ def test_provider_readiness_backs_off_and_reuses_a_fresh_success(monkeypatch):
     assert worker.provider_ready(ROUTE, fresh)[0] is True
     monkeypatch.setattr(worker, "_probe", lambda route: pytest.fail("re-probed while fresh"))
     assert worker.provider_ready(ROUTE, fresh)[0] is True
+
+
+def test_readiness_cache_is_invalidated_when_the_runner_changes(monkeypatch):
+    """A verdict from another runner/identity must never mask a working one.
+
+    Observed live: a probe run under a non-root identity recorded
+    PermissionError, and the worker then reused that verdict (and its backoff)
+    after the runner path was fixed.
+    """
+    state: dict = {}
+    monkeypatch.setenv("RESEARCH_COMMITTEE_WORKER_HERMES", "/bin/false")
+    monkeypatch.setattr(worker, "_probe", lambda route: (False, "PermissionError"))
+    assert worker.provider_ready(ROUTE, state)[0] is False
+
+    monkeypatch.setenv("RESEARCH_COMMITTEE_WORKER_HERMES", "/bin/true")
+    monkeypatch.setattr(worker, "_probe", lambda route: (True, None))
+    assert worker.provider_ready(ROUTE, state)[0] is True
 
 
 def test_runner_argv_targets_the_configured_provider_and_model(monkeypatch):

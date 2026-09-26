@@ -209,10 +209,18 @@ Operate and observe:
 systemctl list-timers tradehub-committee-worker.timer
 journalctl -u tradehub-committee-worker.service -n 50 -o cat
 # one bounded invocation by hand (defaults: 4 runs, 12 model calls, 840 s)
-sudo -u tradehub-research env $(grep -v '^#' /etc/tradehub/research.env | xargs) \
-  /opt/tiger-tradehub/.venv/bin/python -m tradehub_research.ops.committee_worker --dry-run
-sudo -u tradehub-research ... -m tradehub_research.ops.committee_worker --probe-only
+sudo -u root bash -c 'set -a; . /etc/tradehub/research.env; set +a; \
+  export TRADEHUB_RESEARCH_DIR=/var/lib/tradehub-research; \
+  /opt/tiger-tradehub/.venv/bin/python -m tradehub_research.ops.committee_worker --dry-run'
+# readiness only (no work claimed, no submissions)
+... -m tradehub_research.ops.committee_worker --probe-only
 ```
+
+The unit runs as `root` for one reason: the model runner CLI needs the Hermes install
+under `/var/lib/hermes` (provider credentials, `0700 root:root`), and this host
+already invokes model CLIs as root (Hermes cron jobs, the health watch). The worker
+holds no trading authority — read-only DB access, submissions only through the
+authenticated API, and it writes only its own state file.
 
 Durable worker state lives in `$TRADEHUB_RESEARCH_DIR/committee-worker-state.json`
 (last activity, provider readiness, last batch records, counters) and is read by the

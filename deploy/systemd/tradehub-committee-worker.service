@@ -6,7 +6,13 @@ Wants=tradehub-research.service
 
 [Service]
 Type=oneshot
-User=tradehub-research
+# Runs as root because the model runner CLI on this host needs the Hermes install
+# under /var/lib/hermes (provider credentials, 0700 root:root), and this host already
+# invokes model CLIs as root (Hermes cron jobs, the health watch). The worker holds
+# NO trading authority: it opens the research DB read-only, submits assessments only
+# through the authenticated committee API (whose router owns every retry, escalation
+# and scoring decision), and writes only its own state file in the research dir.
+User=root
 WorkingDirectory=/opt/tiger-tradehub
 EnvironmentFile=/etc/tradehub/research.env
 # The worker is an ACTUATOR: it fetches the pinned artifact over MCP, submits
