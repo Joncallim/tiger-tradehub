@@ -25,6 +25,10 @@ ExecStart=/opt/tiger-tradehub/.venv/bin/python -m tradehub_research.ops.committe
 # The runner CLI is named absolutely: a systemd service does not inherit the login
 # PATH, and a missing runner would look like an unready provider.
 Environment=RESEARCH_COMMITTEE_WORKER_HERMES=/opt/hermes/venv/bin/hermes
+# HERMES_HOME selects the estate's Hermes profile. Without it a clean service
+# environment resolves a different config and the runner fails with
+# "Unknown provider 'cheaperinference'" -- observed on the first automated tick.
+Environment=HERMES_HOME=/var/lib/hermes
 Nice=10
 # Outer wall: the module's own --max-seconds bound is 840s, so a wedged invocation
 # is killed well before the next timer tick.
