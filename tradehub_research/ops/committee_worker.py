@@ -38,7 +38,9 @@ import argparse
 import fcntl
 import json
 import os
+import select
 import shlex
+import signal
 import subprocess  # noqa: S404 - the configured model runner is an operator-chosen CLI
 import sys
 import time
@@ -73,6 +75,7 @@ DEFAULT_MAX_MODEL_CALLS = 12
 DEFAULT_MAX_SECONDS = 900.0
 MAX_CORRECTIONS_PER_ROLE = 2
 MODEL_TIMEOUT_SECONDS = 600
+MCP_TIMEOUT_SECONDS = 120
 PROBE_TIMEOUT_SECONDS = 120
 PROBE_TTL_SECONDS = 600
 BACKOFF_BASE_SECONDS = 300
@@ -313,22 +316,29 @@ class ApiClient:
 
 
 class McpClient:
-    """Minimal stdio MCP client for the pinned artifact fetch."""
+    """Minimal stdio MCP client for the pinned artifact fetch.
 
-    def __init__(self, settings: ResearchSettings) -> None:
-        binary = Path(sys.executable).parent / "tradehub-research-mcp"
-        if not binary.exists():
-            raise WorkerContractError(f"MCP server entry point not found: {binary}")
+    The server is started in its OWN process group and torn down as a group: a
+    surviving child would keep the systemd unit's cgroup populated, which holds the
+    unit "active" and makes the next timer tick skip (observed live: a worker printed
+    its final line in 2 seconds yet the unit stayed active for 9 minutes).
+    """
+
+    def __init__(self, settings: ResearchSettings, *, binary: Path | None = None) -> None:
+        target = binary or (Path(sys.executable).parent / "tradehub-research-mcp")
+        if not target.exists():
+            raise WorkerContractError(f"MCP server entry point not found: {target}")
         env = dict(os.environ)
         env["RESEARCH_DB_PATH"] = str(settings.db_path)
         self._proc = subprocess.Popen(  # noqa: S603 - fixed binary, no shell
-            [str(binary)],
+            [str(target)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
             env=env,
+            start_new_session=True,
         )
         self._id = 0
         self._request(
@@ -350,7 +360,16 @@ class McpClient:
         assert self._proc.stdin and self._proc.stdout
         self._proc.stdin.write(json.dumps(message) + "\n")
         self._proc.stdin.flush()
+        # A hung server must never wedge the worker (it holds the run lock, so a wedged
+        # invocation would silently stall every later timer tick).
+        deadline = time.monotonic() + MCP_TIMEOUT_SECONDS
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorkerContractError(f"MCP server timed out on {method}")
+            ready, _, _ = select.select([self._proc.stdout], [], [], remaining)
+            if not ready:
+                raise WorkerContractError(f"MCP server timed out on {method}")
             line = self._proc.stdout.readline()
             if not line:
                 raise WorkerContractError("MCP server produced no response")
@@ -408,12 +427,24 @@ class McpClient:
         }
 
     def close(self) -> None:
-        try:
-            if self._proc.stdin:
-                self._proc.stdin.close()
-            self._proc.wait(timeout=10)
-        except Exception:  # noqa: BLE001 - best-effort teardown
-            self._proc.kill()
+        """Reap the server (and anything it spawned). Never leaves an orphan."""
+        proc = self._proc
+        if proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001 - fall through to the group kill
+                pass
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:  # noqa: BLE001 - already gone, or no group
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001 - best effort
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -755,6 +786,10 @@ def main(argv: list[str] | None = None) -> int:
     state_file = state_path(paths)
     lock_file = lock_path(paths)
     state = read_state(state_file)
+    # Per-invocation fields must not inherit the previous invocation's verdicts: the
+    # monitor reads this file, and a stale stopped_by would misattribute the reason.
+    state["previous_stopped_by"] = state.get("stopped_by")
+    state.pop("stopped_by", None)
     state["last_started_at"] = _iso(_now())
 
     Path(paths.research_dir).mkdir(parents=True, exist_ok=True)

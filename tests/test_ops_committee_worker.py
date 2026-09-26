@@ -7,6 +7,8 @@ or a bound the owner requires before this worker may spend model money.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -543,6 +545,74 @@ def test_state_round_trips_through_the_research_dir(tmp_path):
 
     assert worker.read_state(state_file)["last_activity_at"] == "2026-09-26T04:00:00Z"
     assert worker.read_state(tmp_path / "missing.json") == {}
+
+
+def test_per_invocation_verdicts_do_not_leak_into_the_next_run(tmp_path, monkeypatch):
+    """A stale stopped_by would misattribute the reason in the monitor.
+
+    Observed live: an invocation bounded by --max-runs 4 reported
+    "stopped_by: max-runs(3)", inherited from the previous invocation's state.
+    """
+    paths = SimpleNamespace(research_dir=tmp_path)
+    state_file = worker.state_path(paths)
+    worker.write_state(state_file, {"stopped_by": "max-runs(3)", "last_activity_at": "old"})
+    state = worker.read_state(state_file)
+    state["previous_stopped_by"] = state.get("stopped_by")
+    state.pop("stopped_by", None)
+
+    assert "stopped_by" not in state
+    assert state["previous_stopped_by"] == "max-runs(3)"
+
+
+def test_mcp_client_close_reaps_its_child(tmp_path):
+    """A surviving MCP child keeps the systemd cgroup alive and skips ticks.
+
+    The client is built without its handshake so the test needs no real MCP server:
+    the point is that close() terminates the process it started.
+    """
+    script = tmp_path / "fake-mcp"
+    script.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    client = object.__new__(worker.McpClient)
+    client._id = 0
+    client._proc = subprocess.Popen(  # noqa: S603 - the test's own stand-in
+        [str(script)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pid = client._proc.pid
+    client.close()
+
+    client._proc.wait(timeout=5)
+    assert client._proc.poll() is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_mcp_read_times_out_instead_of_wedging(tmp_path, monkeypatch):
+    """A hung server must fail the invocation, not hold the lock forever."""
+    monkeypatch.setattr(worker, "MCP_TIMEOUT_SECONDS", 0.2)
+    script = tmp_path / "silent-mcp"
+    script.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    client = object.__new__(worker.McpClient)
+    client._id = 0
+    client._proc = subprocess.Popen(  # noqa: S603 - the test's own stand-in
+        [str(script)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(WorkerContractError, match="timed out"):
+            client._request("initialize", {})
+    finally:
+        client.close()
 
 
 def test_unknown_role_route_is_rejected(tmp_path):
