@@ -381,6 +381,13 @@ class McpClient:
         return body if body is not None else {"_error": {"message": "empty MCP result"}}
 
     def evidence_pack(self, candidate_id: str, pack_hash: str) -> dict[str, Any]:
+        """Fetch the pinned artifact and unwrap the MCP response.
+
+        The tool returns ``{body, pack_hash, pinned, representation, lineage_hash,
+        pack_spec_version}``; the artifact itself is ``body``. Unwrapping here (with
+        the pin re-checked by the caller) keeps every downstream consumer working on
+        the artifact, never on the envelope.
+        """
         payload = self.call_tool(
             "get_evidence_pack", {"candidate_id": candidate_id, "pack_hash": pack_hash}
         )
@@ -388,7 +395,17 @@ class McpClient:
             raise WorkerContractError(
                 f"pinned evidence fetch refused: {payload['_error'].get('message', '')[:300]}"
             )
-        return payload
+        body = payload.get("body")
+        if not isinstance(body, dict):
+            raise WorkerContractError("pinned artifact response carried no body object")
+        return {
+            "artifact": body,
+            "pack_hash": payload.get("pack_hash"),
+            "pinned": payload.get("pinned"),
+            "representation": payload.get("representation"),
+            "lineage_hash": payload.get("lineage_hash"),
+            "pack_spec_version": payload.get("pack_spec_version"),
+        }
 
     def close(self) -> None:
         try:
@@ -404,9 +421,14 @@ class McpClient:
 # --------------------------------------------------------------------------- #
 
 
+def runner_binary() -> str:
+    """The operator-chosen runner CLI (never inherited from a login PATH)."""
+    return os.environ.get("RESEARCH_COMMITTEE_WORKER_HERMES", "hermes")
+
+
 def runner_argv(route: Any, prompt: str) -> list[str]:
-    """The operator-chosen runner CLI invocation (configurable, not hard-coded)."""
-    binary = os.environ.get("RESEARCH_COMMITTEE_WORKER_HERMES", "hermes")
+    """The runner CLI invocation: configurable, absolute, and never a shell string."""
+    binary = runner_binary()
     extra = shlex.split(os.environ.get("RESEARCH_COMMITTEE_WORKER_HERMES_ARGS", ""))
     return [
         binary,
@@ -447,6 +469,12 @@ def provider_ready(
     """Cached provider readiness. Never degrades silently: unready => no claim."""
     now = now or _now()
     entry = _provider_entry(state, route.provider)
+    runner = runner_binary()
+    if entry and entry.get("probed_runner") not in (None, runner):
+        # A verdict recorded for a DIFFERENT runner (other binary, or the same CLI
+        # run under another identity) says nothing about this one: never reuse it,
+        # and never inherit its backoff.
+        entry.clear()
     checked_at = _parse_iso(entry.get("checked_at"))
     retry_at = _parse_iso(entry.get("next_retry_at"))
     if checked_at is not None:
@@ -467,6 +495,7 @@ def provider_ready(
                 "failures": 0,
                 "next_retry_at": None,
                 "probed_model": route.key,
+                "probed_runner": runner,
             }
         )
         return True, None
@@ -480,6 +509,7 @@ def provider_ready(
             "failures": failures,
             "next_retry_at": _iso(now + timedelta(seconds=backoff)),
             "probed_model": route.key,
+            "probed_runner": runner,
         }
     )
     return False, reason
@@ -548,11 +578,15 @@ def drive_run(
             record["provider_reason"] = reason
             break
 
-        artifact = mcp.evidence_pack(cycle_row["candidate_id"], str(work["pack_hash"]))
-        returned = str(artifact.get("pack_hash"))
+        fetched = mcp.evidence_pack(cycle_row["candidate_id"], str(work["pack_hash"]))
+        artifact = fetched["artifact"]
+        returned = str(fetched.get("pack_hash"))
         if returned != str(work["pack_hash"]):
             record["stopped"] = "pin-mismatch"
             record["pin_error"] = f"requested {work['pack_hash']} got {returned}"
+            break
+        if fetched.get("pinned") is not True:
+            record["stopped"] = "artifact-not-pinned"
             break
         brief = build_brief(role, work, artifact, taxonomy_keys)
         role_record: dict[str, Any] = {
@@ -565,11 +599,13 @@ def drive_run(
         }
         envelope: dict[str, Any] | None = None
         malformed: str | None = None
+        calls_made = 0
         for correction in range(MAX_CORRECTIONS_PER_ROLE + 1):
             if budget.exhausted():
                 role_record["stopped"] = budget.exhausted()
                 break
             budget.model_calls += 1
+            calls_made += 1
             try:
                 output = run_model(route, brief)
             except WorkerContractError as exc:
@@ -607,15 +643,22 @@ def drive_run(
                 # Our defect, not the model's: never send, never burn the attempt.
                 role_record["harness_defect"] = error[:300]
                 break
-            role_record["corrections"] = correction + 1
-            brief = (
-                f"{brief}\n\nCORRECTION REQUIRED - your previous attempt was rejected by the "
-                f"validator with: {error}. Fix EXACTLY that defect and return the complete "
-                "corrected JSON object (same schema, same rules). Note the length limits: "
-                "thesis.summary, thesis.upside_mechanism and thesis.downside_mechanism must each "
-                "be non-empty and at most 512 characters; claim_key 'other' is capped at "
-                "materiality 2."
-            )
+            if correction < MAX_CORRECTIONS_PER_ROLE:
+                role_record["corrections"] = correction + 1
+                brief = (
+                    f"{brief}\n\nCORRECTION REQUIRED - your previous attempt was rejected by the "
+                    f"validator with: {error}. Fix EXACTLY that defect and return the complete "
+                    "corrected JSON object (same schema, same rules). Note the length limits: "
+                    "thesis.summary, thesis.upside_mechanism and thesis.downside_mechanism must "
+                    "each be non-empty and at most 512 characters; claim_key 'other' is capped "
+                    "at materiality 2."
+                )
+                continue
+            # Corrections exhausted on a MODEL-side defect: consume the attempt (per the
+            # existing contract) instead of re-driving this run on every future tick.
+            malformed = f"model output failed validation after corrections: {error}"
+            role_record["malformed_reason"] = malformed
+        role_record["model_calls"] = calls_made
         if envelope is None:
             if malformed is not None:
                 excerpt = str(role_record.get("raw_excerpt") or "")
