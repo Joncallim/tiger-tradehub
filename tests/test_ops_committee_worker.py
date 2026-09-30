@@ -615,6 +615,53 @@ def test_mcp_read_times_out_instead_of_wedging(tmp_path, monkeypatch):
         client.close()
 
 
+def test_terminal_run_without_work_does_not_consume_the_run_budget():
+    """Regression for 2026-09-30: 35 runs undriven with zero model calls per tick.
+
+    Terminal runs (ESCALATE with an explicit cause) sort first by run id and yield no
+    work. When they consumed the --max-runs budget the worker never reached an
+    actionable run behind them.
+    """
+    budget = worker.Budget(max_runs=4, max_model_calls=12, max_seconds=900.0)
+    skipped: list[dict] = []
+
+    for _ in range(3):
+        assert (
+            worker._account_run(
+                {"committee_run_id": "terminal", "stopped": "no-work-issued"}, budget, skipped
+            )
+            is False
+        )
+    assert budget.runs_claimed == 0, "terminal runs must not consume the run budget"
+    assert len(skipped) == 3
+    assert all(s["reason"] == "no-work-issued" for s in skipped)
+
+    assert (
+        worker._account_run(
+            {"committee_run_id": "actionable", "work_obtained": True}, budget, skipped
+        )
+        is True
+    )
+    assert budget.runs_claimed == 1
+    assert budget.exhausted() is None
+
+
+def test_scan_window_covers_more_runs_than_the_budget():
+    """The scan must consider enough runs to look past terminal ones."""
+    assert worker.SCAN_FACTOR >= 4
+    assert worker.DEFAULT_MAX_RUNS * worker.SCAN_FACTOR > worker.DEFAULT_MAX_RUNS
+
+
+def test_work_obtained_is_marked_only_when_the_api_issues_work(monkeypatch):
+    _stub_run(monkeypatch, comparator_config_hash="cc")
+    idle = _drive(monkeypatch, api=FakeApi([]), mcp=FakeMcp(), preflight_result=None)
+    assert idle["stopped"] == "no-work-issued"
+    assert not idle.get("work_obtained")
+
+    driven = _drive(monkeypatch, api=FakeApi([WORK]), mcp=FakeMcp(), preflight_result=None)
+    assert driven.get("work_obtained") is True
+
+
 def test_unknown_role_route_is_rejected(tmp_path):
     config = tmp_path / "routes.json"
     config.write_text(json.dumps({"chief_vibes_officer": {}}), encoding="utf-8")

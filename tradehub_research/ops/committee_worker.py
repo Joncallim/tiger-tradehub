@@ -71,6 +71,9 @@ STATE_FILENAME = "committee-worker-state.json"
 LOCK_FILENAME = "committee-worker.lock"
 
 DEFAULT_MAX_RUNS = 4
+#: Runs EXAMINED per invocation = max_runs x this. Terminal runs (no work issued) are
+#: skipped without consuming the run budget, so the scan window must cover them.
+SCAN_FACTOR = 8
 DEFAULT_MAX_MODEL_CALLS = 12
 DEFAULT_MAX_SECONDS = 900.0
 MAX_CORRECTIONS_PER_ROLE = 2
@@ -205,6 +208,23 @@ def outstanding_runs(db: ResearchDB, pipeline_run_id: str, limit: int) -> list[d
             (pipeline_run_id, ACCEPTANCE_PREFIX + "%", limit),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _account_run(record: dict[str, Any], budget: Budget, skipped: list[dict[str, Any]]) -> bool:
+    """Count a run against the invocation budget ONLY when work was actually obtained.
+
+    Terminal runs (ESCALATE with an explicit cause, or every role already decided)
+    yield no work, sort first by run id, and would otherwise consume the whole
+    ``--max-runs`` budget on every tick -- starving every actionable run behind them.
+    Observed 2026-09-30: 35 runs undriven with zero model calls per invocation.
+    """
+    if record.get("work_obtained"):
+        budget.runs_claimed += 1
+        return True
+    skipped.append(
+        {"committee_run_id": record.get("committee_run_id"), "reason": record.get("stopped")}
+    )
+    return False
 
 
 def superseded(research_db: ResearchDB, cycle_run_id: str) -> bool:
@@ -596,8 +616,13 @@ def drive_run(
             break
         work = client.get_work(committee_run_id)
         if work is None:
+            # Nothing is issued for this run (terminal state such as ESCALATE with an
+            # explicit cause, or all roles already decided). The run must NOT consume
+            # the invocation's run budget: terminal runs sort first, and burning the
+            # budget on them starves every actionable run behind them.
             record["stopped"] = "no-work-issued"
             break
+        record["work_obtained"] = True
         role = str(work["role"])
         route = routes.get(role)
         if route is None:
@@ -841,7 +866,7 @@ def _run_locked(
     runs = (
         [{"committee_run_id": args.run_id}]
         if args.run_id
-        else outstanding_runs(db, cycle["run_id"], args.max_runs)
+        else outstanding_runs(db, cycle["run_id"], max(args.max_runs * SCAN_FACTOR, args.max_runs))
     )
     state["outstanding_at_start"] = len(runs)
     state["claimed_runs"] = [
@@ -870,6 +895,9 @@ def _run_locked(
         )
     )
     records: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    scanned = 0
+    scan_limit = max(args.max_runs * SCAN_FACTOR, args.max_runs)
     mcp: McpClient | None = None
     try:
         client = ApiClient(settings)
@@ -893,7 +921,10 @@ def _run_locked(
                     )
                 )
                 break
-            budget.runs_claimed += 1
+            if scanned >= scan_limit:
+                state["stopped_by"] = state.get("stopped_by") or f"scan-limit({scan_limit})"
+                break
+            scanned += 1
             try:
                 cycle_row = run_row(db, run["committee_run_id"])
                 spec = comparator_spec(db, cycle_row["comparator_config_hash"])
@@ -915,6 +946,7 @@ def _run_locked(
                     "stopped": f"{type(exc).__name__}: {str(exc)[:200]}",
                     "roles": [],
                 }
+            _account_run(record, budget, skipped)
             records.append(record)
             print(json.dumps({"worker": "run", **record})[:2_000])
             if record.get("stopped", "").startswith("provider-unready"):
@@ -924,6 +956,8 @@ def _run_locked(
             mcp.close()
 
     state["last_run_records"] = records[-5:]
+    state["skipped_runs"] = skipped[-20:]
+    state["scanned"] = scanned
     state["last_activity_at"] = _iso(_now())
     state["last_exit"] = "ok"
     state["cycle"] = summarise(db, cycle)
