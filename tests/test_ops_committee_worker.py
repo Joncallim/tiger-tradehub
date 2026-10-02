@@ -564,6 +564,67 @@ def test_per_invocation_verdicts_do_not_leak_into_the_next_run(tmp_path, monkeyp
     assert state["previous_stopped_by"] == "max-runs(3)"
 
 
+def test_transport_failure_does_not_consume_the_role_budget(monkeypatch):
+    """Live 2026-10-01: the CheaperInference route answered with an HTTP 400 body
+    ("Request is missing x-opencode-session"). That is a ROUTE failure, not a
+    malformed model answer: nothing may be submitted and no attempt may be spent.
+    92 such attempts were charged before this guard existed, which escalated whole
+    committee runs to ESCALATE and left the cycle scored 1/40."""
+    _stub_run(monkeypatch, comparator_config_hash="cc")
+    api = FakeApi([WORK])
+    calls = {"n": 0}
+
+    def _counting_model(*args, **kwargs):
+        calls["n"] += 1
+        return (
+            "HTTP 400: Request is missing x-opencode-session and cannot be routed "
+            "efficiently. Please see https://opencode.ai/docs/go/#where-can-i-use-it"
+        )
+
+    record = _drive(
+        monkeypatch,
+        api=api,
+        model=_counting_model,
+        preflight_result=None,
+    )
+
+    assert calls["n"] == 1, "one runner call, then stop -- no correction loop"
+    assert api.sent == [], "a transport failure must never be submitted"
+    assert record["stopped"] == "provider-transport-failure"
+    assert record["roles"][0]["infrastructure_failure"]
+    assert "transport failure" in record["provider_reason"]
+
+
+def test_runner_exception_is_infrastructure_not_a_malformed_answer(monkeypatch):
+    _stub_run(monkeypatch, comparator_config_hash="cc")
+    api = FakeApi([WORK])
+
+    def _boom(*args, **kwargs):
+        raise WorkerContractError("runner failed rc=1: OAuth session expired")
+
+    record = _drive(monkeypatch, api=api, model=_boom, preflight_result=None)
+
+    assert api.sent == []
+    assert record["stopped"] == "provider-transport-failure"
+    assert "infrastructure_failure" in record["roles"][0]
+
+
+def test_garbled_model_output_still_counts_as_a_malformed_answer(monkeypatch):
+    """The guard must not swallow genuinely bad MODEL answers."""
+    _stub_run(monkeypatch, comparator_config_hash="cc")
+    api = FakeApi([WORK])
+    record = _drive(
+        monkeypatch,
+        api=api,
+        output="I am unable to provide that analysis right now.",
+        preflight_result=None,
+    )
+
+    assert len(api.sent) == 1
+    assert api.sent[0]["outcome"] == "malformed"
+    assert record["roles"][0]["outcome"] == "malformed"
+
+
 def test_mcp_client_close_reaps_its_child(tmp_path):
     """A surviving MCP child keeps the systemd cgroup alive and skips ticks.
 

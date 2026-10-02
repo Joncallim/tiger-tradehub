@@ -591,6 +591,56 @@ def _harness_owned_error(error: str) -> bool:
     return any(field in error for field in HARNESS_OWNED_FIELDS)
 
 
+#: Markers that mean the RUNNER or its PROVIDER failed, not that the model answered
+#: badly. Live case (2026-10-01): the CheaperInference route returned
+#: "HTTP 400: Request is missing x-opencode-session and cannot be routed efficiently"
+#: IN PLACE OF a model answer. The worker read that as a malformed model response and
+#: charged it against the role's bounded attempts, which escalated whole committee
+#: runs to ESCALATE and left the cycle scored 1/40.
+TRANSPORT_MARKERS: tuple[str, ...] = (
+    "x-opencode-session",
+    "cannot be routed",
+    "http 400",
+    "http 401",
+    "http 403",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "unknown provider",
+    "permission denied",
+    "oauth session expired",
+    "connection refused",
+    "econnrefused",
+    "timed out",
+    "rate limit",
+)
+
+
+def transport_failure(output: str) -> str | None:
+    """The reason this runner output is a route/provider failure, else ``None``.
+
+    Deliberately biased towards under-burning: a genuine model answer misread here
+    only delays the run (retried next tick), while a transport failure misread as a
+    malformed answer permanently spends the role's attempt budget.
+    """
+    head = (output or "").strip()[:400]
+    low = head.lower()
+    for marker in TRANSPORT_MARKERS:
+        if marker in low:
+            return f"runner/provider transport failure: {head[:200]}"
+    if not head.startswith("{") and "traceback (most recent call last)" in low:
+        return f"runner crash: {head[:200]}"
+    return None
+
+
+def _invalidate_provider(state: dict[str, Any], provider: str) -> None:
+    """Drop a cached readiness verdict: a transport failure is evidence about the
+    ROUTE, and must never be reused as if it described the route as healthy."""
+    _provider_entry(state, provider).clear()
+
+
 def drive_run(
     *,
     client: ApiClient,
@@ -655,6 +705,7 @@ def drive_run(
         }
         envelope: dict[str, Any] | None = None
         malformed: str | None = None
+        infrastructure: str | None = None
         calls_made = 0
         for correction in range(MAX_CORRECTIONS_PER_ROLE + 1):
             if budget.exhausted():
@@ -665,8 +716,18 @@ def drive_run(
             try:
                 output = run_model(route, brief)
             except WorkerContractError as exc:
-                role_record["runner_error"] = str(exc)[:300]
-                malformed = f"runner failure: {exc}"
+                infrastructure = f"runner failure: {exc}"[:300]
+                role_record["infrastructure_failure"] = infrastructure
+                _invalidate_provider(state, route.provider)
+                break
+            transport = transport_failure(output)
+            if transport is not None:
+                # NOT model output: burn nothing, leave the work pending, and force a
+                # fresh readiness probe so the batch stops on the next tick too.
+                infrastructure = transport
+                role_record["infrastructure_failure"] = transport
+                role_record["raw_excerpt"] = output[-DIAGNOSTIC_EXCERPT_CHARS:]
+                _invalidate_provider(state, route.provider)
                 break
             try:
                 judgement = parse_model_output(output)
@@ -715,6 +776,15 @@ def drive_run(
             malformed = f"model output failed validation after corrections: {error}"
             role_record["malformed_reason"] = malformed
         role_record["model_calls"] = calls_made
+        if infrastructure is not None:
+            # A route/provider failure leaves the work PENDING: no envelope is sent and
+            # no committee attempt is spent, so the run stays actionable until the
+            # route returns.
+            role_record["stopped"] = "provider-transport-failure"
+            record["roles"].append(role_record)
+            record["stopped"] = "provider-transport-failure"
+            record["provider_reason"] = infrastructure
+            break
         if envelope is None:
             if malformed is not None:
                 excerpt = str(role_record.get("raw_excerpt") or "")
