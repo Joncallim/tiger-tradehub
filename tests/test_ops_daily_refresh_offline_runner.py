@@ -428,4 +428,3 @@ def test_interrupted_same_session_rerun_invalidates_prior_deferrals_and_recovers
     assert adapter.fetches == ["A", "B", "B"]
     assert recovered["rotation_refreshed"] == 1
     assert store.run(AS_OF.isoformat())["status"] == refresh_runs.COMPLETED
-
