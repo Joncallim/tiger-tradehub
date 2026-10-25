@@ -128,7 +128,12 @@ def _settings(tmp_path):
     )
 
 
-def _seed(paths, tickers: list[str], *, active: set[str] | None = None) -> ExperimentDB:
+def _seed(
+    paths,
+    tickers: list[str],
+    *,
+    active: set[str] | None = None,
+) -> ExperimentDB:
     """Seed real migrated schema, including the production screen join used by active selection."""
     active = active or set()
     database = ResearchDB(paths.research_db, 5000)
@@ -142,7 +147,17 @@ def _seed(paths, tickers: list[str], *, active: set[str] | None = None) -> Exper
             sid = f"security-{ticker}"
             conn.execute(
                 "INSERT INTO security VALUES (?,?,?,?,?,?,?,?,?)",
-                (sid, ticker, "US", ticker, None, None, "SUPPORTED", "2026-01-01T00:00:00Z", None),
+                (
+                    sid,
+                    ticker,
+                    "US",
+                    ticker,
+                    None,
+                    None,
+                    "SUPPORTED",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                ),
             )
             conn.execute(
                 "INSERT INTO universe_membership "
@@ -168,7 +183,14 @@ def _seed(paths, tickers: list[str], *, active: set[str] | None = None) -> Exper
         if active:
             conn.execute(
                 "INSERT INTO screen_definition VALUES (?,?,?,?,?,?)",
-                ("active-config", "quality", "offline-active", 1, "{}", utc_now()),
+                (
+                    "active-config",
+                    "quality",
+                    "offline-active",
+                    1,
+                    "{}",
+                    utc_now(),
+                ),
             )
             conn.execute(
                 "INSERT INTO pipeline_run "
@@ -218,7 +240,10 @@ def _seed(paths, tickers: list[str], *, active: set[str] | None = None) -> Exper
         store.insert(
             security_id=f"security-{ticker}",
             source_id="tiingo_eod",
-            structured_fields={"record_type": "price_bar", "session_date": "2026-10-01"},
+            structured_fields={
+                "record_type": "price_bar",
+                "session_date": "2026-10-01",
+            },
             extraction_confidence=1.0,
             event_time="2026-10-01T00:00:00Z",
             public_available_time="2026-10-02T00:15:00Z",
@@ -260,7 +285,12 @@ def test_active_security_ids_are_mapped_back_to_tickers_before_the_real_runner_f
 ):
     """Fails on the source baseline: ``{'security-ACT'} & {'ACT'}`` is empty."""
     summary, adapter, _paths_value, _experiment_db = _run(
-        monkeypatch, tmp_path, ["ACT"], active={"ACT"}, active_max=1, rotation_budget=0
+        monkeypatch,
+        tmp_path,
+        ["ACT"],
+        active={"ACT"},
+        active_max=1,
+        rotation_budget=0,
     )
     assert adapter.fetches == ["ACT"]
     assert summary["active_refreshed"] == 1
@@ -272,7 +302,10 @@ def test_fresh_active_candidate_is_skipped_without_a_provider_fetch(tmp_path, mo
     EvidenceStore(ResearchDB(paths.research_db)).insert(
         security_id="security-FRESH",
         source_id="tiingo_eod",
-        structured_fields={"record_type": "price_bar", "session_date": AS_OF.isoformat()},
+        structured_fields={
+            "record_type": "price_bar",
+            "session_date": AS_OF.isoformat(),
+        },
         extraction_confidence=1.0,
         event_time=f"{AS_OF}T00:00:00Z",
         public_available_time="2026-10-24T00:15:00Z",
@@ -294,7 +327,12 @@ def test_fresh_active_candidate_is_skipped_without_a_provider_fetch(tmp_path, mo
 
 def test_active_rotation_overlap_is_fetched_once(tmp_path, monkeypatch):
     _summary, adapter, _paths_value, _experiment_db = _run(
-        monkeypatch, tmp_path, ["OVERLAP"], active={"OVERLAP"}, active_max=1, rotation_budget=1
+        monkeypatch,
+        tmp_path,
+        ["OVERLAP"],
+        active={"OVERLAP"},
+        active_max=1,
+        rotation_budget=1,
     )
     assert adapter.fetches == ["OVERLAP"]
 
@@ -355,7 +393,11 @@ def test_interrupted_same_session_rerun_invalidates_prior_deferrals_and_recovers
     tmp_path, monkeypatch
 ):
     _summary, adapter, paths, experiment_db = _run(
-        monkeypatch, tmp_path, ["A", "B"], active_max=0, rotation_budget=1
+        monkeypatch,
+        tmp_path,
+        ["A", "B"],
+        active_max=0,
+        rotation_budget=1,
     )
     assert adapter.fetches == ["A"]
     adapter.crash_on.add("B")
