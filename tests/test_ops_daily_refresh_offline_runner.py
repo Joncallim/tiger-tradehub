@@ -71,7 +71,7 @@ class FakeTiingoAdapter:
                     "low": 9.0,
                     "close": 10.5,
                     "volume": 100,
-                }
+                },
             ]
         ).encode()
         return FetchResult(
@@ -111,7 +111,7 @@ class FakeTiingoAdapter:
                     "session_date": AS_OF.isoformat(),
                     "close": 10.5,
                 },
-            )
+            ),
         ]
 
 
