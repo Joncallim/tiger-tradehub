@@ -34,7 +34,9 @@ def test_signal_input_supersession_is_pit_partitioned_and_zero_does_not_sell(tmp
         )
     store = SnapshotStore(database)
 
-    known_a = evaluate(_input(security_id="security-a", evidence_cutoff="2025-06-03T01:00:00Z"))
+    known_a = evaluate(
+        _input(security_id="security-a", evidence_cutoff="2025-06-03T01:00:00Z")
+    )
     unknown_a = evaluate(
         _input(
             security_id="security-a",
@@ -59,10 +61,14 @@ def test_signal_input_supersession_is_pit_partitioned_and_zero_does_not_sell(tmp
     for result in (known_a, unknown_a, zero_b, future):
         store.save_signal_input(result.to_signal_input(), recorded_at=result.as_of)
 
-    signals = load_persisted_signal_inputs(database, decision_as_of="2025-06-05T00:00:00Z")
+    signals = load_persisted_signal_inputs(
+        database,
+        decision_as_of="2025-06-05T00:00:00Z",
+    )
     by_security = {signal.security_id: signal for signal in signals}
     assert set(by_security) == {"security-a", "security-b"}
-    assert by_security["security-a"].opportunity_status.value == "UNKNOWN"  # newer UNKNOWN wins
+    # Newer UNKNOWN wins.
+    assert by_security["security-a"].opportunity_status.value == "UNKNOWN"
     assert by_security["security-b"].remaining_opportunity_ppm == 0
     assert by_security["security-b"].source_kind.value == "DETERMINISTIC_METRIC"
 

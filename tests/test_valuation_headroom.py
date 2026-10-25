@@ -47,17 +47,29 @@ def _input(**updates) -> HeadroomInput:
 
 
 def test_metric_remains_unregistered_and_inactive():
-    assert all(spec.screen_id != "valuation_screen_headroom" for spec, _ in registered_screens())
+    assert all(
+        spec.screen_id != "valuation_screen_headroom"
+        for spec, _ in registered_screens()
+    )
 
 
 def test_boundary_uses_the_limiting_yield_and_exact_buy_thresholds():
     earnings_limited = evaluate(_input(free_cash_flow_ttm=Decimal("60")))
     fcf_limited = evaluate(_input(net_income_ttm=Decimal("100")))
-    assert (earnings_limited.boundary, fcf_limited.boundary) == (Decimal("1000"), Decimal("1000"))
+    assert (earnings_limited.boundary, fcf_limited.boundary) == (
+        Decimal("1000"),
+        Decimal("1000"),
+    )
 
-    at_threshold = evaluate(_input(price=Decimal("1"), shares_outstanding=Decimal("800")))
-    just_below = evaluate(_input(price=Decimal("800.001"), shares_outstanding=Decimal("1")))
-    at_or_above_boundary = evaluate(_input(price=Decimal("1000"), shares_outstanding=Decimal("1")))
+    at_threshold = evaluate(
+        _input(price=Decimal("1"), shares_outstanding=Decimal("800"))
+    )
+    just_below = evaluate(
+        _input(price=Decimal("800.001"), shares_outstanding=Decimal("1"))
+    )
+    at_or_above_boundary = evaluate(
+        _input(price=Decimal("1000"), shares_outstanding=Decimal("1"))
+    )
     assert at_threshold.remaining_opportunity_ppm == 200_000
     assert just_below.remaining_opportunity_ppm == 199_999
     assert at_or_above_boundary.remaining_opportunity_ppm == 0
@@ -74,7 +86,9 @@ def test_same_day_pit_and_quarterly_filing_age_are_explicit():
     quarterly = evaluate(
         _input(net_income_lineage=_evidence("net-income", "2025-03-05T16:00:00Z"))
     )
-    stale = evaluate(_input(net_income_lineage=_evidence("net-income", "2025-01-03T16:00:00Z")))
+    stale = evaluate(
+        _input(net_income_lineage=_evidence("net-income", "2025-01-03T16:00:00Z"))
+    )
     stale_price = evaluate(
         _input(expected_price_session="2025-05-20", price_session="2025-05-20")
     )
@@ -91,7 +105,9 @@ def test_invalid_metadata_and_operands_are_unknown_not_a_fake_zero():
     )
     malformed_price_metadata = evaluate(_input(price_lineage={}))
     naive_cutoff = evaluate(_input(evidence_cutoff="2025-06-03T01:00:00"))
-    naive_pat = evaluate(_input(price_lineage=_evidence("price", "2025-06-03T00:20:00")))
+    naive_pat = evaluate(
+        _input(price_lineage=_evidence("price", "2025-06-03T00:20:00"))
+    )
     future_currency = evaluate(
         _input(currency_lineage=_evidence("currency", "2025-06-03T02:00:00Z"))
     )
@@ -115,9 +131,13 @@ def test_raw_identity_changes_and_replay_is_deterministic():
     changed = evaluate(
         replace(
             original,
-            price_lineage=replace(original.price_lineage, content_hash="hash:revised-price"),
+            price_lineage=replace(
+                original.price_lineage,
+                content_hash="hash:revised-price",
+            ),
         )
     )
     assert replay == evaluate(original)
     assert replay.raw_evidence_identity != changed.raw_evidence_identity
-    assert replay.evidence_ids == changed.evidence_ids  # identity is not inferred from IDs alone
+    # Identity is not inferred from IDs alone.
+    assert replay.evidence_ids == changed.evidence_ids
