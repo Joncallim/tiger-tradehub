@@ -122,8 +122,9 @@ def _settings(tmp_path):
     )
 
 
-def _seed(paths, tickers: list[str], *, active: set[str] = set()) -> ExperimentDB:
+def _seed(paths, tickers: list[str], *, active: set[str] | None = None) -> ExperimentDB:
     """Seed real migrated schema, including the production screen join used by active selection."""
+    active = active or set()
     database = ResearchDB(paths.research_db, 5000)
     database.migrate()
     with database.connect() as conn:
@@ -223,7 +224,7 @@ def _seed(paths, tickers: list[str], *, active: set[str] = set()) -> ExperimentD
     return experiment_db
 
 
-def _run(monkeypatch, tmp_path, tickers, *, active=set(), quota=None, **kwargs):
+def _run(monkeypatch, tmp_path, tickers, *, active=None, quota=None, **kwargs):
     paths = _paths(tmp_path)
     experiment_db = _seed(paths, tickers, active=active)
     adapter = FakeTiingoAdapter(quota or FakeQuota())
@@ -344,7 +345,9 @@ def test_capacity_exhaustion_defers_without_a_provider_fetch(tmp_path, monkeypat
     )
 
 
-def test_interrupted_same_session_rerun_invalidates_prior_deferrals(tmp_path, monkeypatch):
+def test_interrupted_same_session_rerun_invalidates_prior_deferrals_and_recovers(
+    tmp_path, monkeypatch
+):
     _summary, adapter, paths, experiment_db = _run(
         monkeypatch, tmp_path, ["A", "B"], active_max=0, rotation_budget=1
     )
@@ -362,4 +365,19 @@ def test_interrupted_same_session_rerun_invalidates_prior_deferrals(tmp_path, mo
     store = refresh_runs.store_for(paths)
     assert store.run(AS_OF.isoformat())["status"] == refresh_runs.RUNNING
     assert store.completed_deferrals(AS_OF.isoformat()) == {}
+
+    # A later clean invocation owns the same session and offers the stale work
+    # again. The old completed deferral cannot poison this recovery run.
+    adapter.crash_on.remove("B")
+    recovered = dr.run_daily_refresh(
+        settings=_settings(tmp_path),
+        experiment_db=experiment_db,
+        paths=paths,
+        as_of=AS_OF,
+        active_max=0,
+        rotation_budget=1,
+    )
+    assert adapter.fetches == ["A", "B", "B"]
+    assert recovered["rotation_refreshed"] == 1
+    assert store.run(AS_OF.isoformat())["status"] == refresh_runs.COMPLETED
 
