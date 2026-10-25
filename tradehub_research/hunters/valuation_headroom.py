@@ -155,7 +155,9 @@ def _raw_identity(value: HeadroomInput) -> str:
         "shares": _identity_dict(value.shares_lineage),
         "currency_lineage": _identity_dict(value.currency_lineage),
         "split_coverage": _identity_dict(None if split is None else split.coverage),
-        "split_actions": [] if split is None else [_identity_dict(item) for item in split.actions],
+        "split_actions": (
+            [] if split is None else [_identity_dict(item) for item in split.actions]
+        ),
         "split_factor": None if split is None else str(split.cumulative_factor),
     }
     return _hash(material)

@@ -71,7 +71,9 @@ def test_same_day_pit_and_quarterly_filing_age_are_explicit():
             price_lineage=_evidence("price", "2025-06-03T00:15:00Z"),
         )
     )
-    quarterly = evaluate(_input(net_income_lineage=_evidence("net-income", "2025-03-05T16:00:00Z")))
+    quarterly = evaluate(
+        _input(net_income_lineage=_evidence("net-income", "2025-03-05T16:00:00Z"))
+    )
     stale = evaluate(_input(net_income_lineage=_evidence("net-income", "2025-01-03T16:00:00Z")))
     stale_price = evaluate(
         _input(expected_price_session="2025-05-20", price_session="2025-05-20")
