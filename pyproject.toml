@@ -33,10 +33,12 @@ telegram = ["python-telegram-bot>=21.4"]
 dev = [
   "build>=1.2.0",
   "mcp>=1.2,<2.0",
-  "pip-audit>=2.7.0",
   "pytest>=8.2.0",
   "ruff==0.15.17",
   "setuptools>=83.0.0",
+]
+audit = [
+  "pip-audit>=2.7.0; python_version >= '3.11'",
 ]
 
 [project.urls]
