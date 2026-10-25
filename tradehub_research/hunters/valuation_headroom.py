@@ -8,12 +8,12 @@ input for review; it is neither a fair-value estimate nor a sell signal.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
 from tradehub_research.db import normalize_ts
-from tradehub_research.hunters.common import parse_ts, session_close_utc
+from tradehub_research.hunters.common import session_close_utc, trading_days_since
 from tradehub_research.hunters.valuation import SCREEN_SPEC as VALUATION_SCREEN_SPEC
 from tradehub_research.portfolio.snapshot import SignalInput, build_signal_input
 from tradehub_research.screens import canonical_json
@@ -24,6 +24,9 @@ EARNINGS_YIELD_FLOOR = Decimal("0.05")
 FCF_YIELD_FLOOR = Decimal("0.03")
 PPM = Decimal("1000000")
 MAX_FUNDAMENTAL_AGE_DAYS = int(VALUATION_SCREEN_SPEC.parameters["max_filing_age_days"])
+MAX_PRICE_BAR_AGE_TRADING_DAYS = int(
+    VALUATION_SCREEN_SPEC.parameters["max_price_bar_age_trading_days"]
+)
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,7 @@ def _config_material() -> dict[str, Any]:
         "earnings_yield_floor": str(EARNINGS_YIELD_FLOOR),
         "fcf_yield_floor": str(FCF_YIELD_FLOOR),
         "max_fundamental_age_days": MAX_FUNDAMENTAL_AGE_DAYS,
+        "max_price_bar_age_trading_days": MAX_PRICE_BAR_AGE_TRADING_DAYS,
         "currency": "USD",
         "price_session_rule": "expected session, 20:15 America/New_York cutoff",
     }
@@ -165,10 +169,13 @@ def _parse_aware(value: str | None) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        parsed = parse_ts(value)
+        candidate = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(candidate)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def _valid_identity(value: Any, cutoff: datetime) -> bool:
@@ -253,6 +260,8 @@ def evaluate(value: HeadroomInput) -> HeadroomResult:
         reasons.append("price_session_mismatch")
     if cutoff < session_close_utc(expected_session):
         reasons.append("price_session_not_published")
+    if trading_days_since(actual_session, cutoff) > MAX_PRICE_BAR_AGE_TRADING_DAYS:
+        reasons.append("stale_price_bar")
     if value.currency != "USD":
         reasons.append("unsupported_currency")
     split = value.split_lineage if isinstance(value.split_lineage, SplitLineage) else None

@@ -73,11 +73,13 @@ def test_same_day_pit_and_quarterly_filing_age_are_explicit():
     )
     quarterly = evaluate(_input(net_income_lineage=_evidence("net-income", "2025-03-05T16:00:00Z")))
     stale = evaluate(_input(net_income_lineage=_evidence("net-income", "2025-01-03T16:00:00Z")))
-    stale_price = evaluate(_input(price_session="2025-05-30"))
+    stale_price = evaluate(
+        _input(expected_price_session="2025-05-20", price_session="2025-05-20")
+    )
     assert same_day.status == quarterly.status == "KNOWN"
     assert (stale.status, stale.reason_codes) == ("UNKNOWN", ("stale_fundamentals",))
     assert stale_price.status == "UNKNOWN"
-    assert "price_session_mismatch" in stale_price.reason_codes
+    assert "stale_price_bar" in stale_price.reason_codes
 
 
 def test_invalid_metadata_and_operands_are_unknown_not_a_fake_zero():
@@ -86,6 +88,8 @@ def test_invalid_metadata_and_operands_are_unknown_not_a_fake_zero():
         _input(split_lineage=SplitLineage(None, (), Decimal("1")))
     )
     malformed_price_metadata = evaluate(_input(price_lineage={}))
+    naive_cutoff = evaluate(_input(evidence_cutoff="2025-06-03T01:00:00"))
+    naive_pat = evaluate(_input(price_lineage=_evidence("price", "2025-06-03T00:20:00")))
     future_currency = evaluate(
         _input(currency_lineage=_evidence("currency", "2025-06-03T02:00:00Z"))
     )
@@ -94,6 +98,8 @@ def test_invalid_metadata_and_operands_are_unknown_not_a_fake_zero():
         invalid_operand,
         missing_split_coverage,
         malformed_price_metadata,
+        naive_cutoff,
+        naive_pat,
         future_currency,
         wrong_currency,
     ):
