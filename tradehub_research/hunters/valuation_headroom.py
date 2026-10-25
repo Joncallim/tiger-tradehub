@@ -138,11 +138,7 @@ CONFIG_HASH = _hash(_config_material())
 
 
 def _raw_identity(value: HeadroomInput) -> str:
-    split = (
-        value.split_lineage
-        if isinstance(value.split_lineage, SplitLineage)
-        else None
-    )
+    split = value.split_lineage if isinstance(value.split_lineage, SplitLineage) else None
     material = {
         "security_id": value.security_id,
         "evidence_cutoff": value.evidence_cutoff,
@@ -270,11 +266,7 @@ def evaluate(value: HeadroomInput) -> HeadroomResult:
         reasons.append("stale_price_bar")
     if value.currency != "USD":
         reasons.append("unsupported_currency")
-    split = (
-        value.split_lineage
-        if isinstance(value.split_lineage, SplitLineage)
-        else None
-    )
+    split = value.split_lineage if isinstance(value.split_lineage, SplitLineage) else None
     if not all(
         _positive_finite(item)
         for item in (
@@ -297,16 +289,12 @@ def evaluate(value: HeadroomInput) -> HeadroomResult:
     )
     if not all(_valid_identity(item, cutoff) for item in identities):
         reasons.append("incomplete_or_future_lineage")
-    if split is None or not all(
-        _valid_identity(item, cutoff) for item in split.actions
-    ):
+    if split is None or not all(_valid_identity(item, cutoff) for item in split.actions):
         reasons.append("incomplete_or_future_lineage")
 
     for fact in (value.net_income_lineage, value.free_cash_flow_lineage):
         published = (
-            _parse_aware(fact.public_available_time)
-            if isinstance(fact, EvidenceIdentity)
-            else None
+            _parse_aware(fact.public_available_time) if isinstance(fact, EvidenceIdentity) else None
         )
         if (
             published is not None

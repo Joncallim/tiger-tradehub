@@ -34,9 +34,7 @@ def test_signal_input_supersession_is_pit_partitioned_and_zero_does_not_sell(tmp
         )
     store = SnapshotStore(database)
 
-    known_a = evaluate(
-        _input(security_id="security-a", evidence_cutoff="2025-06-03T01:00:00Z")
-    )
+    known_a = evaluate(_input(security_id="security-a", evidence_cutoff="2025-06-03T01:00:00Z"))
     unknown_a = evaluate(
         _input(
             security_id="security-a",
@@ -121,7 +119,7 @@ def test_signal_input_supersession_is_pit_partitioned_and_zero_does_not_sell(tmp
             pipeline_run_id="zero-run",
             security_id="security-b",
             run_as_of=second_as_of,
-            suffix="zero",
+            committee_suffix="zero",
         )
     second = engine.run(
         pipeline_run_id="zero-run",
@@ -134,10 +132,9 @@ def test_signal_input_supersession_is_pit_partitioned_and_zero_does_not_sell(tmp
     assert (second.transition_count, second.proposal_count) == (0, 0)
     with database.connect(read_only=True) as db:
         state = db.execute(
-            "SELECT state FROM portfolio_state WHERE security_id='security-b'"
-        ).fetchone()["state"]
-        exits = db.execute(
-            "SELECT count(*) FROM trade_proposal WHERE action='SELL'"
-        ).fetchone()[0]
+            "SELECT to_state FROM portfolio_state_transition "
+            "WHERE security_id='security-b' ORDER BY effective_at DESC, transition_id DESC LIMIT 1"
+        ).fetchone()["to_state"]
+        exits = db.execute("SELECT count(*) FROM trade_proposal WHERE action='SELL'").fetchone()[0]
     assert state == "WATCH"
     assert exits == 0
