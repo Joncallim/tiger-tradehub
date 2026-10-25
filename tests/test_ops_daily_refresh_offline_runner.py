@@ -24,6 +24,12 @@ from tradehub_research.validation.experiment_db import ExperimentDB
 AS_OF = date(2026, 10, 23)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_retirement_state(tmp_path, monkeypatch):
+    """Never let an offline runner test read the host retirement ledger."""
+    monkeypatch.setattr(dr, "RETIRED_FILE", tmp_path / "retired_securities.json")
+
+
 class FakeQuota:
     """Read-only capacity view for the runner's real capacity planner."""
 
