@@ -540,14 +540,14 @@ class TestHealthReportShape:
                 {"active": 0},
             )
         )
-        assert text.startswith("TRADEHUB WATCH — AUTO-RECOVERED")
+        assert text.startswith("TRADEHUB WATCH — FRESHNESS WINDOW RECOVERED")
         assert "Expected session: 2026-09-18" in text
         assert "Stale before remediation: 1" in text
         assert "Repaired this run: 1" in text
         assert "Excluded legitimate exceptions: 2" in text
         assert "Stale after remediation: 0" in text
         assert "Quarantined after remediation: 0" in text
-        assert "Downstream signals: healthy" in text
+        assert "Downstream signals: NOT EVALUATED" in text and "healthy" not in text.lower()
         assert "NEEDS ATTENTION" not in text
         assert "Unresolved examples" not in text
         assert "REPORT INTEGRITY ERROR" not in text

@@ -260,7 +260,7 @@ class TestReconciledReport:
         after = _audit(fresh=6, stale=[])
         lines = render_freshness_report(audit, after, _summary(repaired=1), {"active": 0})
         text = "\n".join(lines)
-        assert text.startswith("TRADEHUB WATCH — AUTO-RECOVERED")
+        assert text.startswith("TRADEHUB WATCH — FRESHNESS WINDOW RECOVERED")
         assert "Universe total:" in text and "Eligible:" in text
         assert "Stale after remediation: 0" in text
         assert "Quarantined after remediation: 0" in text

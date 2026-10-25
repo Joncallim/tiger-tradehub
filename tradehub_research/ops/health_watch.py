@@ -341,24 +341,76 @@ def _reconcile_problems(rec: dict) -> list[str]:
 
 
 def render_freshness_report(audit, after, summary, residual, capacity=None) -> list[str]:
-    """The operator-facing report. Pure: no I/O, so its shape is testable.
-
-    Every count is named for exactly one thing and the arithmetic reconciles, so
-    the report reads as a fleet snapshot rather than a set of unrelated numbers.
-    If the counts do not reconcile -- or the quarantine does not match the stale
-    set -- the report says so loudly instead of rendering a plausible-looking
-    summary.
-    """
+    """The operator-facing report. Pure: no I/O, so its shape is testable."""
     if not audit.stale:
         return []  # no incident at all: the watch stays silent
 
     rec = reconciliation(audit, after, summary)
-    rec["quarantined_after"] = residual.get("active", after.stale_count)
-    problems = _reconcile_problems(rec) + list(audit.invariant_errors())
+    residual = residual if isinstance(residual, dict) else {}
+    active = residual.get("active")
+    quarantine_unverified = active is None
+    rec["quarantined_after"] = after.stale_count if quarantine_unverified else int(active)
+    problems = (
+        _reconcile_problems(rec) + list(audit.invariant_errors()) + list(after.invariant_errors())
+    )
+    quarantine_line = (
+        "Quarantined after remediation: unverified (no residual count supplied)"
+        if quarantine_unverified
+        else f"Quarantined after remediation: {rec['quarantined_after']:,}"
+    )
+
+    def _operational_warnings() -> list[str]:
+        """Warnings that stand regardless of reconciliation integrity."""
+        out: list[str] = []
+        if summary.get("repair_ledger_unrecorded"):
+            out.append(
+                f"{summary['repair_ledger_unrecorded']:,} repair(s) could not be recorded in the "
+                "attempt ledger; the failure-streak reader trusts that ledger, so those symbols "
+                "may keep reading as failing until it is writable"
+            )
+        if rec["quota_blocked"]:
+            out.append("remediation paused on the provider quota reserve (resumes next cycle)")
+        if rec["time_budget_exhausted"]:
+            out.append("remediation hit its time budget (resumes next cycle)")
+        if capacity:
+            out.append(
+                f"rolling-month symbol capacity: {capacity.get('used', 0):,}/"
+                f"{capacity.get('limit', 0):,} distinct symbols reserved "
+                f"(headroom {capacity.get('headroom', 0):,})"
+            )
+            if capacity.get("at_capacity"):
+                out.append("rolling-month capacity reached; new symbols cannot be admitted")
+            if capacity.get("deferred"):
+                out.append(f"{capacity['deferred']:,} new symbols could not be admitted")
+        return out
+
+    warnings = _operational_warnings()
+
+    if problems and not after.stale:
+        # Never claim recovery when the counts do not reconcile, and never drop
+        # operational warnings because the arithmetic failed.
+        integrity = [
+            "TRADEHUB WATCH — FRESHNESS REPORT (RECONCILIATION INTEGRITY ERROR)",
+            f"Expected session: {audit.expected_session}",
+            "Recovery not claimed: the reported counts do not reconcile.",
+        ]
+        integrity.append("REPORT INTEGRITY ERROR (counts do not reconcile):")
+        integrity += [f"  - {p}" for p in problems]
+        integrity += [
+            f"At expected session (observed): {rec['at_expected_after']:,}",
+            f"Within rolling window only: {rec['within_rolling_window_after']:,}",
+            f"Stale after remediation: {rec['stale_after']:,}",
+            quarantine_line,
+        ]
+        if warnings:
+            integrity.append("")
+            integrity.append("Operational warnings still in force:")
+            integrity += [f"  - {w}" for w in warnings]
+        return integrity
 
     if not after.stale:
         lines = [
-            "TRADEHUB WATCH — AUTO-RECOVERED",
+            "TRADEHUB WATCH — FRESHNESS WINDOW RECOVERED",
             f"Expected session: {audit.expected_session}",
             f"Universe total: {rec['universe_total']:,}",
             f"Excluded legitimate exceptions: {rec['excluded_exceptions']:,}",
@@ -369,21 +421,13 @@ def render_freshness_report(audit, after, summary, residual, capacity=None) -> l
             f"Newly classified exceptions: {rec['newly_classified_exceptions']:,}",
             f"Fresh after remediation: {rec['fresh_after']:,}",
             "Stale after remediation: 0",
-            "Quarantined after remediation: 0",
-            "Downstream signals: healthy",
+            quarantine_line,
+            f"  at expected session ({audit.expected_session}): {rec['at_expected_after']:,}",
+            f"  within rolling window only: {rec['within_rolling_window_after']:,}",
+            "Downstream signals: NOT EVALUATED by this watch "
+            "(scoring, proposals and maturation are separate gates)",
         ]
-        if summary.get("repair_ledger_unrecorded"):
-            # Disclosed even on the happy path: the recovery is real but its
-            # evidence is not, and the failure-streak reader trusts that ledger.
-            lines.append(
-                f"{summary['repair_ledger_unrecorded']:,} repair(s) could not be recorded in the "
-                "attempt ledger; the failure-streak reader trusts that ledger, so those symbols "
-                "may keep reading as failing until it is writable"
-            )
-        if problems:
-            lines.append("")
-            lines.append("REPORT INTEGRITY ERROR (counts do not reconcile):")
-            lines.extend(f"- {p}" for p in problems)
+        lines.extend(warnings)
         return lines
 
     lines = [
