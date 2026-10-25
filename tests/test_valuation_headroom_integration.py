@@ -17,8 +17,7 @@ from tradehub_research.ops.decision_pipeline import load_persisted_signal_inputs
 from tradehub_research.portfolio.engine import PortfolioEngine
 from tradehub_research.portfolio.fixtures import fixture_policy
 from tradehub_research.portfolio.policy import PolicyRegistry
-from tradehub_research.portfolio.snapshot import SnapshotStore
-from tradehub_research.portfolio.snapshot import build_snapshot
+from tradehub_research.portfolio.snapshot import SnapshotStore, build_snapshot
 
 
 def test_signal_input_supersession_is_pit_partitioned_and_zero_does_not_sell(tmp_path):
