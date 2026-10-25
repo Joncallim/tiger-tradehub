@@ -19,7 +19,7 @@ from tradehub_research.portfolio.snapshot import SignalInput, build_signal_input
 from tradehub_research.screens import canonical_json
 
 METHOD_ID = "valuation-screen-headroom"
-METHOD_VERSION = 1
+METHOD_VERSION = 2
 EARNINGS_YIELD_FLOOR = Decimal("0.05")
 FCF_YIELD_FLOOR = Decimal("0.03")
 PPM = Decimal("1000000")
@@ -65,7 +65,8 @@ class HeadroomInput:
     shares_outstanding: Decimal | None
     currency: str | None
     net_income_lineage: EvidenceIdentity | None
-    free_cash_flow_lineage: EvidenceIdentity | None
+    operating_cash_flow_lineage: EvidenceIdentity | None
+    capex_lineage: EvidenceIdentity | None
     price_lineage: EvidenceIdentity | None
     shares_lineage: EvidenceIdentity | None
     split_lineage: SplitLineage | None
@@ -150,7 +151,8 @@ def _raw_identity(value: HeadroomInput) -> str:
         "shares_outstanding": str(value.shares_outstanding),
         "currency": value.currency,
         "net_income": _identity_dict(value.net_income_lineage),
-        "free_cash_flow": _identity_dict(value.free_cash_flow_lineage),
+        "operating_cash_flow": _identity_dict(value.operating_cash_flow_lineage),
+        "capex": _identity_dict(value.capex_lineage),
         "price_lineage": _identity_dict(value.price_lineage),
         "shares": _identity_dict(value.shares_lineage),
         "currency_lineage": _identity_dict(value.currency_lineage),
@@ -198,7 +200,8 @@ def _valid_identity(value: Any, cutoff: datetime) -> bool:
 def _evidence_ids(value: HeadroomInput) -> tuple[str, ...]:
     identities = [
         value.net_income_lineage,
-        value.free_cash_flow_lineage,
+        value.operating_cash_flow_lineage,
+        value.capex_lineage,
         value.price_lineage,
         value.shares_lineage,
         value.currency_lineage,
@@ -281,7 +284,8 @@ def evaluate(value: HeadroomInput) -> HeadroomResult:
 
     identities = (
         value.net_income_lineage,
-        value.free_cash_flow_lineage,
+        value.operating_cash_flow_lineage,
+        value.capex_lineage,
         value.price_lineage,
         value.shares_lineage,
         value.currency_lineage,
@@ -292,7 +296,11 @@ def evaluate(value: HeadroomInput) -> HeadroomResult:
     if split is None or not all(_valid_identity(item, cutoff) for item in split.actions):
         reasons.append("incomplete_or_future_lineage")
 
-    for fact in (value.net_income_lineage, value.free_cash_flow_lineage):
+    for fact in (
+        value.net_income_lineage,
+        value.operating_cash_flow_lineage,
+        value.capex_lineage,
+    ):
         published = (
             _parse_aware(fact.public_available_time) if isinstance(fact, EvidenceIdentity) else None
         )
