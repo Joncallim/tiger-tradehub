@@ -118,7 +118,7 @@ class TestDurableRotationTotals:
         monkeypatch.setattr(dr, "symbol_has_evidence", lambda _db, ticker: True)
         monkeypatch.setattr(dr, "_load_retired", set)
         monkeypatch.setattr(
-            dr, "_active_securities", lambda _db, days=14: {"ACT"} if active else set()
+            dr, "_active_securities", lambda _db, days=14: {"S-ACT"} if active else set()
         )
         monkeypatch.setattr(dr, "attempt_failure_state", lambda _db, tickers: {})
 
