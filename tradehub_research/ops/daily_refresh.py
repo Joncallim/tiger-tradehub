@@ -612,9 +612,10 @@ def run_daily_refresh(
     )
     try:
         # 1. Active set first: securities with recent production screens.
-        active = _active_securities(research_db) & set(by_ticker)
+        active_ids = _active_securities(research_db)
+        active = {ticker: sid for ticker, sid in by_ticker.items() if sid in active_ids}
         for ticker in sorted(active)[:active_max]:
-            sid = by_ticker[ticker]
+            sid = active[ticker]
             if not _needs_fresh(research_db, sid, as_of.isoformat()):
                 summary["SKIPPED_FRESH"] += 1
                 continue
