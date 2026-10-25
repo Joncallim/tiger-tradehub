@@ -26,7 +26,7 @@ Offline and deterministic: no network, no live database.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -97,7 +97,7 @@ class TestActiveSetFailuresAreRecordedAsFailed:
         monkeypatch.setattr(dr, "_last_bar_date", lambda _db, sid: bars.get(sid))
         monkeypatch.setattr(dr, "symbol_has_evidence", lambda _db, ticker: True)
         monkeypatch.setattr(dr, "_load_retired", set)
-        monkeypatch.setattr(dr, "_active_securities", lambda _db, days=14: {"ACT"})
+        monkeypatch.setattr(dr, "_active_securities", lambda _db, days=14: {"S-ACT"})
         monkeypatch.setattr(dr, "attempt_failure_state", lambda _db, tickers: {})
 
         attempted: list[str] = []
@@ -175,7 +175,7 @@ class TestRerunInvalidatesThePreviousRecord:
         monkeypatch.setattr(dr, "_last_bar_date", lambda _db, sid: bars.get(sid))
         monkeypatch.setattr(dr, "symbol_has_evidence", lambda _db, ticker: True)
         monkeypatch.setattr(dr, "_load_retired", set)
-        monkeypatch.setattr(dr, "_active_securities", lambda _db, days=14: {"ACT"})
+        monkeypatch.setattr(dr, "_active_securities", lambda _db, days=14: {"S-ACT"})
 
         def boom(*_a, **_k):
             # Mirrors the provider's own refusal (`classify_error` keys on
@@ -364,6 +364,10 @@ class TestRepairsAreRecordedInTheLedger:
     def test_an_unrecorded_failure_would_read_as_cooling(self, tmp_path, monkeypatch):
         """Positive control: the ledger is what the streak reader trusts."""
         experiment_db = _ledger_row(
-            tmp_path, "DEF000", "ERROR", "PROVIDER_ERROR: 503 x", "2026-09-10T00:00:00+00:00"
+            tmp_path,
+            "DEF000",
+            "ERROR",
+            "PROVIDER_ERROR: 503 x",
+            (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
         )
         assert dr.attempt_failure_state(experiment_db, ["DEF000"])["DEF000"]["streak"] == 1

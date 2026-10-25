@@ -55,17 +55,18 @@ class TestFailureState:
     """Durable state is the ledger, so the rotation and the audit cannot disagree."""
 
     def test_consecutive_failures_accumulate_into_a_streak(self, tmp_path):
+        now = datetime.now(timezone.utc)
         db = _ledger(
             tmp_path,
             [
-                ("AAA", "ERROR", "NETWORK: read timeout", "2026-09-17T00:00:00+00:00"),
-                ("AAA", "ERROR", "PROVIDER_ERROR: 500", "2026-09-16T00:00:00+00:00"),
-                ("AAA", "SUCCESS", None, "2026-09-15T00:00:00+00:00"),
+                ("AAA", "ERROR", "NETWORK: read timeout", (now - timedelta(days=1)).isoformat()),
+                ("AAA", "ERROR", "PROVIDER_ERROR: 500", (now - timedelta(days=2)).isoformat()),
+                ("AAA", "SUCCESS", None, (now - timedelta(days=3)).isoformat()),
             ],
         )
         state = dr.attempt_failure_state(db, ["AAA"])
         assert state["AAA"]["streak"] == 2
-        assert state["AAA"]["last_attempt_at"] == "2026-09-17T00:00:00+00:00"
+        assert state["AAA"]["last_attempt_at"] == (now - timedelta(days=1)).isoformat()
 
     def test_a_landing_fetch_resets_the_streak(self, tmp_path):
         db = _ledger(
@@ -83,16 +84,22 @@ class TestFailureState:
         Counting it would turn one quota pause into a fake per-symbol failure
         streak -- and then fairness would hold back symbols that never failed.
         """
+        now = datetime.now(timezone.utc)
         db = _ledger(
             tmp_path,
             [
-                ("AAA", "ERROR", "QUOTA: hourly reserve exhausted", "2026-09-17T00:00:00+00:00"),
-                ("AAA", "ERROR", "PROVIDER_ERROR: 500", "2026-09-16T00:00:00+00:00"),
+                (
+                    "AAA",
+                    "ERROR",
+                    "QUOTA: hourly reserve exhausted",
+                    (now - timedelta(days=1)).isoformat(),
+                ),
+                ("AAA", "ERROR", "PROVIDER_ERROR: 500", (now - timedelta(days=2)).isoformat()),
             ],
         )
         state = dr.attempt_failure_state(db, ["AAA"])
         assert state["AAA"]["streak"] == 1, "only the provider error is a symbol failure"
-        assert state["AAA"]["last_attempt_at"] == "2026-09-17T00:00:00+00:00"
+        assert state["AAA"]["last_attempt_at"] == (now - timedelta(days=1)).isoformat()
 
     def test_skipped_quota_status_is_not_a_symbol_failure(self, tmp_path):
         db = _ledger(tmp_path, [("AAA", "SKIPPED_QUOTA", None, "2026-09-17T00:00:00+00:00")])

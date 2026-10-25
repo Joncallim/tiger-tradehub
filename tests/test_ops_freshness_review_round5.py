@@ -37,7 +37,7 @@ def _run(tmp_path, monkeypatch):
     monkeypatch.setattr(dr, "_last_bar_date", lambda _db, sid: bars.get(sid))
     monkeypatch.setattr(dr, "symbol_has_evidence", lambda _db, ticker: True)
     monkeypatch.setattr(dr, "_load_retired", set)
-    monkeypatch.setattr(dr, "_active_securities", lambda _db, days=14: {"ACT"})
+    monkeypatch.setattr(dr, "_active_securities", lambda _db, days=14: {"S-ACT"})
     monkeypatch.setattr(dr, "attempt_failure_state", lambda _db, tickers: {})
 
     attempted: list[str] = []
