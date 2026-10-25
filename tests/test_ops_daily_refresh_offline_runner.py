@@ -72,7 +72,7 @@ class FakeTiingoAdapter:
                     "close": 10.5,
                     "volume": 100,
                 },
-            ]
+            ],
         ).encode()
         return FetchResult(
             url=f"offline://tiingo/{ticker}",
