@@ -86,6 +86,32 @@ def _fact(
     return next((item for item in matched if item.fields is selected), None)
 
 
+def _shares(records: list[_Record], cutoff: str) -> _Record | None:
+    """Return one PIT-valid, issuer-level DEI share count or fail closed."""
+    candidates = [
+        item
+        for item in records
+        if item.fields.get("record_type") == "xbrl_fact"
+        and item.fields.get("metric") == "shares_outstanding"
+        and item.fields.get("taxonomy") == "dei"
+        and item.fields.get("unit") == "shares"
+        and not item.fields.get("dimensions")
+    ]
+    selected = _fact(candidates, "shares_outstanding", cutoff, instant=True)
+    if selected is None:
+        return None
+    key = (selected.fields.get("period_end"), selected.identity.public_available_time)
+    return (
+        selected
+        if sum(
+            (item.fields.get("period_end"), item.identity.public_available_time) == key
+            for item in candidates
+        )
+        == 1
+        else None
+    )
+
+
 def _unknown_input(
     security_id: str, evidence_cutoff: str, expected_price_session: str
 ) -> HeadroomInput:
@@ -129,8 +155,10 @@ def load_input(
 
     net_income = _fact(records, "net_income", evidence_cutoff)
     operating_cash_flow = _fact(records, "operating_cash_flow", evidence_cutoff)
-    capex = _fact(records, "capex", evidence_cutoff)
-    shares = _fact(records, "shares_outstanding", evidence_cutoff, instant=True)
+    capex = _fact(records, "capex", evidence_cutoff) or _fact(
+        records, "capital_expenditure", evidence_cutoff
+    )
+    shares = _shares(records, evidence_cutoff)
     prices = [
         item
         for item in records
