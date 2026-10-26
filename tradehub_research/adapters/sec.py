@@ -35,12 +35,12 @@ CONCEPT_ALIASES = {
     "assets": ("Assets",),
     "equity": ("StockholdersEquity",),
     "cash": ("CashAndCashEquivalentsAtCarryingValue",),
-    "shares_outstanding": ("EntityCommonStockSharesOutstanding",),
     "basic_eps": ("EarningsPerShareBasic",),
     "long_term_debt_current": ("LongTermDebtCurrent",),
     "short_term_borrowings": ("ShortTermBorrowings",),
     "long_term_debt_noncurrent": ("LongTermDebtNoncurrent",),
 }
+DEI_CONCEPT_ALIASES = {"shares_outstanding": ("EntityCommonStockSharesOutstanding",)}
 _SEC_BUCKET = TokenBucket(2.0)
 
 
@@ -189,65 +189,89 @@ class SecAdapter(NetworkClient):
         cik = str(doc["cik"]).zfill(10)
         acceptance_by_accession = acceptance_by_accession or {}
         records: list[ParsedRecord] = []
-        us_gaap = doc.get("facts", {}).get("us-gaap", {})
-        for metric, aliases in CONCEPT_ALIASES.items():
-            selected = next((tag for tag in aliases if tag in us_gaap), None)
-            if selected is None:  # absence is missingness, not a fabricated zero row
-                continue
-            concept = us_gaap[selected]
-            for unit, facts in concept.get("units", {}).items():
-                for fact in facts:
-                    accession = fact["accn"]
-                    event_time = fact.get("end") or fact.get("filed")
-                    acceptance = acceptance_by_accession.get(accession)
-                    pat = acceptance or _next_day_pat(fact["filed"])
-                    provenance = "source_reported" if acceptance else "derived_from_index"
-                    dimensions = fact.get("dimensions", {})
-                    fields = {
-                        "record_type": "xbrl_fact",
-                        "metric": metric,
-                        "cik": cik,
-                        "taxonomy": "us-gaap",
-                        "tag": selected,
-                        "label": concept.get("label"),
-                        "unit": unit,
-                        "value": fact.get("val"),
-                        "start": fact.get("start"),
-                        "end": fact.get("end"),
-                        "accession": accession,
-                        "form": fact.get("form"),
-                        "fy": fact.get("fy"),
-                        "fp": fact.get("fp"),
-                        "filed": fact.get("filed"),
-                        "frame": fact.get("frame"),
-                        "dimensions": dimensions,
-                        "day_precision": not bool(acceptance),
-                    }
-                    identity = canonical_hash(
-                        [
-                            accession,
-                            "us-gaap",
-                            selected,
-                            unit,
-                            fact.get("start"),
-                            fact.get("end"),
-                            dimensions,
-                            fact.get("val"),
-                        ]
+        taxonomies = (("us-gaap", CONCEPT_ALIASES), ("dei", DEI_CONCEPT_ALIASES))
+        for taxonomy, aliases_by_metric in taxonomies:
+            facts_by_tag = doc.get("facts", {}).get(taxonomy, {})
+            for metric, aliases in aliases_by_metric.items():
+                selected = next((tag for tag in aliases if tag in facts_by_tag), None)
+                if selected is None:  # absence is missingness, not a fabricated zero row
+                    continue
+                concept = facts_by_tag[selected]
+                for unit, facts in concept.get("units", {}).items():
+                    if metric == "shares_outstanding" and unit != "shares":
+                        continue
+                    ambiguous = (
+                        {
+                            (fact.get("end"), fact.get("filed"))
+                            for fact in facts
+                            if sum(
+                                other.get("end") == fact.get("end")
+                                and other.get("filed") == fact.get("filed")
+                                for other in facts
+                            )
+                            > 1
+                        }
+                        if metric == "shares_outstanding"
+                        else set()
                     )
-                    envelope = envelope_from_fetch(
-                        metadata,
-                        source_id="sec_xbrl",
-                        source_record_id=f"{accession}:{identity}",
-                        parser_version=PARSER_VERSION,
-                        event_time=event_time,
-                        public_available_time=pat,
-                        pat_provenance=provenance,
-                        freshness=Freshness(
-                            last_success_at=metadata.retrieved_at, max_source_time_seen=event_time
-                        ),
-                    )
-                    records.append(ParsedRecord(envelope, cik, "cik", fields))
+                    for fact in facts:
+                        if (
+                            metric == "shares_outstanding"
+                            and (fact.get("end"), fact.get("filed")) in ambiguous
+                        ):
+                            continue
+                        accession = fact["accn"]
+                        event_time = fact.get("end") or fact.get("filed")
+                        acceptance = acceptance_by_accession.get(accession)
+                        pat = acceptance or _next_day_pat(fact["filed"])
+                        provenance = "source_reported" if acceptance else "derived_from_index"
+                        dimensions = fact.get("dimensions", {})
+                        fields = {
+                            "record_type": "xbrl_fact",
+                            "metric": metric,
+                            "cik": cik,
+                            "taxonomy": taxonomy,
+                            "tag": selected,
+                            "label": concept.get("label"),
+                            "unit": unit,
+                            "value": fact.get("val"),
+                            "start": fact.get("start"),
+                            "end": fact.get("end"),
+                            "accession": accession,
+                            "form": fact.get("form"),
+                            "fy": fact.get("fy"),
+                            "fp": fact.get("fp"),
+                            "filed": fact.get("filed"),
+                            "frame": fact.get("frame"),
+                            "dimensions": dimensions,
+                            "day_precision": not bool(acceptance),
+                        }
+                        identity = canonical_hash(
+                            [
+                                accession,
+                                taxonomy,
+                                selected,
+                                unit,
+                                fact.get("start"),
+                                fact.get("end"),
+                                dimensions,
+                                fact.get("val"),
+                            ]
+                        )
+                        envelope = envelope_from_fetch(
+                            metadata,
+                            source_id="sec_xbrl",
+                            source_record_id=f"{accession}:{identity}",
+                            parser_version=PARSER_VERSION,
+                            event_time=event_time,
+                            public_available_time=pat,
+                            pat_provenance=provenance,
+                            freshness=Freshness(
+                                last_success_at=metadata.retrieved_at,
+                                max_source_time_seen=event_time,
+                            ),
+                        )
+                        records.append(ParsedRecord(envelope, cik, "cik", fields))
         return records
 
     def parse_submissions(self, raw: bytes, metadata: FetchResult) -> list[ParsedRecord]:

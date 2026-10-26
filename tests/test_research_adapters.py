@@ -52,6 +52,90 @@ def test_sec_companyfacts_curated_accession_aware_and_missing_not_zero(tmp_path)
     assert "assets" not in {r.structured_fields["metric"] for r in rows}
 
 
+def test_sec_companyfacts_uses_dei_cover_shares_without_substituting_gaap_counts(tmp_path):
+    payload = {
+        "cik": 1,
+        "facts": {
+            "us-gaap": {
+                "PaymentsToAcquirePropertyPlantAndEquipment": {
+                    "units": {
+                        "USD": [
+                            {"accn": "a", "filed": "2025-01-01", "end": "2024-12-31", "val": 10}
+                        ]
+                    }
+                },
+                "CommonStockSharesOutstanding": {
+                    "units": {
+                        "shares": [
+                            {"accn": "a", "filed": "2025-01-01", "end": "2024-12-31", "val": 99}
+                        ]
+                    }
+                },
+            },
+            "dei": {
+                "EntityCommonStockSharesOutstanding": {
+                    "units": {
+                        "shares": [
+                            {"accn": "a", "filed": "2025-01-01", "end": "2024-12-31", "val": 100}
+                        ]
+                    }
+                }
+            },
+        },
+    }
+    rows = sec(tmp_path).parse_companyfacts(
+        json.dumps(payload).encode(), fetched("sec_companyfacts.json")
+    )
+    by_metric = {row.structured_fields["metric"]: row.structured_fields for row in rows}
+    assert by_metric["capital_expenditure"]["taxonomy"] == "us-gaap"
+    assert by_metric["shares_outstanding"] == {
+        **by_metric["shares_outstanding"],
+        "taxonomy": "dei",
+        "tag": "EntityCommonStockSharesOutstanding",
+        "unit": "shares",
+        "value": 100,
+        "end": "2024-12-31",
+        "accession": "a",
+    }
+
+
+def test_sec_dei_shares_rejects_nonshare_units_and_same_date_context_ambiguity(tmp_path):
+    payload = {
+        "cik": 1,
+        "facts": {
+            "dei": {
+                "EntityCommonStockSharesOutstanding": {
+                    "units": {
+                        "USD": [
+                            {"accn": "a", "filed": "2025-01-01", "end": "2024-12-31", "val": 1}
+                        ],
+                        "shares": [
+                            {
+                                "accn": "a",
+                                "filed": "2025-01-01",
+                                "end": "2024-12-31",
+                                "val": 10,
+                                "dimensions": {"class": "A"},
+                            },
+                            {
+                                "accn": "a",
+                                "filed": "2025-01-01",
+                                "end": "2024-12-31",
+                                "val": 20,
+                                "dimensions": {"class": "B"},
+                            },
+                        ],
+                    }
+                }
+            }
+        },
+    }
+    rows = sec(tmp_path).parse_companyfacts(
+        json.dumps(payload).encode(), fetched("sec_companyfacts.json")
+    )
+    assert not [row for row in rows if row.structured_fields["metric"] == "shares_outstanding"]
+
+
 def test_form4_raw_xml_and_amendment_supersession(tmp_path):
     meta = fetched("sec_form4.xml")
     row = sec(tmp_path).parse_form4(

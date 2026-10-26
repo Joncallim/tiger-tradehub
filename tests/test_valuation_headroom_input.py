@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from tradehub_research.db import ResearchDB
 from tradehub_research.evidence import EvidenceStore
+from tradehub_research.hunters.valuation_headroom import evaluate
 from tradehub_research.hunters.valuation_headroom_input import evaluate_persisted_input, load_input
 
 
@@ -52,6 +53,11 @@ def _database(tmp_path, *, price="1", include_coverage=True, split_factors=()):
                 # Actual SEC adapter field names, normalized only by the loader.
                 "start": "2024-04-01",
                 "end": "2025-03-31",
+                **(
+                    {"taxonomy": "dei", "unit": "shares", "dimensions": {}}
+                    if metric == "shares_outstanding"
+                    else {}
+                ),
             },
         )
     _insert(
@@ -147,3 +153,30 @@ def test_individually_negative_splits_cannot_cancel_to_a_known_factor(tmp_path):
         expected_price_session="2025-06-02",
     )
     assert result.status == "UNKNOWN"
+
+
+def test_same_pit_dei_share_facts_fail_closed_instead_of_selecting_by_order(tmp_path):
+    database = _database(tmp_path)
+    _insert(
+        EvidenceStore(database),
+        "security-a",
+        "shares-conflict",
+        {
+            "record_type": "xbrl_fact",
+            "metric": "shares_outstanding",
+            "taxonomy": "dei",
+            "unit": "shares",
+            "dimensions": {},
+            "value": "801",
+            "start": "2024-04-01",
+            "end": "2025-03-31",
+        },
+    )
+    loaded = load_input(
+        database,
+        security_id="security-a",
+        evidence_cutoff="2025-06-03T01:00:00Z",
+        expected_price_session="2025-06-02",
+    )
+    assert loaded.shares_outstanding is None
+    assert evaluate(loaded).status == "UNKNOWN"
