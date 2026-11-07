@@ -54,6 +54,19 @@ class AcceptanceConsumersTest(unittest.TestCase):
                 ],
             )
 
+    def _screen(self, run_id):
+        return {
+            "run_id": run_id,
+            "security_id": "synthetic",
+            "as_of": "2026-01-05",
+            "confidence": 0.9,
+            "passed": True,
+            "sufficient_data": True,
+            "raw_features_json": "{}",
+            "evidence_ids_json": "[]",
+            "config_hash": "cfg",
+        }
+
     def test_evaluation_inputs_exclude_acceptance_and_keep_history(self):
         from tradehub_research.validation.replay import load_screen_results
 
@@ -76,10 +89,18 @@ class AcceptanceConsumersTest(unittest.TestCase):
         from tradehub_research.validation.replay import load_screen_results
 
         database = self._screens()
+        # Three genuine dates produce a numeric conclusion, so synthetic
+        # scores must not merely preserve an INSUFFICIENT_DATA verdict.
+        with database.connect() as conn:
+            for day in ("2026-01-06", "2026-01-07"):
+                conn.execute("INSERT INTO pipeline_run VALUES (?, ?)", (day, day))
+                conn.executemany(
+                    "INSERT INTO screen_result VALUES (?, 'cfg', ?, ?, 1, 1)",
+                    [(day, sid, score) for sid, score in (("A", 0.1), ("B", 0.5), ("C", 0.9))],
+                )
         outcomes = {
-            "A": {"2026-01-05": -0.1},
-            "B": {"2026-01-05": 0.0},
-            "C": {"2026-01-05": 0.1},
+            sid: dict.fromkeys(("2026-01-05", "2026-01-06", "2026-01-07"), value)
+            for sid, value in (("A", -0.1), ("B", 0.0), ("C", 0.1))
         }
 
         def conclusion():
@@ -90,8 +111,8 @@ class AcceptanceConsumersTest(unittest.TestCase):
         genuine = conclusion()
         self._add_acceptance(database)
         self.assertEqual(conclusion(), genuine)
-        # A single real date remains insufficient; synthetic rows cannot rescue it.
-        self.assertEqual(genuine[1]["verdict"], "INSUFFICIENT_DATA")
+        self.assertEqual(genuine[1]["mean_ic"], 1.0)
+        self.assertEqual(genuine[1]["date_count"], 3)
 
     def test_production_ingress_rejects_known_acceptance_before_any_write(self):
         database = ExperimentDB(self.root / "experiment.db")
@@ -99,7 +120,10 @@ class AcceptanceConsumersTest(unittest.TestCase):
         for run in ("pr66-acceptance-0", "pr66-acceptance-v2-3", "", None):
             with self.subTest(run=run), self.assertRaisesRegex(ValueError, "acceptance"):
                 record_prediction_from_screen(
-                    database, screen={"run_id": run}, horizon_sessions=21
+                    database,
+                    screen=self._screen(run),
+                    horizon_sessions=21,
+                    collection_date=date(2026, 1, 5),
                 )
         with database.connect(read_only=True) as conn:
             self.assertEqual(
@@ -131,8 +155,9 @@ class AcceptanceConsumersTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "acceptance"):
             record_prediction_from_screen(
                 database,
-                screen={"run_id": "pr66-acceptance-0"},
+                screen=self._screen("pr66-acceptance-0"),
                 horizon_sessions=21,
+                collection_date=date(2026, 1, 5),
             )
         with database.connect(read_only=True) as conn:
             self.assertEqual(
@@ -177,6 +202,7 @@ class AcceptanceConsumersTest(unittest.TestCase):
             patch.object(report_cli, "_decision_plane_note", return_value=None),
             patch.object(report_cli, "LEDGER", self.root / "absent.jsonl"),
         ):
+
             def reports():
                 args = {
                     "settings": SimpleNamespace(),
