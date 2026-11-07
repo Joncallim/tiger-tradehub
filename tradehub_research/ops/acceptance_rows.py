@@ -22,12 +22,24 @@ WIRING STATUS (kept honest — do not overclaim):
     - tradehub_research/ops/forward_capture.py   (acceptance runs are never
       captured into the production forward ledger, and the implicit
       "latest run" selection skips them)
-  NOT YET WIRED (tracked as follow-up; do NOT assume protection):
-    - portfolio performance reporting
-    - investment-evidence conclusion surfaces
-    - adaptive training/evaluation inputs
-  Callers in those surfaces should adopt genuine_clause()/is_acceptance_run()
-  before they are treated as protected.
+    - validation/replay.py: load_screen_results excludes acceptance ancestry
+      before pipeline outcomes, baselines, ablations, walk-forward and holdout
+      evaluation consume screens (also the future adaptive input boundary).
+    - validation/forward_collector.py: production screen ingress rejects known
+      acceptance/unattributable run ids, even outside ops.forward_capture.
+  NOT AFFECTED BY DECISION ROWS:
+    - ops/report_cli.py and validation/reporting.py: portfolio P&L/returns use
+      broker analytics/history, never portfolio_run/state observations.
+    - validation/regime.py: evaluation_regime is date-range metadata only.
+  LIMITS:
+    - No adaptive production learner exists; future readers must preserve this
+      exclusion. Raw snapshot/coverage counts include historical acceptance
+      artifacts for audit, not investment conclusions or training examples.
+    - Legacy forward_prediction has no pipeline ancestry column. Prefix-based
+      checks cannot classify already-captured rows or unlabelled pure screen
+      inputs; production capture remains the authoritative lineage guard.
+
+See docs/acceptance-data-isolation.md for scope and residual audit requirements.
 """
 
 from __future__ import annotations

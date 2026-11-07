@@ -22,6 +22,7 @@ from datetime import date
 from typing import Any
 
 from tradehub_research.db import utc_now
+from tradehub_research.ops.acceptance_rows import is_acceptance_run
 from tradehub_research.validation import horizons
 from tradehub_research.validation.experiment_db import ExperimentDB
 from tradehub_research.validation.horizons import HORIZON_SESSIONS
@@ -141,6 +142,11 @@ def record_prediction_from_screen(
     (delayed collection -- recorded honestly via created_at); the
     future-dated guard applies regardless.
     """
+    # Keep the ingress safe even for callers bypassing ops.forward_capture.
+    # Legacy pure screen callers have no run_id; an explicit unattributable
+    # or acceptance run must never be promoted into production evidence.
+    if provenance == "production" and "run_id" in screen and is_acceptance_run(screen["run_id"]):
+        raise ValueError("acceptance/unattributable screen cannot become a production prediction")
     raw_features = json.loads(screen.get("raw_features_json", "{}"))
     evidence_ids = json.loads(screen.get("evidence_ids_json", "[]"))
     from tradehub_research.validation.replay import screen_observation_date
