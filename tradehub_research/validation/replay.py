@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from tradehub_research.db import ResearchDB
+from tradehub_research.ops.acceptance_rows import genuine_clause
 from tradehub_research.screening import ScreeningConfig, run_screening
 from tradehub_research.validation.snapshot_builder import load_dataset_snapshot
 
@@ -114,7 +115,9 @@ def _mirror_security_identity(replay_db: ResearchDB, snapshot_path: Path) -> Non
 
 def load_screen_results(replay_db: ResearchDB) -> list[dict[str, Any]]:
     """All screen_result rows from a replay DB (pass AND fail, sufficient AND
-    insufficient -- never just candidates), each augmented with its Hunter
+    insufficient -- never just candidates), excluding synthetic acceptance
+    runs before any investment evaluation or future adaptive input is built.
+    Each row is augmented with its Hunter
     family (screen_definition join) and its EVALUATION date (pipeline_run
     as_of join).
 
@@ -122,12 +125,15 @@ def load_screen_results(replay_db: ResearchDB) -> list[dict[str, Any]]:
     timestamp), NEVER screen_result.computed_at -- computed_at is the run's
     wall-clock time (utc_now), which would silently shift every observation
     to the replay run's date and break date-keyed evaluation entirely."""
+    predicate, params = genuine_clause("pr.run_id")
     with replay_db.connect(read_only=True) as conn:
         rows = conn.execute(
             "SELECT sr.*, sd.family, pr.as_of FROM screen_result sr "
             "JOIN screen_definition sd ON sd.config_hash = sr.config_hash "
             "JOIN pipeline_run pr ON pr.run_id = sr.run_id "
-            "ORDER BY pr.as_of, sr.security_id"
+            f"WHERE {predicate} "
+            "ORDER BY pr.as_of, sr.security_id",
+            params,
         ).fetchall()
     return [dict(row) for row in rows]
 
